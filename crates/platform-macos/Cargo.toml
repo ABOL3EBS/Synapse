@@ -1,0 +1,25 @@
+[package]
+name = "synapse-platform-macos"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "synapse_platform_macos"
+path = "src/lib.rs"
+
+[[bin]]
+name = "synapsed-helper"
+path = "src/helper/main.rs"
+
+[[bin]]
+name = "synapse-agent"
+path = "src/agent/main.rs"
+
+[dependencies]
+synapse-common = { path = "../common" }
+nix = { version = "0.29", features = ["socket", "uio", "fs"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+log = "0.4"
+env_logger = "0.11"
