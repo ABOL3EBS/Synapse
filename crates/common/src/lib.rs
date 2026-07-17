@@ -18,14 +18,9 @@ use std::time::Duration;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum EnforcementCommand {
     /// Block traffic from/to this IP for the given TTL.
-    Block {
-        ip: IpAddr,
-        ttl: Duration,
-    },
+    Block { ip: IpAddr, ttl: Duration },
     /// Remove a previously applied block.
-    Unblock {
-        ip: IpAddr,
-    },
+    Unblock { ip: IpAddr },
     /// Kill active state table entries matching this 5-tuple.
     KillState {
         src: IpAddr,
@@ -47,3 +42,13 @@ pub struct PacketInfo {
     pub protocol: u8,
     pub length: u16,
 }
+
+// ---------------------------------------------------------------------------
+// Protocol Constants
+// ---------------------------------------------------------------------------
+
+/// Magic bytes preceding every IPC message. Provides basic framing validation.
+pub const IPC_MAGIC: [u8; 4] = *b"SYNP";
+
+/// Current IPC protocol version. Bump on breaking changes.
+pub const IPC_VERSION: u8 = 1;
