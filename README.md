@@ -1,37 +1,62 @@
-# Synapse IPS
+ ███████╗██╗   ██╗███╗   ██╗ █████╗ ██████╗ ███████╗███████╗
+ ██╔════╝╚██╗ ██╔╝████╗  ██║██╔══██╗██╔══██╗██╔════╝██╔════╝
+ ███████╗ ╚████╔╝ ██╔██╗ ██║███████║██████╔╝███████╗█████╗
+ ╚════██║  ╚██╔╝  ██║╚██╗██║██╔══██║██╔═══╝ ╚════██║██╔══╝
+ ███████║   ██║   ██║ ╚████║██║  ██║██║     ███████║███████╗
+ ╚══════╝   ╚═╝   ╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝     ╚══════╝╚══════╝
 
-macOS-native intrusion prevention system in Rust. Detects and blocks malicious network activity — C2 beaconing, data exfiltration, lateral movement — using behavioral analysis and locally-run ML models. No cloud. No kernel extensions. No Apple Developer account required.
+                    I N T R U S I O N   P R E V E N T I O N
 
-## Architecture
+**Reactive session-level IPS for macOS. No cloud. No kernel extensions. No Apple Developer account.**
+
+Synapse captures network traffic via BPF, detects threats through a pluggable detector framework (rules, ONNX models, reputation feeds), and enforces decisions through the native `pf` firewall. All inference runs locally — nothing leaves the machine.
+
+The process model splits privileged work (BPF device open, `pf` state) into a minimal helper daemon, while all untrusted parsing, detection, and decision logic runs unprivileged. A bug in enrichment, ML inference, or storage is not a root exploit.
 
 ```
-  synapsed-helper (root)                 synapse-agent (unprivileged)
-  ┌──────────────────────────┐          ┌───────────────────────────┐
-  │ Opens /dev/bpf*          │──fd───▶ │ BPF reads (raw ioctls)    │
-  │ SCM_RIGHTS fd handoff    │          │ IPv4 + IPv6 parsing       │
-  │ pf anchor management     │◀─typed── │ EnforcementBackend trait  │
-  │ EnforcementBackend impl  │ commands │ Detection pipeline (planned)│
-  └──────────────────────────┘          │ SQLite storage (planned)  │
-                                        └───────────────────────────┘
+                    ┌─────────────────────────────────┐
+                    │      NETWORK INTERFACE (en0)      │
+                    └───────────────┬─────────────────┘
+                                    │ raw packets
+                                    ▼
+                 ┌──────────────────────────────────────┐
+                 │   synapsed-helper (root, launchd)     │
+                 │   • Opens /dev/bpf*                   │
+                 │   • SCM_RIGHTS fd handoff              │
+                 │   • pf anchor: flush → load → enable   │
+                 │   • Enforcement: apply / remove / kill  │
+                 └──────────┬───────────┬───────────────┘
+                   fd (BPF) │           │ typed commands
+                            ▼           ▲
+                 ┌──────────────────────────────────────┐
+                 │   synapse-agent (unprivileged)        │
+                 │   • BPF reads (raw ioctls)            │
+                 │   • IPv4 + IPv6 parsing                │
+                 │   • EnforcementBackend trait            │
+                 │   • Detection pipeline (planned)        │
+                 │   • SQLite storage (planned)            │
+                 └──────────────────────────────────────┘
 ```
 
 ## What's built
 
-Capture + fd passing + pf enforcement end-to-end on macOS. BPF device opened by helper, passed to unprivileged agent via SCM_RIGHTS. Agent reads packets, parses IPv4/IPv6, sends typed Block/Unblock commands back. pf table add/delete verified against real `pfctl`.
+| Component | Status |
+|---|---|
+| BPF capture (raw ioctls, no pcap) | Done |
+| SCM_RIGHTS fd-passing | Done |
+| pf anchor (flush, reload, enable) | Done |
+| Typed enforcement (Block/Unblock/KillState) | Done |
+| `EnforcementBackend` trait | Done |
+| Dedup + TTL auto-unblock | Done |
+| KillState (real state termination) | Verified |
 
-## Project structure
+## Stack
 
-```
-crates/
-  common/            Shared types + EnforcementBackend trait (zero logic)
-  platform-macos/    macOS enforcement boundary
-    helper/          Root daemon — BPF, fd handoff, pfctl
-    agent/           Unprivileged — packet reads, IPC
-    protocol.rs      SCM_RIGHTS + bincode IPC
-doc/
-  STATUS.md          What's actually built (source of truth)
-  Synapse-IPS-Architecture.md  Design blueprint + rejected alternatives
-```
+- **Capture:** BPF raw ioctls (BIOCSBLEN → BIOCSETIF → BIOCIMMEDIATE → BIOCSETF)
+- **Enforcement:** `pf` via `pfctl` — argv execution, never shell
+- **IPC:** Unix domain socket, SCM_RIGHTS fd-passing, bincode serialization
+- **Runtime:** `std::thread` + `crossbeam` — no async runtime
+- **Platform:** macOS only (v1)
 
 ## Building
 
@@ -39,7 +64,51 @@ doc/
 cargo build --workspace
 ```
 
-Requires macOS with BPF support. Helper must run as root.
+Helper requires root:
+```bash
+sudo RUST_LOG=info cargo run --bin synapsed-helper
+```
+
+Agent runs unprivileged:
+```bash
+cargo run --bin synapse-agent
+```
+
+## Project structure
+
+```
+crates/
+├── common/          Shared types + EnforcementBackend trait (zero logic)
+│   └── src/
+│       ├── lib.rs       EnforcementCommand, PacketInfo, trait def
+│       └── types.rs     ValidatedBlock, BlockId, EnforcementReceipt
+│
+├── agent/           Unprivileged processing (planned)
+│   └── src/
+│       ├── detectors/   Detector trait + impls
+│       ├── enrichment/  DNS, geo, process attribution
+│       ├── flow/        Session tracking
+│       ├── decision/    Weighted scoring
+│       └── storage/     SQLite single-writer
+│
+└── platform-macos/  macOS enforcement boundary
+    └── src/
+        ├── helper/      Root daemon — BPF, fd handoff, pfctl
+        ├── agent/       Unprivileged — packet reads, IPC
+        └── protocol.rs  SCM_RIGHTS + bincode IPC
+
+doc/
+├── STATUS.md                    What's built (source of truth)
+└── Synapse-IPS-Architecture.md  Design blueprint + rejected alternatives
+```
+
+## Threat model
+
+**In scope (v1):** malware performing C2 beaconing, data exfiltration, or lateral movement over the network. Hostile peers on the local network.
+
+**Out of scope (v1):** anti-tamper / self-defense, kernel rootkits, physical access attacks, adversarial model evasion.
+
+See `doc/Synapse-IPS-Architecture.md` §1a for full threat model.
 
 ## License
 
