@@ -80,10 +80,26 @@ impl EnforcementBackend for MacOsEnforcementBackend {
     fn apply_block(&mut self, block: ValidatedBlock) -> Result<EnforcementReceipt, String> {
         let block_id = BlockId::from(block.ip);
 
+        // If already blocked, keep the original TTL. Re-issue block_ip()
+        // (idempotent — pfctl table add is a no-op for an existing entry)
+        // but do NOT spawn a second timer. Two timers for the same IP means
+        // whichever fires first unblocks it, losing the intended duration.
+        if self.active_blocks.contains(&block.ip) {
+            Self::block_ip(block.ip)?;
+            return Ok(EnforcementReceipt {
+                block_id,
+                success: true,
+                message: format!("already blocked {ip}", ip = block.ip),
+            });
+        }
+
         Self::block_ip(block.ip)?;
         self.active_blocks.insert(block.ip);
 
         // Spawn TTL auto-unblock in a background thread.
+        // v1 tradeoff: one OS thread per active block, no cap. Fine at
+        // current traffic volumes; if block counts grow, replace with a
+        // single timer-wheel or a thread with a channel of wake events.
         let ip = block.ip;
         let ttl = block.ttl;
         std::thread::spawn(move || {
