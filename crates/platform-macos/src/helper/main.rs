@@ -3,20 +3,21 @@
 // synapsed-helper — the root-privileged daemon.
 //
 // Responsibilities (and *only* these):
-//   1. Open BPF device via pcap, bind to network interface.
+//   1. Open BPF device, bind to network interface.
 //   2. Pass the BPF fd to synapse-agent via SCM_RIGHTS over a Unix socket.
 //   3. Listen for typed EnforcementCommand messages from the agent.
 //   4. Execute pfctl commands in a dedicated anchor to block/unblock IPs.
 
 use std::collections::HashSet;
-use std::io::{self, Read, Write};
+use std::ffi::CString;
+use std::io::{self, Write};
 use std::net::IpAddr;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::RawFd;
-use std::os::unix::net::UnixStream;
 
 use log::{error, info, warn};
 use synapse_common::EnforcementCommand;
+use synapse_platform_macos::protocol;
 
 // ---------------------------------------------------------------------------
 // pf Constants
@@ -27,62 +28,131 @@ const PF_TABLE_NAME: &str = "synapse_blocklist";
 const IPC_SOCKET_PATH: &str = "/tmp/synapse-helper.sock";
 
 // ---------------------------------------------------------------------------
-// SCM_RIGHTS — fd passing via raw libc
+// BPF filter for IP traffic (both IPv4 and IPv6)
 // ---------------------------------------------------------------------------
 
-/// Send a file descriptor over a Unix domain socket using SCM_RIGHTS.
-fn send_fd(stream: &UnixStream, fd_to_send: RawFd) -> io::Result<()> {
-    let stream_fd: RawFd = std::os::fd::AsRawFd::as_raw_fd(stream);
-
-    let cmsg_len = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) };
-    let mut cmsg_buf = vec![0u8; cmsg_len as usize];
-
-    let mut dummy = [0u8; 1];
-    let mut iov = libc::iovec {
-        iov_base: dummy.as_mut_ptr() as *mut libc::c_void,
-        iov_len: 1,
-    };
-
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov as *mut libc::iovec;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = cmsg_len;
-
-    let cmsg = unsafe { &mut *(libc::CMSG_FIRSTHDR(&msg) as *mut libc::cmsghdr) };
-    cmsg.cmsg_level = libc::SOL_SOCKET;
-    cmsg.cmsg_type = libc::SCM_RIGHTS;
-    cmsg.cmsg_len = unsafe { libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) };
-
-    let data_ptr = unsafe { libc::CMSG_DATA(cmsg) } as *mut libc::c_int;
-    unsafe { *data_ptr = fd_to_send };
-
-    let ret = unsafe { libc::sendmsg(stream_fd, &msg, 0) };
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SockFilter {
+    code: u16,
+    jt: u8,
+    jf: u8,
+    k: u32,
 }
 
-/// Receive a length-prefixed bincode message from the stream.
-fn recv_message<D: for<'de> serde::Deserialize<'de>>(stream: &mut UnixStream) -> io::Result<D> {
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let len = u32::from_be_bytes(len_buf) as usize;
+#[repr(C)]
+struct SockFprog {
+    len: u16,
+    filter: *const SockFilter,
+}
 
-    if len > 1024 * 1024 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("message too large: {len} bytes"),
-        ));
+/// BPF program: pass if EtherType is IPv4 (0x0800) OR IPv6 (0x86DD), else drop.
+///
+/// [0] LD [12]                    — load 2-byte EtherType from Ethernet header
+/// [1] JEQ 0x0800, jt=2, jf=0    — IPv4? → jump to [4] (RET 65535 = pass)
+/// [2] JEQ 0x86DD, jt=1, jf=0    — IPv6? → jump to [4] (RET 65535 = pass)
+/// [3] RET 0                      — neither → drop
+/// [4] RET 65535                  — pass full packet
+const BPF_IP_FILTER: &[SockFilter] = &[
+    SockFilter { code: 0x28, jt: 0, jf: 0, k: 12 },     // LD [12]
+    SockFilter { code: 0x15, jt: 2, jf: 0, k: 0x0800 },  // JEQ 0x0800 → [4]
+    SockFilter { code: 0x15, jt: 1, jf: 0, k: 0x86DD },  // JEQ 0x86DD → [4]
+    SockFilter { code: 0x06, jt: 0, jf: 0, k: 0 },       // RET 0 (drop)
+    SockFilter { code: 0x06, jt: 0, jf: 0, k: 65535 },   // RET 65535 (pass)
+];
+
+// ---------------------------------------------------------------------------
+// BPF device setup (raw, no pcap)
+// ---------------------------------------------------------------------------
+
+/// Open /dev/bpfN and configure it for the given interface.
+/// Returns the BPF file descriptor ready for packet capture.
+fn open_bpf_device(interface: &str) -> io::Result<std::os::unix::io::OwnedFd> {
+    // Try /dev/bpf0 through /dev/bpf9.
+    let mut last_err = None;
+    for i in 0..10 {
+        let path = format!("/dev/bpf{i}");
+        match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(f) => {
+                info!("opened {path}");
+                let fd = std::os::fd::IntoRawFd::into_raw_fd(f);
+
+                // Step 1: BIOCSBLEN — set buffer size FIRST, before BIOCSETIF.
+                // "The buffer must be set before the file is attached to an
+                //  interface with BIOCSETIF." — bpf(4) man page.
+                let mut buf_len: u32 = 1024 * 1024;
+                let ret = unsafe { libc::ioctl(fd, libc::BIOCSBLEN, &mut buf_len) };
+                if ret < 0 {
+                    let err = io::Error::last_os_error();
+                    warn!("BIOCSBLEN failed on {path}: {err}");
+                    unsafe { libc::close(fd) };
+                    last_err = Some(err);
+                    continue;
+                }
+                info!("BPF buffer: {buf_len} bytes");
+
+                // Step 2: BIOCSETIF — bind to interface (must come after BIOCSBLEN).
+                let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+                let ifname = CString::new(interface)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+                let name_bytes = ifname.to_bytes_with_nul();
+                let copy_len = name_bytes.len().min(libc::IFNAMSIZ);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        name_bytes.as_ptr(),
+                        ifr.ifr_name.as_mut_ptr() as *mut u8,
+                        copy_len,
+                    );
+                }
+                let ret = unsafe { libc::ioctl(fd, libc::BIOCSETIF, &mut ifr) };
+                if ret < 0 {
+                    let err = io::Error::last_os_error();
+                    warn!("BIOCSETIF failed on {path}: {err}");
+                    unsafe { libc::close(fd) };
+                    last_err = Some(err);
+                    continue;
+                }
+                info!("bound to interface: {interface}");
+
+                // Step 3: BIOCIMMEDIATE — deliver packets as soon as they arrive
+                // (must come after BIOCSETIF).
+                let mut immediate: i32 = 1;
+                let ret = unsafe { libc::ioctl(fd, libc::BIOCIMMEDIATE, &mut immediate) };
+                if ret < 0 {
+                    warn!("BIOCIMMEDIATE failed: {}", io::Error::last_os_error());
+                }
+
+                // Step 4: BIOCSETF — set BPF filter (must come after BIOCSETIF).
+                let prog = SockFprog {
+                    len: BPF_IP_FILTER.len() as u16,
+                    filter: BPF_IP_FILTER.as_ptr(),
+                };
+                let ret = unsafe { libc::ioctl(fd, libc::BIOCSETF, &prog) };
+                if ret < 0 {
+                    let err = io::Error::last_os_error();
+                    warn!("BIOCSETF failed: {err}");
+                    unsafe { libc::close(fd) };
+                    last_err = Some(err);
+                    continue;
+                }
+                info!("BPF filter set (IPv4 + IPv6)");
+
+                // Wrap in OwnedFd so it's properly closed on drop.
+                let owned = unsafe {
+                    std::os::unix::io::OwnedFd::from_raw_fd(fd)
+                };
+                return Ok(owned);
+            }
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        }
     }
-
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload)?;
-
-    bincode::deserialize(&payload).map_err(|e| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("bincode deserialize: {e}"))
-    })
+    Err(last_err.unwrap_or_else(|| io::Error::new(
+        io::ErrorKind::NotFound,
+        "no /dev/bpf* device found",
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -209,34 +279,12 @@ fn main() -> io::Result<()> {
     }
     info!("synapsed-helper starting (pid={})", std::process::id());
 
-    // 1. Open capture device via pcap — handles all BPF ioctl quirks.
+    // 1. Open and configure BPF device (raw, no pcap).
     let interface = std::env::var("SYNAPSE_IFACE").unwrap_or_else(|_| "en0".to_string());
-    info!("opening capture on interface: {interface}");
+    info!("opening BPF on interface: {interface}");
 
-    // Configure before opening (Capture<Inactive> builder methods).
-    let mut cap = pcap::Capture::from_device(interface.as_str())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pcap: {e}")))?
-        .buffer_size(1024 * 1024)
-        .immediate_mode(true)
-        .open()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pcap open: {e}")))?;
-
-    // Set BPF filter: IP traffic only.
-    cap.filter("ip", true)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pcap filter: {e}")))?;
-
-    info!("capture configured: buffer=1MiB, immediate=true, filter=ip");
-
-    // Get the raw BPF file descriptor from pcap and dup it before dropping.
-    use std::os::fd::AsRawFd;
-    let bpf_fd = cap.as_raw_fd();
-    let bpf_fd_owned = unsafe { libc::dup(bpf_fd) };
-    if bpf_fd_owned < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    drop(cap);
-    let bpf_fd = bpf_fd_owned;
-    info!("BPF fd ready: {bpf_fd}");
+    let bpf_fd = open_bpf_device(&interface)?;
+    info!("BPF device configured and ready");
 
     // 2. Initialise pf anchor.
     ensure_anchor()?;
@@ -256,10 +304,10 @@ fn main() -> io::Result<()> {
     info!("synapse-agent connected");
 
     // 4. Send BPF fd via SCM_RIGHTS.
-    // The kernel dups the fd into the receiver's table; our copy stays open.
-    // Close our copy so only the agent holds it (privilege separation).
-    send_fd(&stream, bpf_fd)?;
-    unsafe { libc::close(bpf_fd) };
+    let raw_fd = bpf_fd.as_raw_fd();
+    protocol::send_fd(&stream, raw_fd)?;
+    // Drop OwnedFd — closes helper's copy. Agent now solely holds the fd.
+    drop(bpf_fd);
     info!("sent BPF fd to agent via SCM_RIGHTS (helper copy closed)");
 
     // 5. Enforcement loop.
@@ -267,7 +315,7 @@ fn main() -> io::Result<()> {
     let mut active_blocks: HashSet<IpAddr> = HashSet::new();
 
     loop {
-        match recv_message::<EnforcementCommand>(&mut stream) {
+        match protocol::recv_message::<EnforcementCommand>(&mut stream) {
             Ok(cmd) => {
                 info!("received command: {cmd:?}");
                 if let Err(e) = enforce(&cmd, &mut active_blocks) {

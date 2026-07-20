@@ -2,35 +2,65 @@
 //
 // synapse-agent — the unprivileged processing engine.
 //
-// Milestone 1: opens its own pcap capture (both agent and helper run as root).
-// The privilege separation architecture is validated by code structure:
-// the helper is the ONLY process that calls pfctl, and the enforcement
-// protocol only accepts typed values — never strings.
-//
-// Milestone 2: replace pcap::from_device with SCM_RIGHTS fd passing from helper.
+// Milestone 1: receives BPF fd from helper via SCM_RIGHTS and reads packets
+// directly from the fd using raw BPF reads. The agent never opens /dev/bpf*
+// itself — privilege separation is enforced structurally.
 
 use std::collections::HashSet;
-use std::io::{self, Write};
+use std::io;
 use std::net::IpAddr;
+use std::os::unix::io::RawFd;
+use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use log::{error, info, warn};
 use synapse_common::{EnforcementCommand, PacketInfo};
+use synapse_platform_macos::protocol;
 
 const IPC_SOCKET_PATH: &str = "/tmp/synapse-helper.sock";
 const TEST_TARGET_IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 100));
 const BLOCK_TTL: Duration = Duration::from_secs(300);
 
-// ---------------------------------------------------------------------------
-// Length-prefixed bincode messages
-// ---------------------------------------------------------------------------
+/// BPF word alignment — packets are padded to this boundary between entries.
+/// On macOS/BSD this is 4 (sizeof(long) on 32-bit, traditional BPF alignment).
+const BPF_WORDALIGN: usize = 4;
 
-fn send_message<S: serde::Serialize>(stream: &mut std::os::unix::net::UnixStream, msg: &S) -> io::Result<()> {
-    let payload = bincode::serialize(msg)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("serialize: {e}")))?;
-    stream.write_all(&(payload.len() as u32).to_be_bytes())?;
-    stream.write_all(&payload)?;
-    stream.flush()
+/// Align a BPF offset up to the next word boundary.
+fn bpf_wordalign(offset: usize) -> usize {
+    (offset + BPF_WORDALIGN - 1) & !(BPF_WORDALIGN - 1)
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct BpfHdr {
+    tv_sec: i32,    // timeval32.tv_sec
+    tv_usec: i32,   // timeval32.tv_usec
+    bh_caplen: u32,
+    bh_datalen: u32,
+    bh_hdrlen: u16,
+}
+
+impl BpfHdr {
+    const SIZE: usize = std::mem::size_of::<Self>(); // 20
+
+    /// Parse a BPF header from the beginning of a buffer.
+    fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::SIZE {
+            return None;
+        }
+        Some(Self {
+            tv_sec: i32::from_ne_bytes(buf[0..4].try_into().ok()?),
+            tv_usec: i32::from_ne_bytes(buf[4..8].try_into().ok()?),
+            bh_caplen: u32::from_ne_bytes(buf[8..12].try_into().ok()?),
+            bh_datalen: u32::from_ne_bytes(buf[12..16].try_into().ok()?),
+            bh_hdrlen: u16::from_ne_bytes(buf[16..18].try_into().ok()?),
+        })
+    }
+
+    /// Offset to next packet in the buffer: header + captured data, word-aligned.
+    fn next_offset(&self) -> usize {
+        bpf_wordalign(self.bh_hdrlen as usize + self.bh_caplen as usize)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -119,65 +149,96 @@ fn main() -> io::Result<()> {
         warn!("agent running as root — expected during milestone 1 testing");
     }
 
-    // 1. Connect to helper for enforcement commands.
-    let mut stream = std::os::unix::net::UnixStream::connect(IPC_SOCKET_PATH)?;
+    // 1. Connect to helper.
+    let mut stream = UnixStream::connect(IPC_SOCKET_PATH)?;
     info!("connected to helper");
 
-    // 2. Open capture via pcap (milestone 1: own device; milestone 2: receive fd via SCM_RIGHTS).
-    let interface = std::env::var("SYNAPSE_IFACE").unwrap_or_else(|_| "en0".to_string());
-    let mut cap = pcap::Capture::from_device(interface.as_str())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pcap: {e}")))?
-        .buffer_size(1024 * 1024)
-        .immediate_mode(true)
-        .open()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pcap open: {e}")))?;
-    cap.filter("ip", true)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pcap filter: {e}")))?;
+    // 2. Receive BPF fd from helper via SCM_RIGHTS.
+    //    The helper has already configured: buffer, filter, immediate mode.
+    let bpf_fd: RawFd = protocol::recv_fd(&stream)?;
+    info!("received fd from helper: fd={bpf_fd}");
 
-    info!("capture started on {interface} — watching for {TEST_TARGET_IP}");
+    // 3. Query the ACTUAL buffer length the helper configured.
+    //    bpf(4): "A read call will result in EINVAL if it is passed a buffer
+    //    that is not this size."
+    let mut buf_len: u32 = 0;
+    let ret = unsafe { libc::ioctl(bpf_fd, libc::BIOCGBLEN, &mut buf_len) };
+    if ret < 0 || buf_len == 0 {
+        let err = io::Error::last_os_error();
+        error!("BIOCGBLEN failed: ret={ret}, buf_len={buf_len}, err={err}");
+        return Err(err);
+    }
+    let buf_len = buf_len as usize;
+    info!("BPF buffer length from kernel: {buf_len} bytes");
 
-    // 3. Capture loop.
+    info!("capture started — watching for {TEST_TARGET_IP}");
+
+    // 4. Allocate read buffer of EXACTLY the kernel-reported size.
+    let mut read_buf = vec![0u8; buf_len];
+
+    // 5. Capture loop — one read() can return multiple packets.
     let mut pkt_count: u64 = 0;
     let mut blocked: HashSet<IpAddr> = HashSet::new();
 
     loop {
-        let pkt = match cap.next_packet() {
-            Ok(p) => p,
-            Err(e) => {
-                // pcap returns error when the interface goes down or capture is stopped.
-                error!("pcap error: {e}");
-                break;
+        let n = unsafe { libc::read(bpf_fd, read_buf.as_mut_ptr() as *mut libc::c_void, read_buf.len()) };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
             }
-        };
-
-        pkt_count += 1;
-        let data = pkt.data;
-
-        let info_pkt = match parse_ip_frame(data) {
-            Some(p) => p,
-            None => continue,
-        };
-
-        let hit = info_pkt.src_ip == TEST_TARGET_IP || info_pkt.dst_ip == TEST_TARGET_IP;
-
-        if pkt_count % 10 == 0 || hit {
-            info!(
-                "pkt#{pkt_count}: {}:{} → {}:{} (proto={}){}",
-                info_pkt.src_ip, info_pkt.src_port,
-                info_pkt.dst_ip, info_pkt.dst_port,
-                info_pkt.protocol,
-                if hit { " *** TARGET ***" } else { "" }
-            );
+            error!("BPF read error: {err}");
+            break;
         }
+        if n == 0 {
+            info!("BPF fd closed (helper exited?)");
+            break;
+        }
+        let n = n as usize;
 
-        if hit && !blocked.contains(&TEST_TARGET_IP) {
-            let cmd = EnforcementCommand::Block { ip: TEST_TARGET_IP, ttl: BLOCK_TTL };
-            info!("sending: {cmd:?}");
-            if let Err(e) = send_message(&mut stream, &cmd) {
-                error!("send failed: {e}");
+        // Parse BPF packets from the read buffer.
+        let mut offset = 0usize;
+        while offset + BpfHdr::SIZE <= n {
+            let hdr = match BpfHdr::from_bytes(&read_buf[offset..]) {
+                Some(h) => h,
+                None => break,
+            };
+
+            let data_start = offset + hdr.bh_hdrlen as usize;
+            let data_end = data_start + hdr.bh_caplen as usize;
+            if data_end > n {
+                warn!("truncated packet at offset {offset}");
                 break;
             }
-            blocked.insert(TEST_TARGET_IP);
+
+            pkt_count += 1;
+            let frame = &read_buf[data_start..data_end];
+
+            if let Some(info_pkt) = parse_ip_frame(frame) {
+                let hit = info_pkt.src_ip == TEST_TARGET_IP || info_pkt.dst_ip == TEST_TARGET_IP;
+
+                if pkt_count % 10 == 0 || hit {
+                    info!(
+                        "pkt#{pkt_count}: {}:{} → {}:{} (proto={}){}",
+                        info_pkt.src_ip, info_pkt.src_port,
+                        info_pkt.dst_ip, info_pkt.dst_port,
+                        info_pkt.protocol,
+                        if hit { " *** TARGET ***" } else { "" }
+                    );
+                }
+
+                if hit && !blocked.contains(&TEST_TARGET_IP) {
+                    let cmd = EnforcementCommand::Block { ip: TEST_TARGET_IP, ttl: BLOCK_TTL };
+                    info!("sending: {cmd:?}");
+                    if let Err(e) = protocol::send_message(&mut stream, &cmd) {
+                        error!("send failed: {e}");
+                        break;
+                    }
+                    blocked.insert(TEST_TARGET_IP);
+                }
+            }
+
+            offset += hdr.next_offset();
         }
     }
 
