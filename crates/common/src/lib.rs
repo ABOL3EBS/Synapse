@@ -3,9 +3,15 @@
 // Shared data contracts between synapsed-helper (root) and synapse-agent (unprivileged).
 // Zero logic — just types. Both crates depend on this without pulling in engine internals.
 
+pub mod types;
+
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::time::Duration;
+
+pub use types::{
+    BlockId, DesiredFirewallState, EnforcementReceipt, ReconciliationReport, ValidatedBlock,
+};
 
 // ---------------------------------------------------------------------------
 // Enforcement Protocol
@@ -52,3 +58,18 @@ pub const IPC_MAGIC: [u8; 4] = *b"SYNP";
 
 /// Current IPC protocol version. Bump on breaking changes.
 pub const IPC_VERSION: u8 = 1;
+
+// ---------------------------------------------------------------------------
+// Enforcement Backend Trait (§4c)
+// ---------------------------------------------------------------------------
+// The only safe execution guarantee isn't just typed data — it's that the
+// implementation uses argv-based process execution, never a shell.
+// ValidatedBlock/BlockId are constructed only through a validation path
+// the caller can't bypass.
+
+pub trait EnforcementBackend {
+    fn apply_block(&mut self, block: ValidatedBlock) -> Result<EnforcementReceipt, String>;
+    fn remove_block(&mut self, block_id: BlockId) -> Result<EnforcementReceipt, String>;
+    fn reconcile(&mut self, desired: &DesiredFirewallState)
+        -> Result<ReconciliationReport, String>;
+}

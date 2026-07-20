@@ -33,8 +33,8 @@ fn bpf_wordalign(offset: usize) -> usize {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct BpfHdr {
-    tv_sec: i32,    // timeval32.tv_sec
-    tv_usec: i32,   // timeval32.tv_usec
+    tv_sec: i32,  // timeval32.tv_sec
+    tv_usec: i32, // timeval32.tv_usec
     bh_caplen: u32,
     bh_datalen: u32,
     bh_hdrlen: u16,
@@ -91,23 +91,38 @@ fn parse_ipv4(frame: &[u8]) -> Option<PacketInfo> {
 
     let protocol = frame[ip + 9];
     let src_ip = IpAddr::V4(std::net::Ipv4Addr::new(
-        frame[ip + 12], frame[ip + 13], frame[ip + 14], frame[ip + 15],
+        frame[ip + 12],
+        frame[ip + 13],
+        frame[ip + 14],
+        frame[ip + 15],
     ));
     let dst_ip = IpAddr::V4(std::net::Ipv4Addr::new(
-        frame[ip + 16], frame[ip + 17], frame[ip + 18], frame[ip + 19],
+        frame[ip + 16],
+        frame[ip + 17],
+        frame[ip + 18],
+        frame[ip + 19],
     ));
     let total_len = u16::from_be_bytes([frame[ip + 2], frame[ip + 3]]);
 
     let (sp, dp) = match protocol {
         6 | 17 => {
             let t = ip + hdr_len;
-            (u16::from_be_bytes([frame[t], frame[t + 1]]),
-             u16::from_be_bytes([frame[t + 2], frame[t + 3]]))
+            (
+                u16::from_be_bytes([frame[t], frame[t + 1]]),
+                u16::from_be_bytes([frame[t + 2], frame[t + 3]]),
+            )
         }
         _ => (0, 0),
     };
 
-    Some(PacketInfo { src_ip, dst_ip, src_port: sp, dst_port: dp, protocol, length: total_len })
+    Some(PacketInfo {
+        src_ip,
+        dst_ip,
+        src_port: sp,
+        dst_port: dp,
+        protocol,
+        length: total_len,
+    })
 }
 
 fn parse_ipv6(frame: &[u8]) -> Option<PacketInfo> {
@@ -129,12 +144,21 @@ fn parse_ipv6(frame: &[u8]) -> Option<PacketInfo> {
     let (sp, dp) = match nh {
         6 | 17 => {
             let t = ip + 40;
-            (u16::from_be_bytes([frame[t], frame[t + 1]]),
-             u16::from_be_bytes([frame[t + 2], frame[t + 3]]))
+            (
+                u16::from_be_bytes([frame[t], frame[t + 1]]),
+                u16::from_be_bytes([frame[t + 2], frame[t + 3]]),
+            )
         }
         _ => (0, 0),
     };
-    Some(PacketInfo { src_ip, dst_ip, src_port: sp, dst_port: dp, protocol: nh, length: 0 })
+    Some(PacketInfo {
+        src_ip,
+        dst_ip,
+        src_port: sp,
+        dst_port: dp,
+        protocol: nh,
+        length: 0,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -144,7 +168,11 @@ fn parse_ipv6(frame: &[u8]) -> Option<PacketInfo> {
 fn main() -> io::Result<()> {
     env_logger::init();
     let euid = unsafe { libc::geteuid() };
-    info!("synapse-agent starting (pid={}, euid={})", std::process::id(), euid);
+    info!(
+        "synapse-agent starting (pid={}, euid={})",
+        std::process::id(),
+        euid
+    );
     if euid == 0 {
         warn!("agent running as root — expected during milestone 1 testing");
     }
@@ -181,7 +209,13 @@ fn main() -> io::Result<()> {
     let mut blocked: HashSet<IpAddr> = HashSet::new();
 
     loop {
-        let n = unsafe { libc::read(bpf_fd, read_buf.as_mut_ptr() as *mut libc::c_void, read_buf.len()) };
+        let n = unsafe {
+            libc::read(
+                bpf_fd,
+                read_buf.as_mut_ptr() as *mut libc::c_void,
+                read_buf.len(),
+            )
+        };
         if n < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
@@ -217,18 +251,23 @@ fn main() -> io::Result<()> {
             if let Some(info_pkt) = parse_ip_frame(frame) {
                 let hit = info_pkt.src_ip == TEST_TARGET_IP || info_pkt.dst_ip == TEST_TARGET_IP;
 
-                if pkt_count % 10 == 0 || hit {
+                if pkt_count.is_multiple_of(10) || hit {
                     info!(
                         "pkt#{pkt_count}: {}:{} → {}:{} (proto={}){}",
-                        info_pkt.src_ip, info_pkt.src_port,
-                        info_pkt.dst_ip, info_pkt.dst_port,
+                        info_pkt.src_ip,
+                        info_pkt.src_port,
+                        info_pkt.dst_ip,
+                        info_pkt.dst_port,
                         info_pkt.protocol,
                         if hit { " *** TARGET ***" } else { "" }
                     );
                 }
 
                 if hit && !blocked.contains(&TEST_TARGET_IP) {
-                    let cmd = EnforcementCommand::Block { ip: TEST_TARGET_IP, ttl: BLOCK_TTL };
+                    let cmd = EnforcementCommand::Block {
+                        ip: TEST_TARGET_IP,
+                        ttl: BLOCK_TTL,
+                    };
                     info!("sending: {cmd:?}");
                     if let Err(e) = protocol::send_message(&mut stream, &cmd) {
                         error!("send failed: {e}");
@@ -242,6 +281,9 @@ fn main() -> io::Result<()> {
         }
     }
 
-    info!("agent shutting down — {pkt_count} packets, {} blocked", blocked.len());
+    info!(
+        "agent shutting down — {pkt_count} packets, {} blocked",
+        blocked.len()
+    );
     Ok(())
 }

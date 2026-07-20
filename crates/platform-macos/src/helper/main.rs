@@ -8,16 +8,18 @@
 //   3. Listen for typed EnforcementCommand messages from the agent.
 //   4. Execute pfctl commands in a dedicated anchor to block/unblock IPs.
 
-use std::collections::HashSet;
+mod enforce;
+
 use std::ffi::CString;
 use std::io::{self, Write};
-use std::net::IpAddr;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 
 use log::{error, info, warn};
-use synapse_common::EnforcementCommand;
+use synapse_common::{BlockId, EnforcementBackend, EnforcementCommand, ValidatedBlock};
 use synapse_platform_macos::protocol;
+
+use enforce::MacOsEnforcementBackend;
 
 // ---------------------------------------------------------------------------
 // pf Constants
@@ -54,11 +56,36 @@ struct SockFprog {
 /// [3] RET 0                      — neither → drop
 /// [4] RET 65535                  — pass full packet
 const BPF_IPV4_IPV6_FILTER: &[SockFilter] = &[
-    SockFilter { code: 0x28, jt: 0, jf: 0, k: 12 },     // LD [12]
-    SockFilter { code: 0x15, jt: 2, jf: 0, k: 0x0800 },  // JEQ 0x0800 → [4]
-    SockFilter { code: 0x15, jt: 1, jf: 0, k: 0x86DD },  // JEQ 0x86DD → [4]
-    SockFilter { code: 0x06, jt: 0, jf: 0, k: 0 },       // RET 0 (drop)
-    SockFilter { code: 0x06, jt: 0, jf: 0, k: 65535 },   // RET 65535 (pass)
+    SockFilter {
+        code: 0x28,
+        jt: 0,
+        jf: 0,
+        k: 12,
+    }, // LD [12]
+    SockFilter {
+        code: 0x15,
+        jt: 2,
+        jf: 0,
+        k: 0x0800,
+    }, // JEQ 0x0800 → [4]
+    SockFilter {
+        code: 0x15,
+        jt: 1,
+        jf: 0,
+        k: 0x86DD,
+    }, // JEQ 0x86DD → [4]
+    SockFilter {
+        code: 0x06,
+        jt: 0,
+        jf: 0,
+        k: 0,
+    }, // RET 0 (drop)
+    SockFilter {
+        code: 0x06,
+        jt: 0,
+        jf: 0,
+        k: 65535,
+    }, // RET 65535 (pass)
 ];
 
 // ---------------------------------------------------------------------------
@@ -72,7 +99,11 @@ fn open_bpf_device(interface: &str) -> io::Result<std::os::unix::io::OwnedFd> {
     let mut last_err = None;
     for i in 0..10 {
         let path = format!("/dev/bpf{i}");
-        match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
             Ok(f) => {
                 info!("opened {path}");
                 let fd = std::os::fd::IntoRawFd::into_raw_fd(f);
@@ -138,9 +169,7 @@ fn open_bpf_device(interface: &str) -> io::Result<std::os::unix::io::OwnedFd> {
                 info!("BPF filter set (IPv4 + IPv6)");
 
                 // Wrap in OwnedFd so it's properly closed on drop.
-                let owned = unsafe {
-                    std::os::unix::io::OwnedFd::from_raw_fd(fd)
-                };
+                let owned = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) };
                 return Ok(owned);
             }
             Err(e) => {
@@ -149,10 +178,8 @@ fn open_bpf_device(interface: &str) -> io::Result<std::os::unix::io::OwnedFd> {
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| io::Error::new(
-        io::ErrorKind::NotFound,
-        "no /dev/bpf* device found",
-    )))
+    Err(last_err
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no /dev/bpf* device found")))
 }
 
 // ---------------------------------------------------------------------------
@@ -167,10 +194,9 @@ fn ensure_anchor() -> io::Result<()> {
 
     if !status.status.success() {
         let stderr = String::from_utf8_lossy(&status.stderr);
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("pfctl anchor init failed: {stderr}"),
-        ));
+        return Err(io::Error::other(format!(
+            "pfctl anchor init failed: {stderr}"
+        )));
     }
 
     let anchor_rules = format!(
@@ -193,76 +219,6 @@ fn ensure_anchor() -> io::Result<()> {
         info!("pf anchor '{PF_ANCHOR_NAME}' with table '{PF_TABLE_NAME}' ready");
     }
     Ok(())
-}
-
-fn block_ip(ip: IpAddr) -> io::Result<()> {
-    let output = std::process::Command::new("pfctl")
-        .args(["-a", PF_ANCHOR_NAME, "-t", PF_TABLE_NAME, "-T", "add", &ip.to_string()])
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("pfctl table add failed for {ip}: {stderr}"),
-        ));
-    }
-    info!("pfctl: added {ip} to table '{PF_TABLE_NAME}'");
-    Ok(())
-}
-
-fn unblock_ip(ip: IpAddr) -> io::Result<()> {
-    let output = std::process::Command::new("pfctl")
-        .args(["-a", PF_ANCHOR_NAME, "-t", PF_TABLE_NAME, "-T", "delete", &ip.to_string()])
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!("pfctl table delete failed for {ip}: {stderr}");
-    } else {
-        info!("pfctl: removed {ip} from table '{PF_TABLE_NAME}'");
-    }
-    Ok(())
-}
-
-fn enforce(command: &EnforcementCommand, active_blocks: &mut HashSet<IpAddr>) -> io::Result<()> {
-    match command {
-        EnforcementCommand::Block { ip, ttl } => {
-            block_ip(*ip)?;
-            active_blocks.insert(*ip);
-            let ip = *ip;
-            let ttl = *ttl;
-            std::thread::spawn(move || {
-                std::thread::sleep(ttl);
-                if let Err(e) = unblock_ip(ip) {
-                    error!("TTL unblock failed for {ip}: {e}");
-                }
-                info!("TTL expired: unblocked {ip}");
-            });
-            Ok(())
-        }
-        EnforcementCommand::Unblock { ip } => {
-            unblock_ip(*ip)?;
-            active_blocks.remove(ip);
-            Ok(())
-        }
-        EnforcementCommand::KillState { src, dst, proto } => {
-            let proto_str = match proto {
-                6 => "tcp",
-                17 => "udp",
-                _ => "all",
-            };
-            let output = std::process::Command::new("pfctl")
-                .args(["-k", &format!("{proto_str} from {src} to {dst}")])
-                .output()?;
-            if !output.status.success() {
-                warn!("pfctl kill state failed: {}", String::from_utf8_lossy(&output.stderr));
-            } else {
-                info!("pfctl: killed state {proto_str} {src} → {dst}");
-            }
-            Ok(())
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -293,10 +249,7 @@ fn main() -> io::Result<()> {
     let _ = std::fs::remove_file(IPC_SOCKET_PATH);
     let listener = std::os::unix::net::UnixListener::bind(IPC_SOCKET_PATH)?;
     // chmod so unprivileged agent can connect.
-    std::fs::set_permissions(
-        IPC_SOCKET_PATH,
-        std::fs::Permissions::from_mode(0o666),
-    )?;
+    std::fs::set_permissions(IPC_SOCKET_PATH, std::fs::Permissions::from_mode(0o666))?;
     info!("listening on {IPC_SOCKET_PATH} (mode 0666)");
 
     info!("waiting for synapse-agent to connect...");
@@ -312,13 +265,46 @@ fn main() -> io::Result<()> {
 
     // 5. Enforcement loop.
     info!("entering enforcement loop...");
-    let mut active_blocks: HashSet<IpAddr> = HashSet::new();
+    let mut backend = MacOsEnforcementBackend::new();
 
     loop {
         match protocol::recv_message::<EnforcementCommand>(&mut stream) {
             Ok(cmd) => {
                 info!("received command: {cmd:?}");
-                if let Err(e) = enforce(&cmd, &mut active_blocks) {
+                let result = match &cmd {
+                    EnforcementCommand::Block { ip, ttl } => {
+                        let block = ValidatedBlock { ip: *ip, ttl: *ttl };
+                        backend.apply_block(block).map(|r| r.message)
+                    }
+                    EnforcementCommand::Unblock { ip } => {
+                        let block_id = BlockId::from(*ip);
+                        backend.remove_block(block_id).map(|r| r.message)
+                    }
+                    // KillState: kept as direct pfctl call for now — broken syntax,
+                    // will be fixed in Step 3.
+                    EnforcementCommand::KillState { src, dst, proto } => {
+                        let proto_str = match proto {
+                            6 => "tcp",
+                            17 => "udp",
+                            _ => "all",
+                        };
+                        let output = std::process::Command::new("pfctl")
+                            .args(["-k", &format!("{proto_str} from {src} to {dst}")])
+                            .output();
+                        match output {
+                            Ok(o) if o.status.success() => {
+                                info!("pfctl: killed state {proto_str} {src} → {dst}");
+                                Ok("state killed".to_string())
+                            }
+                            Ok(o) => Err(format!(
+                                "pfctl kill failed: {}",
+                                String::from_utf8_lossy(&o.stderr)
+                            )),
+                            Err(e) => Err(format!("pfctl spawn failed: {e}")),
+                        }
+                    }
+                };
+                if let Err(e) = result {
                     error!("enforcement failed for {cmd:?}: {e}");
                 }
             }

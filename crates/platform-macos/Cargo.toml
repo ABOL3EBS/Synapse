@@ -17,7 +17,6 @@ path = "src/agent/main.rs"
 
 [dependencies]
 synapse-common = { path = "../common" }
-pcap = "2.4"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
