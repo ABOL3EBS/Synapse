@@ -130,6 +130,45 @@ impl EnforcementBackend for MacOsEnforcementBackend {
         })
     }
 
+    /// Kill state entries for a specific src→dst pair.
+    ///
+    /// `man pfctl`: `-k host1 -k host2` kills all state entries from host1 to host2.
+    /// NOTE: `pfctl -k` does NOT filter by protocol — it kills all states
+    /// (TCP, UDP, etc.) matching the src/dst pair. The `proto` field is
+    /// kept for logging and future use if pfctl gains protocol-specific killing.
+    fn kill_state(
+        &mut self,
+        src: IpAddr,
+        dst: IpAddr,
+        proto: u8,
+    ) -> Result<EnforcementReceipt, String> {
+        let proto_name = match proto {
+            6 => "tcp",
+            17 => "udp",
+            _ => "all",
+        };
+
+        let output = std::process::Command::new("pfctl")
+            .args(["-k", &src.to_string(), "-k", &dst.to_string()])
+            .output()
+            .map_err(|e| format!("pfctl spawn failed: {e}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("pfctl kill failed: {stderr}"));
+        }
+
+        info!(
+            "pfctl: killed states {proto_name} {src} → {dst} (all protocols for this pair)"
+        );
+
+        Ok(EnforcementReceipt {
+            block_id: BlockId::from(src),
+            success: true,
+            message: format!("killed states {proto_name} {src} → {dst}"),
+        })
+    }
+
     /// §4a/§4c: STUB — real reconciliation is tracked separate work.
     /// Returns default (no re-applied, no evicted, no errors).
     fn reconcile(

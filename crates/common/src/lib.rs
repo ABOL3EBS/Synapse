@@ -70,6 +70,12 @@ pub const IPC_VERSION: u8 = 1;
 pub trait EnforcementBackend {
     fn apply_block(&mut self, block: ValidatedBlock) -> Result<EnforcementReceipt, String>;
     fn remove_block(&mut self, block_id: BlockId) -> Result<EnforcementReceipt, String>;
+    fn kill_state(
+        &mut self,
+        src: IpAddr,
+        dst: IpAddr,
+        proto: u8,
+    ) -> Result<EnforcementReceipt, String>;
     fn reconcile(&mut self, desired: &DesiredFirewallState)
         -> Result<ReconciliationReport, String>;
 }

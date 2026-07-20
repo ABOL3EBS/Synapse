@@ -11,6 +11,7 @@
 mod enforce;
 
 use std::ffi::CString;
+use std::fs;
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
@@ -44,7 +45,7 @@ struct SockFilter {
 
 #[repr(C)]
 struct SockFprog {
-    len: u16,
+    len: u32,
     filter: *const SockFilter,
 }
 
@@ -155,7 +156,7 @@ fn open_bpf_device(interface: &str) -> io::Result<std::os::unix::io::OwnedFd> {
 
                 // Step 4: BIOCSETF — set BPF filter (must come after BIOCSETIF).
                 let prog = SockFprog {
-                    len: BPF_IPV4_IPV6_FILTER.len() as u16,
+                    len: BPF_IPV4_IPV6_FILTER.len() as u32,
                     filter: BPF_IPV4_IPV6_FILTER.as_ptr(),
                 };
                 let ret = unsafe { libc::ioctl(fd, libc::BIOCSETF, &prog) };
@@ -187,18 +188,18 @@ fn open_bpf_device(interface: &str) -> io::Result<std::os::unix::io::OwnedFd> {
 // ---------------------------------------------------------------------------
 
 fn ensure_anchor() -> io::Result<()> {
-    let status = std::process::Command::new("pfctl")
-        .args(["-a", PF_ANCHOR_NAME, "-f", "-"])
-        .stdin(std::process::Stdio::null())
-        .output()?;
-
-    if !status.status.success() {
-        let stderr = String::from_utf8_lossy(&status.stderr);
-        return Err(io::Error::other(format!(
-            "pfctl anchor init failed: {stderr}"
-        )));
+    // 1. Flush the anchor to clear stale rules from previous runs or manual testing.
+    let flush = std::process::Command::new("pfctl")
+        .args(["-a", PF_ANCHOR_NAME, "-F", "all"])
+        .output();
+    if let Ok(o) = flush {
+        if !o.status.success() {
+            // Anchor may not exist yet — that's fine, the next step creates it.
+            info!("anchor flush (first run or already clean): {}", String::from_utf8_lossy(&o.stderr).trim());
+        }
     }
 
+    // 2. Load rules into the anchor.
     let anchor_rules = format!(
         "table <{PF_TABLE_NAME}> persist\n\
          pass out quick to <{PF_TABLE_NAME}>\n\
@@ -214,10 +215,39 @@ fn ensure_anchor() -> io::Result<()> {
     let output = child.wait_with_output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!("pfctl table setup warning: {stderr}");
-    } else {
-        info!("pf anchor '{PF_ANCHOR_NAME}' with table '{PF_TABLE_NAME}' ready");
+        return Err(io::Error::other(format!(
+            "pfctl anchor rules load failed: {stderr}"
+        )));
     }
+    info!("pf anchor '{PF_ANCHOR_NAME}' with table '{PF_TABLE_NAME}' ready");
+
+    // 3. Ensure the anchor is referenced from the main ruleset.
+    //    Without this, pf never evaluates the anchor rules — no states
+    //    created, no blocks enforced. See /etc/pf.conf.
+    let pf_conf = fs::read_to_string("/etc/pf.conf")
+        .map_err(|e| io::Error::other(format!("failed to read /etc/pf.conf: {e}")))?;
+
+    let anchor_line = format!("anchor \"{PF_ANCHOR_NAME}\" all");
+    if !pf_conf.lines().any(|l| l.trim() == anchor_line) {
+        info!("adding anchor '{PF_ANCHOR_NAME}' to /etc/pf.conf");
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open("/etc/pf.conf")
+            .map_err(|e| io::Error::other(format!("failed to open /etc/pf.conf: {e}")))?;
+        writeln!(f, "\n{anchor_line}\n")?;
+    }
+
+    // 4. Reload main ruleset so the anchor is always active (even on restart).
+    let reload = std::process::Command::new("pfctl")
+        .args(["-f", "/etc/pf.conf"])
+        .output()?;
+    if !reload.status.success() {
+        let stderr = String::from_utf8_lossy(&reload.stderr);
+        warn!("pfctl main ruleset reload warning: {stderr}");
+    } else {
+        info!("main ruleset reloaded — anchor '{PF_ANCHOR_NAME}' active");
+    }
+
     Ok(())
 }
 
@@ -245,7 +275,19 @@ fn main() -> io::Result<()> {
     // 2. Initialise pf anchor.
     ensure_anchor()?;
 
-    // 3. Create IPC socket and wait for agent.
+    // 3. Enable pf (reference counted — safe to call multiple times).
+    //    Without this, no rules are evaluated and no states are created.
+    let enable = std::process::Command::new("pfctl")
+        .args(["-e"])
+        .output()?;
+    if !enable.status.success() {
+        let stderr = String::from_utf8_lossy(&enable.stderr);
+        warn!("pfctl -e warning: {stderr}");
+    } else {
+        info!("pf enabled");
+    }
+
+    // 4. Create IPC socket and wait for agent.
     let _ = std::fs::remove_file(IPC_SOCKET_PATH);
     let listener = std::os::unix::net::UnixListener::bind(IPC_SOCKET_PATH)?;
     // chmod so unprivileged agent can connect.
@@ -256,14 +298,14 @@ fn main() -> io::Result<()> {
     let (mut stream, _addr) = listener.accept()?;
     info!("synapse-agent connected");
 
-    // 4. Send BPF fd via SCM_RIGHTS.
+    // 5. Send BPF fd via SCM_RIGHTS.
     let raw_fd = bpf_fd.as_raw_fd();
     protocol::send_fd(&stream, raw_fd)?;
     // Drop OwnedFd — closes helper's copy. Agent now solely holds the fd.
     drop(bpf_fd);
     info!("sent BPF fd to agent via SCM_RIGHTS (helper copy closed)");
 
-    // 5. Enforcement loop.
+    // 6. Enforcement loop.
     info!("entering enforcement loop...");
     let mut backend = MacOsEnforcementBackend::new();
 
@@ -280,28 +322,8 @@ fn main() -> io::Result<()> {
                         let block_id = BlockId::from(*ip);
                         backend.remove_block(block_id).map(|r| r.message)
                     }
-                    // KillState: kept as direct pfctl call for now — broken syntax,
-                    // will be fixed in Step 3.
                     EnforcementCommand::KillState { src, dst, proto } => {
-                        let proto_str = match proto {
-                            6 => "tcp",
-                            17 => "udp",
-                            _ => "all",
-                        };
-                        let output = std::process::Command::new("pfctl")
-                            .args(["-k", &format!("{proto_str} from {src} to {dst}")])
-                            .output();
-                        match output {
-                            Ok(o) if o.status.success() => {
-                                info!("pfctl: killed state {proto_str} {src} → {dst}");
-                                Ok("state killed".to_string())
-                            }
-                            Ok(o) => Err(format!(
-                                "pfctl kill failed: {}",
-                                String::from_utf8_lossy(&o.stderr)
-                            )),
-                            Err(e) => Err(format!("pfctl spawn failed: {e}")),
-                        }
+                        backend.kill_state(*src, *dst, *proto).map(|r| r.message)
                     }
                 };
                 if let Err(e) = result {
