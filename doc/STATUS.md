@@ -2,7 +2,7 @@
 
 This is a factual ledger, not a design doc. It answers one question only: **what actually exists in the code right now, verified against real files** — not what the architecture blueprint describes as the target. If this file and `Synapse-IPS-Architecture.md` ever disagree about what's built, this file wins; the architecture doc describes where the project is going, not where it is.
 
-**Last verified:** 2026-07-20, against commit `67b8d02` ("helper: raw BPF ioctls + IPv4+IPv6 filter; agent: raw BPF reads from received fd"), by direct file read and live traffic verification on en0.
+**Last verified:** 2026-07-20, against commit `f2351f2` ("fix: apply_block() dedup — keep original TTL on re-flag"), by direct file read and live traffic + pfctl table verification.
 
 Update this file whenever you verify a change by actually reading the file that changed — not from memory, not from a commit message, not from an agent's description of what it wrote.
 
@@ -10,23 +10,50 @@ Update this file whenever you verify a change by actually reading the file that 
 
 ## Built and confirmed working
 
-- **`crates/common/`** — shared types: `EnforcementCommand` (`Block`/`Unblock`/`KillState` variants), `PacketInfo`, protocol constants. (~54 lines, `lib.rs`)
-- **`crates/platform-macos/src/helper/main.rs`** (331 lines) — the privileged daemon:
-  - Opens BPF device via **raw ioctls** (no pcap): `BIOCSBLEN` → `BIOCSETIF` → `BIOCIMMEDIATE` → `BIOCSETF`, in that exact order. The earlier pcap-based version called `BIOCSBLEN` after `BIOCSETIF`, which violates bpf(4) ("buffer must be set before the file is attached to an interface with BIOCSETIF"). Fixed by switching to raw ioctls with correct ordering.
-  - BPF filter: 5-instruction program matching both IPv4 (EtherType `0x0800`) and IPv6 (EtherType `0x86DD`), dropping other traffic. The earlier filter (`BPF_IP_FILTER`) had only 4 instructions matching IPv4 only; renamed to `BPF_IPV4_IPV6_FILTER` with a comment documenting both EtherTypes.
-  - Sends BPF fd to agent via `SCM_RIGHTS` (using shared `protocol.rs`), drops own copy — agent now solely holds the fd.
-  - Initializes the `pf` anchor and `synapse_blocklist` table
-  - Listens for typed `EnforcementCommand`s over the agent↔helper channel
-  - `block_ip()` (line ~190): `Command::new("pfctl").args([...])` — seven individual args, IP goes through `IpAddr::to_string()`. **Confirmed correct: argv-based, no shell, no injection risk.**
-  - `unblock_ip()` (line ~206): same pattern as `block_ip()`. **Confirmed correct.**
-- **`crates/platform-macos/src/agent/main.rs`** (247 lines) — the unprivileged side:
-  - Receives BPF fd from helper via `SCM_RIGHTS` (does **not** open `/dev/bpf*` itself — privilege separation enforced structurally)
-  - Queries `BIOCGBLEN` for exact kernel buffer size, allocates matching read buffer
-  - Reads packets via raw `libc::read()` on the received fd (no pcap dependency in the agent)
-  - Parses `bpf_hdr` headers (20-byte macOS `timeval32` layout) with proper `BPF_WORDALIGN` (4-byte alignment)
-  - Parses both IPv4 and IPv6 frames from raw Ethernet: `parse_ipv4()` and `parse_ipv6()` — both confirmed working against live traffic
-  - Sends a `Block` command for a hardcoded test target (`192.168.1.100`)
-- **`crates/platform-macos/src/protocol.rs`** (95 lines) — reusable functions: `send_fd`/`recv_fd` (SCM_RIGHTS), `send_message`/`recv_message` (length-prefixed bincode). **Confirmed exercised** by the running M1 path — helper sends fd via `send_fd`, agent receives via `recv_fd`; agent sends `EnforcementCommand` via `send_message`, helper receives via `recv_message`.
+### `crates/common/` (75 + 62 lines)
+- **`lib.rs`** — `EnforcementCommand` enum (`Block`/`Unblock`/`KillState`), `PacketInfo` struct, `EnforcementBackend` trait, protocol constants (`IPC_MAGIC`, `IPC_VERSION`). Re-exports types from `types.rs`.
+- **`types.rs`** — `ValidatedBlock`, `BlockId`, `DesiredFirewallState`, `EnforcementReceipt`, `ReconciliationReport`. Shared data contracts for the enforcement backend (§4c).
+- Dependencies: `serde` (with derive), `bincode`
+
+### `crates/platform-macos/src/helper/main.rs` (325 lines) — `synapsed-helper` binary
+- Opens BPF device via **raw ioctls** (no pcap): `BIOCSBLEN` → `BIOCSETIF` → `BIOCIMMEDIATE` → `BIOCSETF`, in that exact order. BPF ioctl ordering is critical: "The buffer must be set before the file is attached to an interface with BIOCSETIF." — bpf(4).
+- BPF filter: 5-instruction program matching both IPv4 (EtherType `0x0800`) and IPv6 (EtherType `0x86DD`), dropping other traffic.
+- Sends BPF fd to agent via `SCM_RIGHTS` (using shared `protocol.rs`), drops own copy — agent now solely holds the fd.
+- Initializes the `pf` anchor and `synapse_blocklist` table via `ensure_anchor()`.
+- Listens for typed `EnforcementCommand`s over the agent↔helper channel.
+- Enforcement loop: `Block`/`Unblock` go through `MacOsEnforcementBackend` (trait). `KillState` kept as direct pfctl call (broken syntax — see "Built but broken").
+- Constants: `PF_ANCHOR_NAME = "com.synapse.ips"`, `PF_TABLE_NAME = "synapse_blocklist"`, `IPC_SOCKET_PATH = "/tmp/synapse-helper.sock"`
+- Internal modules: `mod enforce` (the backend implementation)
+- Dependencies: `synapse-common`, `libc`, `log`, `env_logger`
+
+### `crates/platform-macos/src/helper/enforce.rs` (141 lines) — `MacOsEnforcementBackend`
+- **The ONLY pfctl executor.** All `Command::new("pfctl").args([...])` calls live here, never in a shell.
+- `block_ip(IpAddr)` — adds IP to pf table via `pfctl -a com.synapse.ips -t synapse_blocklist -T add <ip>`
+- `unblock_ip(IpAddr)` — removes IP via `pfctl -T delete`
+- `apply_block(ValidatedBlock)` — idempotent: if IP already in `active_blocks`, re-issues `block_ip()` but does NOT spawn a second TTL thread (keeps original TTL). Otherwise: blocks + spawns one background thread that sleeps for TTL then unblocks.
+- `remove_block(BlockId)` — unblocks + removes from `active_blocks`.
+- `reconcile()` — **STUB** returning `Ok(ReconciliationReport::default())`. Real reconciliation is tracked separate work (§4a).
+- v1 tradeoff: one OS thread per active block, no cap.
+- Verified against real pf: `pfctl -T show` before/after add/delete confirmed table manipulation works.
+
+### `crates/platform-macos/src/agent/main.rs` (289 lines) — `synapse-agent` binary
+- Receives BPF fd from helper via `SCM_RIGHTS` (does **not** open `/dev/bpf*` itself — privilege separation enforced structurally)
+- Queries `BIOCGBLEN` for exact kernel buffer size, allocates matching read buffer
+- Reads packets via raw `libc::read()` on the received fd (no pcap dependency in the agent)
+- Parses `bpf_hdr` headers (20-byte macOS `timeval32` layout) with proper `BPF_WORDALIGN` (4-byte alignment)
+- Parses both IPv4 and IPv6 frames from raw Ethernet: `parse_ipv4()` and `parse_ipv6()`
+- Sends a `Block` command for a hardcoded test target (`192.168.1.100`) — milestone 1 test behavior
+- Dependencies: `synapse-common`, `libc`, `log`, `env_logger`
+
+### `crates/platform-macos/src/protocol.rs` (112 lines)
+- `send_fd(stream, fd)` / `recv_fd(stream)` — SCM_RIGHTS fd-passing over Unix socket
+- `send_message(stream, msg)` / `recv_message(stream)` — length-prefixed bincode serialization
+- **Confirmed exercised** by the running path — helper sends fd via `send_fd`, agent receives via `recv_fd`.
+
+### `crates/platform-macos/src/lib.rs` (11 lines)
+- Re-exports `pub mod protocol`. The `helper/` and `agent/` binaries are NOT re-exported (binary directory names conflict with `pub mod` declarations).
+
+---
 
 ### What was verified against real traffic (2026-07-20, commit `67b8d02`)
 
@@ -38,14 +65,38 @@ Live capture on `en0` with a long-running agent process (not synthetic single-pa
 - **IPv6 UDP** (proto=17): mDNS (`fe80::...:5353 → ff02::fb:5353`)
 - **IPv6 ICMPv6** (proto=58): neighbor solicitation/advertisement (`fe80::... → ff02::1:ff...`, `fe80::... → fe80::...`)
 
+### What was verified against real pfctl (2026-07-20, commit `376e4df`)
+
+```
+$ sudo pfctl -a com.synapse.ips -t synapse_blocklist -T show
+(no output — table empty)
+
+$ sudo pfctl -a com.synapse.ips -t synapse_blocklist -T add 192.168.1.200
+1/1 addresses added.
+
+$ sudo pfctl -a com.synapse.ips -t synapse_blocklist -T show
+   192.168.1.200
+
+$ sudo pfctl -a com.synapse.ips -t synapse_blocklist -T delete 192.168.1.200
+1/1 addresses deleted.
+
+$ sudo pfctl -a com.synapse.ips -t synapse_blocklist -T show
+(no output — table empty)
+```
+
+---
+
 ## Built but broken — do not treat as working
 
-- **`helper/main.rs`, KillState branch (~line 179–194):** `.args(["-k", &format!("{proto_str} from {src} to {dst}")])`. This is a **real functional bug**, not just a style issue. Real `pfctl -k` syntax takes a host/network per flag — kill both src and dst with **two separate `-k` flags**: `pfctl -k <src> -k <dst>` (see `man pfctl` — verified against FreeBSD/OpenBSD/macOS man pages directly, not inferred). A single formatted "proto from X to Y" sentence passed to one `-k` is not valid syntax as written. This will very likely either error or silently kill zero states (`killed 0 states` is the typical real-world symptom of this exact mistake). **No shell-injection risk** — this is a syntax/functionality bug, not a security bug. Needs fixing before the kill-state enforcement path can be trusted at all.
+- **`helper/main.rs`, KillState branch (~line 285–304):** `.args(["-k", &format!("{proto_str} from {src} to {dst}")])`. This is a **real functional bug**, not just a style issue. Real `pfctl -k` syntax takes a host/network per flag — kill both src and dst with **two separate `-k` flags**: `pfctl -k <src> -k <dst>` (see `man pfctl` — verified against FreeBSD/OpenBSD/macOS man pages directly, not inferred). A single formatted "proto from X to Y" sentence passed to one `-k` is not valid syntax as written. This will very likely either error or silently kill zero states (`killed 0 states` is the typical real-world symptom of this exact mistake). **No shell-injection risk** — this is a syntax/functionality bug, not a security bug. Needs fixing before the kill-state enforcement path can be trusted at all.
+
+## Built as stub — functional but incomplete
+
+- **`enforce.rs`, `reconcile()`:** Returns `Ok(ReconciliationReport::default())`. The trait method exists and compiles, but performs no actual pf table query or recovery. Real reconciliation (§4a — detect-and-recover from anchor eviction) is tracked as separate work.
 
 ## Not built at all
 
-- `EnforcementBackend` trait (architecture §4c) — spec only, no implementation. `block_ip()`/`unblock_ip()` are called directly, not through a trait.
-- Reconciliation logic (§4a/§4c `reconcile()`)
+- Reconciliation logic (§4a) — `reconcile()` is a stub, not real logic
 - `crossbeam`-based agent engine / worker threads
 - `crates/agent/` subdirectories (`detectors/`, `enrichment/`, `flow/`, `decision/`, `storage/`) — directories exist, all empty, no code
 - SQLite storage layer
