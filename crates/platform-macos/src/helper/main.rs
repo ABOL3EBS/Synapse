@@ -53,7 +53,7 @@ struct SockFprog {
 /// [2] JEQ 0x86DD, jt=1, jf=0    — IPv6? → jump to [4] (RET 65535 = pass)
 /// [3] RET 0                      — neither → drop
 /// [4] RET 65535                  — pass full packet
-const BPF_IP_FILTER: &[SockFilter] = &[
+const BPF_IPV4_IPV6_FILTER: &[SockFilter] = &[
     SockFilter { code: 0x28, jt: 0, jf: 0, k: 12 },     // LD [12]
     SockFilter { code: 0x15, jt: 2, jf: 0, k: 0x0800 },  // JEQ 0x0800 → [4]
     SockFilter { code: 0x15, jt: 1, jf: 0, k: 0x86DD },  // JEQ 0x86DD → [4]
@@ -124,8 +124,8 @@ fn open_bpf_device(interface: &str) -> io::Result<std::os::unix::io::OwnedFd> {
 
                 // Step 4: BIOCSETF — set BPF filter (must come after BIOCSETIF).
                 let prog = SockFprog {
-                    len: BPF_IP_FILTER.len() as u16,
-                    filter: BPF_IP_FILTER.as_ptr(),
+                    len: BPF_IPV4_IPV6_FILTER.len() as u16,
+                    filter: BPF_IPV4_IPV6_FILTER.as_ptr(),
                 };
                 let ret = unsafe { libc::ioctl(fd, libc::BIOCSETF, &prog) };
                 if ret < 0 {
