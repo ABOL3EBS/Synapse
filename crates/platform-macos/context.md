@@ -6,7 +6,7 @@ macOS enforcement boundary. Only crate that knows about BPF, pf, or (later) Netw
 
 | Binary | Source | Runs as |
 |---|---|---|
-| `synapsed-helper` | `src/helper/main.rs` (325 lines) | root |
+| `synapsed-helper` | `src/helper/main.rs` (347 lines) | root |
 | `synapse-agent` | `src/agent/main.rs` (289 lines) | unprivileged |
 
 ## Library
@@ -16,21 +16,27 @@ macOS enforcement boundary. Only crate that knows about BPF, pf, or (later) Netw
 ## helper/main.rs call tree
 
 ```
-open_bpf_device(iface) → OwnedFd        line 97
+open_bpf_device(iface) → OwnedFd        line 98
   raw ioctls: BIOCSBLEN → BIOCSETIF → BIOCIMMEDIATE → BIOCSETF
-ensure_anchor()                          line 189
-  pfctl -a com.synapse.ips -f - (creates table + rules)
-IPC socket setup                         line 248
+  SockFprog.len is u32 (matches C bf_len)
+ensure_anchor()                          line 190
+  1. pfctl -a com.synapse.ips -F all (flush stale rules)
+  2. pfctl -a com.synapse.ips -f - (load table + pass + block rules via stdin)
+  3. Add "anchor com.synapse.ips all" to /etc/pf.conf if missing
+  4. pfctl -f /etc/pf.conf (reload main ruleset)
+pfctl -e                                line 280
+  Enable pf (reference counted)
+IPC socket setup                         line 290
   /tmp/synapse-helper.sock, chmod 0666
-protocol::send_fd(stream, bpf_fd)        line 261
+protocol::send_fd(stream, bpf_fd)        line 301
   SCM_RIGHTS, drops own copy
-enforcement loop                         line 270
+enforcement loop                         line 308
   Block → backend.apply_block(ValidatedBlock)
   Unblock → backend.remove_block(BlockId)
-  KillState → direct pfctl (BROKEN — -k syntax wrong)
+  KillState → backend.kill_state(src, dst, proto)
 ```
 
-## helper/enforce.rs — MacOsEnforcementBackend (141 lines)
+## helper/enforce.rs — MacOsEnforcementBackend (180 lines)
 
 ONLY file that executes pfctl. All via `Command::new("pfctl").args([...])`.
 
@@ -38,6 +44,7 @@ ONLY file that executes pfctl. All via `Command::new("pfctl").args([...])`.
 - `unblock_ip(IpAddr)` — `pfctl -T delete`
 - `apply_block()` — idempotent (dedup if already blocked, keeps original TTL), spawns TTL thread
 - `remove_block()` — unblock + remove from active_blocks
+- `kill_state(src, dst, proto)` — `pfctl -k src -k dst` (kills all states for pair, proto logged only)
 - `reconcile()` — STUB, returns default
 
 ## agent/main.rs call tree
