@@ -1,4 +1,15 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "instructions": ["doc/AGENTS.md", "doc/STATUS.md", "doc/Synapse-IPS-Architecture.md"]
+  "instructions": ["doc/AGENTS.md", "doc/STATUS.md", "doc/Synapse-IPS-Architecture.md"],
+  "default_agent": "plan",
+  "permission": {
+    "edit": "ask",
+    "bash": {
+      "*": "ask",
+      "git status*": "allow",
+      "git diff*": "allow",
+      "cargo build*": "allow",
+      "cargo test*": "allow"
+    }
+  }
 }
