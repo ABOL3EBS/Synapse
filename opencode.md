@@ -57,7 +57,7 @@ crates/
 ├── common/          # Zero-logic. Shared types + EnforcementBackend trait.
 │   └── src/
 │       ├── lib.rs       # EnforcementCommand, PacketInfo, EnforcementBackend trait, IPC constants
-│       └── types.rs     # ValidatedBlock, BlockId, EnforcementReceipt, ReconciliationReport
+│       └── types.rs     # ValidatedBlock, BlockId, EnforcementReceipt, ReconciliationReport, enrichment types
 │
 ├── agent/           # Unprivileged. All parsing, detection, decision, storage.
 │   └── src/
@@ -70,7 +70,7 @@ crates/
 │
 └── platform-macos/  # macOS enforcement boundary. Only crate that knows BPF/pf.
     └── src/
-        ├── lib.rs               # Re-exports pub mod protocol
+        ├── lib.rs               # Re-exports pub mod protocol, pub mod process_lookup
         ├── protocol.rs          # SCM_RIGHTS fd-passing + bincode IPC
         ├── helper/
         │   ├── main.rs          # Root daemon: BPF open, fd handoff, enforcement loop
@@ -113,10 +113,10 @@ crates/
 
 ## Current status summary
 
-- **Built:** helper (BPF ioctls, SCM_RIGHTS fd-passing, pf anchor + flush + reload + enable, enforcement loop), agent (BPF reads, IPv4+IPv6 parsing, IPC), common (types, EnforcementBackend trait with apply_block/remove_block/kill_state/reconcile), protocol.rs (SCM_RIGHTS, bincode IPC)
-- **Verified:** ICMP/TCP/UDP over IPv4+IPv6 on en0. pfctl table add/delete/show. KillState kills real states (`killed 1 state`, confirmed gone in `pfctl -s state -vv`). pf enabled, anchor active.
-- **Stub:** `reconcile()` returns default
-- **Not built:** detectors, enrichment, flow tracker, decision engine, storage, Tauri UI, ONNX
+- **Built:** helper (BPF ioctls, SCM_RIGHTS fd-passing, pf anchor + flush + reload + enable, enforcement loop), agent (BPF reads, IPv4+IPv6 parsing, IPC, enrichment pool integration), common (types, EnforcementBackend trait with apply_block/remove_block/kill_state/reconcile, enrichment types), protocol.rs (SCM_RIGHTS, bincode IPC), process_lookup.rs (libproc FFI), enrichment/mod.rs (4-thread worker pool with DNS reverse + process attribution + stubs)
+- **Verified:** ICMP/TCP/UDP over IPv4+IPv6 on en0. pfctl table add/delete/show. KillState kills real states (`killed 1 state`, confirmed gone in `pfctl -s state -vv`). pf enabled, anchor active. Process lookup: `test_lookup_own_pid` passes, resolves own executable path and start time.
+- **Stub:** `reconcile()` returns default. GeoIP and Reputation enrichment return `success: false`.
+- **Not built:** flow tracker, detectors, decision engine, storage, Tauri UI, ONNX
 
 ## Order of work
 

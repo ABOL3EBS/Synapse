@@ -195,7 +195,10 @@ fn ensure_anchor() -> io::Result<()> {
     if let Ok(o) = flush {
         if !o.status.success() {
             // Anchor may not exist yet — that's fine, the next step creates it.
-            info!("anchor flush (first run or already clean): {}", String::from_utf8_lossy(&o.stderr).trim());
+            info!(
+                "anchor flush (first run or already clean): {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
         }
     }
 
@@ -283,9 +286,7 @@ fn main() -> io::Result<()> {
 
     // 3. Enable pf (reference counted — safe to call multiple times).
     //    Without this, no rules are evaluated and no states are created.
-    let enable = std::process::Command::new("pfctl")
-        .args(["-e"])
-        .output()?;
+    let enable = std::process::Command::new("pfctl").args(["-e"]).output()?;
     if !enable.status.success() {
         let stderr = String::from_utf8_lossy(&enable.stderr);
         warn!("pfctl -e warning: {stderr}");

@@ -10,7 +10,7 @@ macOS enforcement boundary. Only crate that knows about BPF, pf, or (later) Netw
 
 ## Library
 
-`src/lib.rs` re-exports `pub mod protocol`. Helper is NOT re-exported (directory name conflicts with `pub mod`).
+`src/lib.rs` re-exports `pub mod protocol` and `pub mod process_lookup`. Helper is NOT re-exported (directory name conflicts with `pub mod`).
 
 ## helper/main.rs call tree
 
@@ -48,4 +48,15 @@ ONLY file that executes pfctl. All via `Command::new("pfctl").args([...])`.
 
 ## Dependencies
 
-`synapse-common`, `libc` 0.2, `serde` 1.x, `bincode` 1.x, `log` 0.4, `env_logger` 0.11
+`synapse-common`, `libc` 0.2, `mach2` 0.4, `serde` 1.x, `bincode` 1.x, `log` 0.4, `env_logger` 0.11
+
+## process_lookup.rs — libproc FFI (155 lines)
+
+Resolves PID to executable path + process start time. Called from agent's enrichment pool (unprivileged — libproc reads procfs, no root needed).
+
+- `lookup_process(pid) -> Result<ProcessInfo, String>`
+- `proc_pidpath(pid)` — gets executable path via libproc's `proc_pidpath()`
+- `proc_start_time(pid)` — gets start time via `proc_pidinfo(PROC_PIDTASKINFO)` + mach2 timebase conversion
+- `ProcessInfo { path: String, start_time: f64 }` — start_time is epoch seconds
+- Start-time captured alongside PID to prevent PID-reuse/TOCTOU misattribution
+- Tests: `test_lookup_own_pid` (passes), `test_lookup_invalid_pid` (passes)

@@ -1,4 +1,62 @@
 # Synapse IPS — Day Report
+
+## 2026-07-21
+
+---
+
+### What was done today
+
+**1. Outbound blocking bug — discovered and fixed.**
+
+Milestone 1 was declared "verified working" on 07-20, but outbound blocking was never tested against a real reachable IP. Today's functional re-test against 8.8.8.8 revealed the anchor rules used `pass out quick to <blocklist>` — which ALLOWED outbound to blocked IPs and created pf state entries. TCP connected successfully (`Connected to 8.8.8.8 port 80`), pf state showed an entry (`ALL tcp 192.168.0.100:64323 -> 8.8.8.8:80 TIME_WAIT`). UDP also passed through. Fixed by changing `pass out` → `block out`. After helper restart: curl times out, `pfctl -s state -vv | grep 8.8.8.8` = empty for both TCP and UDP.
+
+This was a real bug shipped as verified — not a refinement or cleanup. The TEST-NET address (198.51.100.1) used in initial tests couldn't distinguish "blocked" from "unreachable."
+
+**2. Agent crate restructuring.**
+
+Moved agent binary from `crates/platform-macos/src/agent/` to `crates/agent/` per architecture doc §5. The agent now lives in its own crate, depending on `platform-macos` only for `protocol.rs` (SCM_RIGHTS + bincode IPC). `platform-macos` retains only the root helper binary. Workspace updated, all three crates compile.
+
+**3. Component context folders for agentic indexing.**
+
+Created `doc/components/` with 6 context.md files: capture, ipc, enforcement, types, agent-engine, anchor-fix. Each covers code location, key structs, gotchas, and verified behavior — single-file context for agents without touching source. Added glob pattern to `opencode.json` instructions.
+
+**4. Milestone 2: Enrichment pipeline — built and verified.**
+
+Built the enrichment async side-channel (§4): worker pool, DNS reverse lookup, process attribution via libproc FFI, and stub providers for GeoIP/Reputation. Enrichment never blocks the hot path — dispatched on packet arrival, results collected non-blocking via `drain_results()`.
+
+New files:
+- `crates/agent/src/enrichment/mod.rs` (402 lines) — 4-thread worker pool (`std::thread` + `mpsc` + `Arc<Mutex<Receiver>>`), DNS reverse via libc `getnameinfo`, process attribution via libproc, GeoIP/Reputation stubs
+- `crates/platform-macos/src/process_lookup.rs` (155 lines) — libproc FFI: `proc_pidpath` + `proc_pidinfo` (PROC_PIDTASKINFO) + mach2 timebase conversion for start-time
+
+Modified files:
+- `crates/common/src/types.rs` — added `EnrichmentKind`, `EnrichmentRequest`, `EnrichmentResult` types
+- `crates/common/src/lib.rs` — re-exports new enrichment types
+- `crates/platform-macos/src/lib.rs` — added `pub mod process_lookup`
+- `crates/platform-macos/Cargo.toml` — added `mach2 = "0.4"` dependency
+- `crates/agent/src/main.rs` — integrated enrichment pool (create, dispatch, collect results)
+
+**Verified:** `cargo test --workspace` — 2/2 pass (`test_lookup_own_pid`, `test_lookup_invalid_pid`). Build + clippy clean. DNS reverse lookup resolves real hostnames. Process attribution resolves own PID to executable path and start time.
+
+### Commits (chronological)
+
+| Hash | Description |
+|---|---|
+| `68e1da1` | **fix: anchor rules block outbound to blocklist + move agent to own crate** — outbound blocking bug fix + crate restructuring + doc corrections |
+| `1171a53` | docs: add per-component agentic context folders in doc/components/ |
+
+### Bugs found
+
+#### Bug 6: Outbound to blocked IPs not blocked
+- **File:** `helper/main.rs` (`ensure_anchor()`)
+- **Was:** `pass out quick to <synapse_blocklist>` — allowed outbound to blocked IPs
+- **Should be:** `block out quick to <synapse_blocklist>` — blocks outbound to blocked IPs
+- **Impact:** IPS did not block outbound traffic to known-bad IPs. C2 beaconing, data exfiltration, and lateral movement to blocked destinations were not prevented.
+- **How found:** Functional re-test against 8.8.8.8 (real reachable IP) after Milestone 1 was declared verified. Initial tests used TEST-NET address (198.51.100.1) which couldn't distinguish "blocked" from "unreachable."
+- **Fix:** Changed `pass out` → `block out` in `ensure_anchor()`. Added comment explaining why both `block out` and `block in` are needed.
+- **Verified:** curl to 8.8.8.8 times out, `pfctl -s state -vv | grep 8.8.8.8` = empty (no state created)
+
+---
+
 ## 2026-07-20
 
 ---

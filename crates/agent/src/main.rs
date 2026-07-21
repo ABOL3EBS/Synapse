@@ -6,6 +6,8 @@
 // directly from the fd using raw BPF reads. The agent never opens /dev/bpf*
 // itself — privilege separation is enforced structurally.
 
+mod enrichment;
+
 use std::collections::HashSet;
 use std::io;
 use std::net::IpAddr;
@@ -14,7 +16,7 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use log::{error, info, warn};
-use synapse_common::{EnforcementCommand, PacketInfo};
+use synapse_common::{EnforcementCommand, EnrichmentKind, EnrichmentRequest, PacketInfo};
 use synapse_platform_macos::protocol;
 
 const IPC_SOCKET_PATH: &str = "/tmp/synapse-helper.sock";
@@ -207,6 +209,10 @@ fn main() -> io::Result<()> {
     // 5. Capture loop — one read() can return multiple packets.
     let mut pkt_count: u64 = 0;
     let mut blocked: HashSet<IpAddr> = HashSet::new();
+    let mut next_flow_id: u64 = 1;
+
+    // Start enrichment worker pool (async side-channel, never blocks hot path).
+    let enrich_pool = enrichment::EnrichmentPool::new();
 
     loop {
         let n = unsafe {
@@ -263,6 +269,34 @@ fn main() -> io::Result<()> {
                     );
                 }
 
+                // Dispatch enrichment for the first packet of each new destination.
+                // v1: simple — assign a flow ID per unique dst_ip. The real flow
+                // tracker (§6) will replace this with proper session windows.
+                if !blocked.contains(&info_pkt.dst_ip) {
+                    let flow_id = next_flow_id;
+                    next_flow_id += 1;
+
+                    let request = EnrichmentRequest {
+                        flow_id,
+                        src_ip: info_pkt.src_ip,
+                        dst_ip: info_pkt.dst_ip,
+                        src_port: info_pkt.src_port,
+                        dst_port: info_pkt.dst_port,
+                        protocol: info_pkt.protocol,
+                        pid: None, // v1: PID attribution not yet wired from BPF
+                        kinds: vec![
+                            EnrichmentKind::DnsReverse,
+                            EnrichmentKind::ProcessAttribution,
+                            EnrichmentKind::GeoIp,
+                            EnrichmentKind::Reputation,
+                        ],
+                    };
+
+                    if let Err(e) = enrich_pool.dispatch(request) {
+                        warn!("enrichment dispatch failed: {e}");
+                    }
+                }
+
                 if hit && !blocked.contains(&TEST_TARGET_IP) {
                     let cmd = EnforcementCommand::Block {
                         ip: TEST_TARGET_IP,
@@ -278,6 +312,29 @@ fn main() -> io::Result<()> {
             }
 
             offset += hdr.next_offset();
+        }
+
+        // Collect enrichment results (non-blocking). Results attach to the
+        // flow record whenever they complete — never gate the hot path.
+        for result in enrich_pool.drain_results() {
+            if result.success {
+                match result.kind {
+                    synapse_common::EnrichmentKind::DnsReverse => {
+                        info!(
+                            "enrich: dns → {}",
+                            result.dns_name.as_deref().unwrap_or("?"),
+                        );
+                    }
+                    synapse_common::EnrichmentKind::ProcessAttribution => {
+                        info!(
+                            "enrich: process → {} (start={:?})",
+                            result.process_path.as_deref().unwrap_or("?"),
+                            result.process_start_time,
+                        );
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 

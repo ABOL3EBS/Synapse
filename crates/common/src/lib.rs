@@ -10,7 +10,8 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 pub use types::{
-    BlockId, DesiredFirewallState, EnforcementReceipt, ReconciliationReport, ValidatedBlock,
+    BlockId, DesiredFirewallState, EnforcementReceipt, EnrichmentKind, EnrichmentRequest,
+    EnrichmentResult, ReconciliationReport, ValidatedBlock,
 };
 
 // ---------------------------------------------------------------------------

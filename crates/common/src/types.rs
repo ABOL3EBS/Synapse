@@ -60,3 +60,69 @@ pub struct ReconciliationReport {
     /// Human-readable error strings for failures during reconciliation.
     pub errors: Vec<String>,
 }
+
+// ---------------------------------------------------------------------------
+// Enrichment Types (§4 enrichment side-channel)
+// ---------------------------------------------------------------------------
+
+/// What kind of enrichment to perform on a flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EnrichmentKind {
+    /// Reverse DNS lookup for the IP.
+    DnsReverse,
+    /// Process attribution via libproc (PID + start-time + executable path).
+    ProcessAttribution,
+    /// GeoIP country/ASN lookup (stub in v1).
+    GeoIp,
+    /// IP reputation feed lookup (stub in v1).
+    Reputation,
+}
+
+/// A request to enrich a flow with contextual data.
+/// Dispatched to the enrichment worker pool on flow creation.
+/// The worker pool never blocks the hot path — results arrive asynchronously.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrichmentRequest {
+    /// Monotonically increasing flow ID (assigned by the flow tracker).
+    pub flow_id: u64,
+    /// Source IP of the flow.
+    pub src_ip: IpAddr,
+    /// Destination IP of the flow.
+    pub dst_ip: IpAddr,
+    /// Source port (0 if not TCP/UDP).
+    pub src_port: u16,
+    /// Destination port (0 if not TCP/UDP).
+    pub dst_port: u16,
+    /// IP protocol number (6=TCP, 17=UDP, 1=ICMP, etc.).
+    pub protocol: u8,
+    /// PID of the local process, if known (from flow tracker / BPF).
+    pub pid: Option<u32>,
+    /// Which enrichments to perform.
+    pub kinds: Vec<EnrichmentKind>,
+}
+
+/// Result of an enrichment lookup. One per `EnrichmentKind` requested.
+/// Results attach to the flow record whenever they complete — they do not
+/// gate feature extraction, detection, or decision-making (§4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrichmentResult {
+    /// Which enrichment this result corresponds to.
+    pub kind: EnrichmentKind,
+    /// Whether the lookup succeeded.
+    pub success: bool,
+    /// Reverse DNS hostname (if DnsReverse succeeded).
+    pub dns_name: Option<String>,
+    /// Process executable path (if ProcessAttribution succeeded).
+    pub process_path: Option<String>,
+    /// Process start time as epoch seconds (if ProcessAttribution succeeded).
+    /// Captured alongside PID to prevent PID-reuse/TOCTOU misattribution.
+    pub process_start_time: Option<f64>,
+    /// ISO 3166-1 alpha-2 country code (if GeoIp succeeded; stub in v1).
+    pub country_code: Option<String>,
+    /// Autonomous system number (if GeoIp succeeded; stub in v1).
+    pub asn: Option<u32>,
+    /// Reputation score 0.0–1.0, higher = more malicious (if Reputation; stub in v1).
+    pub reputation_score: Option<f32>,
+    /// Human-readable error string if the lookup failed.
+    pub error: Option<String>,
+}

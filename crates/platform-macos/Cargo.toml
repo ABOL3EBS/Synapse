@@ -14,6 +14,7 @@ path = "src/helper/main.rs"
 [dependencies]
 synapse-common = { path = "../common" }
 libc = "0.2"
+mach2 = "0.4"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 log = "0.4"

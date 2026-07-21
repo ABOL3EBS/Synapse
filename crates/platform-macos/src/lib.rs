@@ -8,4 +8,5 @@
 // names conflict with `pub mod helper` / `pub mod agent` declarations.
 // Each binary manages its own internal modules via `mod` in its main.rs.
 
+pub mod process_lookup;
 pub mod protocol;

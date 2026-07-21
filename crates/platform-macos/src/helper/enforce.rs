@@ -158,9 +158,7 @@ impl EnforcementBackend for MacOsEnforcementBackend {
             return Err(format!("pfctl kill failed: {stderr}"));
         }
 
-        info!(
-            "pfctl: killed states {proto_name} {src} → {dst} (all protocols for this pair)"
-        );
+        info!("pfctl: killed states {proto_name} {src} → {dst} (all protocols for this pair)");
 
         Ok(EnforcementReceipt {
             block_id: BlockId::from(src),
