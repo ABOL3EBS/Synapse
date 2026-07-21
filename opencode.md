@@ -109,7 +109,7 @@ crates/
 - **pf requires explicit enable.** `pfctl -e` after loading rules.
 - **Anchor must be in main ruleset.** `anchor "name" all` in `/etc/pf.conf` or pf never evaluates it.
 - **Flush before reload.** `pfctl -a name -F all` before loading rules clears stale state.
-- **Deep context lives in `doc/`.** `doc/STATUS.md` for what's built. `doc/report.md` for full architecture, bug history, struct layouts, and testing methodology. `doc/Synapse-IPS-Architecture.md` for design decisions.
+- **Deep context lives in `doc/`.** `doc/STATUS.md` for what's built. `doc/report.md` for full architecture, bug history, struct layouts, and testing methodology. `doc/Synapse-IPS-Architecture.md` for design decisions. `doc/components/*/context.md` for per-component agentic context (capture, ipc, enforcement, types, agent-engine, anchor-fix).
 
 ## Current status summary
 
