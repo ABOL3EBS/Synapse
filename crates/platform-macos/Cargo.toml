@@ -11,10 +11,6 @@ path = "src/lib.rs"
 name = "synapsed-helper"
 path = "src/helper/main.rs"
 
-[[bin]]
-name = "synapse-agent"
-path = "src/agent/main.rs"
-
 [dependencies]
 synapse-common = { path = "../common" }
 libc = "0.2"

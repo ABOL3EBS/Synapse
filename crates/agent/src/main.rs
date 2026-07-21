@@ -1,4 +1,4 @@
-// crates/platform-macos/src/agent/main.rs
+// crates/agent/src/main.rs
 //
 // synapse-agent — the unprivileged processing engine.
 //

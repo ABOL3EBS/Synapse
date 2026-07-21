@@ -200,9 +200,15 @@ fn ensure_anchor() -> io::Result<()> {
     }
 
     // 2. Load rules into the anchor.
+    // Rules:
+    //   block out quick to <table>  — prevent outbound to blocked IPs
+    //     (C2 beaconing, data exfiltration, lateral movement)
+    //   block in quick from <table> — prevent inbound from blocked IPs
+    //     (separate attack direction: remote host initiating contact toward
+    //      this machine, independent of whether we also block outbound to it)
     let anchor_rules = format!(
         "table <{PF_TABLE_NAME}> persist\n\
-         pass out quick to <{PF_TABLE_NAME}>\n\
+         block out quick to <{PF_TABLE_NAME}>\n\
          block in quick from <{PF_TABLE_NAME}>\n"
     );
     let mut child = std::process::Command::new("pfctl")

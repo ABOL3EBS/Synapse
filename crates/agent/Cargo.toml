@@ -1,0 +1,15 @@
+[package]
+name = "synapse-agent"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "synapse-agent"
+path = "src/main.rs"
+
+[dependencies]
+synapse-common = { path = "../common" }
+synapse-platform-macos = { path = "../platform-macos" }
+libc = "0.2"
+log = "0.4"
+env_logger = "0.11"

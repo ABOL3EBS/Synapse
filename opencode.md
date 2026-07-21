@@ -75,7 +75,6 @@ crates/
         ├── helper/
         │   ├── main.rs          # Root daemon: BPF open, fd handoff, enforcement loop
         │   └── enforce.rs       # MacOsEnforcementBackend — ONLY pfctl caller
-        ├── agent/main.rs        # Unprivileged: BPF reads, IPv4+IPv6 parsing, IPC
         ├── capture.rs           # BPF/libpcap wrapper (runs unprivileged after fd received)
         └── process_lookup.rs    # libproc PID + process-start-time resolution
 ```
@@ -110,6 +109,7 @@ crates/
 - **pf requires explicit enable.** `pfctl -e` after loading rules.
 - **Anchor must be in main ruleset.** `anchor "name" all` in `/etc/pf.conf` or pf never evaluates it.
 - **Flush before reload.** `pfctl -a name -F all` before loading rules clears stale state.
+- **Deep context lives in `doc/`.** `doc/STATUS.md` for what's built. `doc/report.md` for full architecture, bug history, struct layouts, and testing methodology. `doc/Synapse-IPS-Architecture.md` for design decisions.
 
 ## Current status summary
 

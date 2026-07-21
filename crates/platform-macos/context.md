@@ -7,11 +7,10 @@ macOS enforcement boundary. Only crate that knows about BPF, pf, or (later) Netw
 | Binary | Source | Runs as |
 |---|---|---|
 | `synapsed-helper` | `src/helper/main.rs` (347 lines) | root |
-| `synapse-agent` | `src/agent/main.rs` (289 lines) | unprivileged |
 
 ## Library
 
-`src/lib.rs` re-exports `pub mod protocol`. Helper/agent are NOT re-exported (directory name conflicts with `pub mod`).
+`src/lib.rs` re-exports `pub mod protocol`. Helper is NOT re-exported (directory name conflicts with `pub mod`).
 
 ## helper/main.rs call tree
 
@@ -21,7 +20,7 @@ open_bpf_device(iface) → OwnedFd        line 98
   SockFprog.len is u32 (matches C bf_len)
 ensure_anchor()                          line 190
   1. pfctl -a com.synapse.ips -F all (flush stale rules)
-  2. pfctl -a com.synapse.ips -f - (load table + pass + block rules via stdin)
+  2. pfctl -a com.synapse.ips -f - (load table + block-out + block-in rules via stdin)
   3. Add "anchor com.synapse.ips all" to /etc/pf.conf if missing
   4. pfctl -f /etc/pf.conf (reload main ruleset)
 pfctl -e                                line 280
@@ -46,39 +45,6 @@ ONLY file that executes pfctl. All via `Command::new("pfctl").args([...])`.
 - `remove_block()` — unblock + remove from active_blocks
 - `kill_state(src, dst, proto)` — `pfctl -k src -k dst` (kills all states for pair, proto logged only)
 - `reconcile()` — STUB, returns default
-
-## agent/main.rs call tree
-
-```
-protocol::recv_fd(stream) → RawFd       line 186
-  receives BPF fd from helper
-libc::ioctl(BIOCGBLEN)                  line 193
-  queries kernel buffer size
-capture loop                            line 211
-  libc::read(bpf_fd, buf)
-  BpfHdr::from_bytes() — 20-byte struct
-  parse_ip_frame()
-    parse_ipv4() → PacketInfo            line 82
-    parse_ipv6() → PacketInfo            line 128
-  every 10th pkt + target hit → log
-  if hit: send_message(Block { ip, ttl })
-```
-
-## protocol.rs (112 lines)
-
-- `send_fd(stream, fd)` / `recv_fd(stream)` — SCM_RIGHTS via CMSG
-- `send_message(stream, msg)` / `recv_message(stream)` — 4-byte length prefix + bincode, max 1MB
-
-## Constants
-
-| Name | Value |
-|---|---|
-| `PF_ANCHOR_NAME` | `com.synapse.ips` |
-| `PF_TABLE_NAME` | `synapse_blocklist` |
-| `IPC_SOCKET_PATH` | `/tmp/synapse-helper.sock` |
-| `BPF_WORDALIGN` | 4 |
-| `TEST_TARGET_IP` | `192.168.1.100` (milestone 1) |
-| `BLOCK_TTL` | 300s (milestone 1) |
 
 ## Dependencies
 
