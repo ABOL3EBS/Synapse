@@ -107,6 +107,8 @@ pub struct EnrichmentRequest {
 /// gate feature extraction, detection, or decision-making (§4).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrichmentResult {
+    /// Flow ID this result belongs to (set by the enrichment worker from the request).
+    pub flow_id: u64,
     /// Which enrichment this result corresponds to.
     pub kind: EnrichmentKind,
     /// Whether the lookup succeeded.

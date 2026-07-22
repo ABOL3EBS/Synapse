@@ -7,11 +7,23 @@ Zero-logic crate. Shared types and traits between helper (root) and agent (unpri
 | File | Contains |
 |---|---|
 | `src/lib.rs` | `EnforcementCommand` enum, `PacketInfo` struct, `EnforcementBackend` trait, `IPC_MAGIC`/`IPC_VERSION` constants, re-exports from `types.rs` |
-| `src/types.rs` | `ValidatedBlock{ip: IpAddr, ttl: Duration}`, `BlockId(IpAddr)`, `DesiredFirewallState{blocks: Vec<ValidatedBlock>}`, `EnforcementReceipt{block_id, success, message}`, `ReconciliationReport{re_applied, evicted, errors}` |
+| `src/types.rs` | All shared types (see below) |
 
-## Dependencies
+## Types (`src/types.rs`)
 
-`serde` 1.x (derive), `bincode` 1.x
+| Type | Purpose |
+|---|---|
+| `ValidatedBlock{ip, ttl}` | Validated block command with TTL |
+| `BlockId(IpAddr)` | Unique block identifier |
+| `DesiredFirewallState{blocks}` | Set of desired blocks for reconciliation |
+| `EnforcementReceipt{block_id, success, message}` | Result of enforcement action |
+| `ReconciliationReport{re_applied, evicted, errors}` | Result of reconcile() |
+| `PortPidCache{entries, pid_count, fd_count, socket_count, probe_ok, elapsed}` | Helper→agent port→PID mapping |
+| `PortPidEntry{port, proto, pid}` | Single cache entry (for serialization) |
+| `IpcMessage` enum | `PortPidCache(PortPidCache)` — all IPC messages |
+| `EnrichmentRequest{flow_id, src/dst_ip, src/dst_port, protocol, pid, kinds}` | Agent→enrichment worker request |
+| `EnrichmentResult{flow_id, kind, success, dns_name, process_path, ...}` | Enrichment worker→agent result |
+| `EnrichmentKind` enum | `DnsReverse`, `ProcessAttribution`, `GeoIp`, `Reputation` |
 
 ## EnforcementBackend trait (§4c)
 
@@ -23,3 +35,7 @@ fn reconcile(&mut self, desired: &DesiredFirewallState) -> Result<Reconciliation
 ```
 
 Only implementer: `MacOsEnforcementBackend` in `platform-macos/src/helper/enforce.rs`.
+
+## Dependencies
+
+`serde` 1.x (derive), `bincode` 1.x

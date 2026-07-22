@@ -5,8 +5,12 @@
 // Milestone 1: receives BPF fd from helper via SCM_RIGHTS and reads packets
 // directly from the fd using raw BPF reads. The agent never opens /dev/bpf*
 // itself — privilege separation is enforced structurally.
+//
+// Flow tracker (§4 step 3): in-memory session window with ~100ms ticks.
+// poll() with timeout ensures tick() fires even on quiet networks.
 
 mod enrichment;
+mod flow;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -17,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use synapse_common::{
     EnforcementCommand, EnrichmentKind, EnrichmentRequest, IpcMessage, PacketInfo,
 };
@@ -265,18 +269,57 @@ fn main() -> io::Result<()> {
 
     info!("capture started — watching for {TEST_TARGET_IP}");
 
-    // 4. Allocate read buffer of EXACTLY the kernel-reported size.
+    // Allocate read buffer of EXACTLY the kernel-reported size.
     let mut read_buf = vec![0u8; buf_len];
 
-    // 5. Capture loop — one read() can return multiple packets.
-    let mut pkt_count: u64 = 0;
+    // Flow tracker — session window with ~100ms ticks.
+    let mut tracker = flow::FlowTracker::new();
+
+    // Track blocked test-target IPs (milestone 1 testing artifact).
     let mut blocked: HashSet<IpAddr> = HashSet::new();
-    let mut next_flow_id: u64 = 1;
 
     // Start enrichment worker pool (async side-channel, never blocks hot path).
     let enrich_pool = enrichment::EnrichmentPool::new();
 
+    // Capture loop — uses poll() with 100ms timeout so tick() fires even
+    // on quiet networks. A blocking read() would pin memory forever.
+    let mut pkt_count: u64 = 0;
     loop {
+        // poll() with 100ms timeout. tick() fires on every iteration
+        // regardless of whether packets arrived.
+        let mut pollfd = libc::pollfd {
+            fd: bpf_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let poll_ret = unsafe { libc::poll(&mut pollfd, 1, 100) };
+
+        if poll_ret < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            error!("poll error: {err}");
+            break;
+        }
+
+        // Always tick on every iteration — even on timeout.
+        // Expires stale flows and reclaims memory.
+        let expired = tracker.tick();
+        if !expired.is_empty() {
+            info!(
+                "tick: expired {} flows ({} remaining)",
+                expired.len(),
+                tracker.len()
+            );
+        }
+
+        if poll_ret == 0 {
+            // Timeout — no packets. tick() already ran above.
+            continue;
+        }
+
+        // Data available — read packets.
         let n = unsafe {
             libc::read(
                 bpf_fd,
@@ -331,35 +374,47 @@ fn main() -> io::Result<()> {
                     );
                 }
 
-                // Dispatch enrichment for the first packet of each new destination.
-                // v1: simple — assign a flow ID per unique dst_ip. The real flow
-                // tracker (§6) will replace this with proper session windows.
-                if !blocked.contains(&info_pkt.dst_ip) {
-                    let flow_id = next_flow_id;
-                    next_flow_id += 1;
+                // Resolve local_port and PID from the port→PID cache.
+                // local_port is stored on the FlowRecord, independent of
+                // the canonical key's ordering (which discards direction).
+                let (local_port, pid) = {
+                    let cache_guard = port_pid_cache.lock().ok();
+                    let cache = cache_guard.as_ref();
+                    let lookup = |port: u16, proto: u8| -> Option<(u16, u32)> {
+                        cache.and_then(|c| {
+                            let key = (port, proto);
+                            c.get(&key).map(|&pid| (port, pid))
+                        })
+                    };
+                    lookup(info_pkt.src_port, info_pkt.protocol)
+                        .or_else(|| lookup(info_pkt.dst_port, info_pkt.protocol))
+                        .unwrap_or((0, 0))
+                };
 
-                    // Look up local PID from the port→PID cache.
-                    // Try src_port first (outbound traffic), then dst_port (inbound).
-                    let pid = port_pid_cache.lock().ok().and_then(|cache| {
-                        let key_src = (info_pkt.src_port, info_pkt.protocol);
-                        let key_dst = (info_pkt.dst_port, info_pkt.protocol);
-                        if cache.is_empty() {
-                            info!("PID lookup: cache empty (0 entries)");
-                        }
-                        cache.get(&key_src).or_else(|| cache.get(&key_dst)).copied()
-                    });
-                    if pkt_count <= 50 || pkt_count.is_multiple_of(200) {
-                        info!(
-                            "PID lookup: src=({},{}) dst=({},{}) → {:?} (cache size={})",
-                            info_pkt.src_port,
-                            info_pkt.protocol,
-                            info_pkt.dst_port,
-                            info_pkt.protocol,
-                            pid,
-                            port_pid_cache.lock().map(|c| c.len()).unwrap_or(0),
-                        );
-                    }
+                // Feed packet to the flow tracker.
+                let update = tracker.update(
+                    &info_pkt,
+                    local_port,
+                    if pid != 0 { Some(pid) } else { None },
+                );
 
+                if let flow::FlowUpdate::NewFlow(flow_id) = update {
+                    info!(
+                        "flow {} created: {}:{} → {}:{} (proto={}, local_port={}, pid={:?})",
+                        flow_id,
+                        info_pkt.src_ip,
+                        info_pkt.src_port,
+                        info_pkt.dst_ip,
+                        info_pkt.dst_port,
+                        info_pkt.protocol,
+                        local_port,
+                        if pid != 0 { Some(pid) } else { None },
+                    );
+                    // New flow — dispatch enrichment.
+                    // KNOWN v1 INEFFICIENCY: DNS/GeoIP/Reputation are per-destination-IP
+                    // but we dispatch per-flow. This means redundant lookups for flows
+                    // to the same IP. Fix: global HashMap<IpAddr, EnrichmentState> cache.
+                    // Only process attribution is genuinely flow-specific.
                     let request = EnrichmentRequest {
                         flow_id,
                         src_ip: info_pkt.src_ip,
@@ -367,7 +422,7 @@ fn main() -> io::Result<()> {
                         src_port: info_pkt.src_port,
                         dst_port: info_pkt.dst_port,
                         protocol: info_pkt.protocol,
-                        pid,
+                        pid: if pid != 0 { Some(pid) } else { None },
                         kinds: vec![
                             EnrichmentKind::DnsReverse,
                             EnrichmentKind::ProcessAttribution,
@@ -398,8 +453,8 @@ fn main() -> io::Result<()> {
             offset += hdr.next_offset();
         }
 
-        // Collect enrichment results (non-blocking). Results attach to the
-        // flow record whenever they complete — never gate the hot path.
+        // Collect enrichment results (non-blocking). Attach to the flow
+        // record whenever they complete — never gate the hot path.
         for result in enrich_pool.drain_results() {
             if result.success {
                 match result.kind {
@@ -408,6 +463,16 @@ fn main() -> io::Result<()> {
                             "enrich: dns → {}",
                             result.dns_name.as_deref().unwrap_or("?"),
                         );
+                        // Attach to the flow that requested this enrichment.
+                        // result.flow_id was set by the enrichment worker.
+                        tracker.attach_enrichment(
+                            result.flow_id,
+                            result.dns_name,
+                            None,
+                            None,
+                            None,
+                            None,
+                        );
                     }
                     synapse_common::EnrichmentKind::ProcessAttribution => {
                         info!(
@@ -415,15 +480,50 @@ fn main() -> io::Result<()> {
                             result.process_path.as_deref().unwrap_or("?"),
                             result.process_start_time,
                         );
+                        tracker.attach_enrichment(
+                            result.flow_id,
+                            None,
+                            result.process_path,
+                            result.process_start_time,
+                            None,
+                            None,
+                        );
                     }
-                    _ => {}
+                    synapse_common::EnrichmentKind::GeoIp => {
+                        tracker.attach_enrichment(
+                            result.flow_id,
+                            None,
+                            None,
+                            None,
+                            result.country_code,
+                            None,
+                        );
+                    }
+                    synapse_common::EnrichmentKind::Reputation => {
+                        tracker.attach_enrichment(
+                            result.flow_id,
+                            None,
+                            None,
+                            None,
+                            None,
+                            result.reputation_score,
+                        );
+                    }
                 }
+            } else {
+                debug!(
+                    "enrich: {:?} failed for flow {}: {}",
+                    result.kind,
+                    result.flow_id,
+                    result.error.as_deref().unwrap_or("unknown"),
+                );
             }
         }
     }
 
     info!(
-        "agent shutting down — {pkt_count} packets, {} blocked",
+        "agent shutting down — {pkt_count} packets, {} flows tracked, {} blocked",
+        tracker.len(),
         blocked.len()
     );
     Ok(())

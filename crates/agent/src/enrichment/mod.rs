@@ -165,6 +165,7 @@ impl EnrichmentPool {
             Ok(name) => {
                 debug!("dns reverse: {target_ip} → {name}");
                 EnrichmentResult {
+                    flow_id: request.flow_id,
                     kind: EnrichmentKind::DnsReverse,
                     success: true,
                     dns_name: Some(name),
@@ -179,6 +180,7 @@ impl EnrichmentPool {
             Err(e) => {
                 debug!("dns reverse: {target_ip} failed: {e}");
                 EnrichmentResult {
+                    flow_id: request.flow_id,
                     kind: EnrichmentKind::DnsReverse,
                     success: false,
                     dns_name: None,
@@ -268,6 +270,7 @@ impl EnrichmentPool {
             Some(p) => p,
             None => {
                 return EnrichmentResult {
+                    flow_id: request.flow_id,
                     kind: EnrichmentKind::ProcessAttribution,
                     success: false,
                     dns_name: None,
@@ -285,6 +288,7 @@ impl EnrichmentPool {
             Ok(info) => {
                 debug!("process attribution: pid={pid} → {}", info.path);
                 EnrichmentResult {
+                    flow_id: request.flow_id,
                     kind: EnrichmentKind::ProcessAttribution,
                     success: true,
                     dns_name: None,
@@ -299,6 +303,7 @@ impl EnrichmentPool {
             Err(e) => {
                 debug!("process attribution: pid={pid} failed: {e}");
                 EnrichmentResult {
+                    flow_id: request.flow_id,
                     kind: EnrichmentKind::ProcessAttribution,
                     success: false,
                     dns_name: None,
@@ -321,6 +326,7 @@ impl EnrichmentPool {
         let target_ip = Self::pick_enrichable_ip(request.src_ip, request.dst_ip);
         debug!("geoip stub: {target_ip} → unknown (v1 stub)");
         EnrichmentResult {
+            flow_id: request.flow_id,
             kind: EnrichmentKind::GeoIp,
             success: false,
             dns_name: None,
@@ -341,6 +347,7 @@ impl EnrichmentPool {
         let target_ip = Self::pick_enrichable_ip(request.src_ip, request.dst_ip);
         debug!("reputation stub: {target_ip} → unknown (v1 stub)");
         EnrichmentResult {
+            flow_id: request.flow_id,
             kind: EnrichmentKind::Reputation,
             success: false,
             dns_name: None,
