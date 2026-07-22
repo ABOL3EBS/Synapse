@@ -461,29 +461,28 @@ mod tests {
 
     #[test]
     fn test_dns_reverse_localhost() {
-        let result = EnrichmentPool::getnameinfo_lookup(
-            IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-        );
+        let result =
+            EnrichmentPool::getnameinfo_lookup(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
         // localhost may or may not resolve depending on /etc/hosts — just verify no panic
         println!("DNS reverse 127.0.0.1: {:?}", result);
     }
 
     #[test]
     fn test_is_public_ip() {
-        assert!(!EnrichmentPool::is_public_ip(
-            IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
-        ));
-        assert!(!EnrichmentPool::is_public_ip(
-            IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1))
-        ));
-        assert!(!EnrichmentPool::is_public_ip(
-            IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))
-        ));
-        assert!(EnrichmentPool::is_public_ip(
-            IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8))
-        ));
-        assert!(EnrichmentPool::is_public_ip(
-            IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1))
-        ));
+        assert!(!EnrichmentPool::is_public_ip(IpAddr::V4(
+            std::net::Ipv4Addr::new(127, 0, 0, 1)
+        )));
+        assert!(!EnrichmentPool::is_public_ip(IpAddr::V4(
+            std::net::Ipv4Addr::new(192, 168, 1, 1)
+        )));
+        assert!(!EnrichmentPool::is_public_ip(IpAddr::V4(
+            std::net::Ipv4Addr::new(10, 0, 0, 1)
+        )));
+        assert!(EnrichmentPool::is_public_ip(IpAddr::V4(
+            std::net::Ipv4Addr::new(8, 8, 8, 8)
+        )));
+        assert!(EnrichmentPool::is_public_ip(IpAddr::V4(
+            std::net::Ipv4Addr::new(1, 1, 1, 1)
+        )));
     }
 }

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 pub use types::{
     BlockId, DesiredFirewallState, EnforcementReceipt, EnrichmentKind, EnrichmentRequest,
-    EnrichmentResult, ReconciliationReport, ValidatedBlock,
+    EnrichmentResult, PortPidCache, ReconciliationReport, ValidatedBlock,
 };
 
 // ---------------------------------------------------------------------------
@@ -34,6 +34,20 @@ pub enum EnforcementCommand {
         dst: IpAddr,
         proto: u8, // IPPROTO_TCP=6, IPPROTO_UDP=17
     },
+}
+
+// ---------------------------------------------------------------------------
+// IPC Message Envelope (helper → agent)
+// ---------------------------------------------------------------------------
+// Wraps messages from helper to agent into a single enum so send_message /
+// recv_message can distinguish message types without ad-hoc tagging.
+// Agent → helper direction remains plain EnforcementCommand (no wrapping).
+
+/// Messages the helper sends to the agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum IpcMessage {
+    /// Port→PID cache snapshot from the helper's fd-scan thread.
+    PortPidCache(PortPidCache),
 }
 
 // ---------------------------------------------------------------------------

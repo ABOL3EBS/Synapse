@@ -15,9 +15,11 @@ use std::fs;
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
+use std::thread;
+use std::time::Duration;
 
 use log::{error, info, warn};
-use synapse_common::{BlockId, EnforcementBackend, EnforcementCommand, ValidatedBlock};
+use synapse_common::{BlockId, EnforcementBackend, EnforcementCommand, IpcMessage, ValidatedBlock};
 use synapse_platform_macos::protocol;
 
 use enforce::MacOsEnforcementBackend;
@@ -302,22 +304,55 @@ fn main() -> io::Result<()> {
     info!("listening on {IPC_SOCKET_PATH} (mode 0666)");
 
     info!("waiting for synapse-agent to connect...");
-    let (mut stream, _addr) = listener.accept()?;
+    let (stream, _addr) = listener.accept()?;
     info!("synapse-agent connected");
 
-    // 5. Send BPF fd via SCM_RIGHTS.
+    // 5. Send BPF fd via SCM_RIGHTS (before stream split — uses original handle).
     let raw_fd = bpf_fd.as_raw_fd();
     protocol::send_fd(&stream, raw_fd)?;
     // Drop OwnedFd — closes helper's copy. Agent now solely holds the fd.
     drop(bpf_fd);
     info!("sent BPF fd to agent via SCM_RIGHTS (helper copy closed)");
 
-    // 6. Enforcement loop.
+    // 6. Split stream for concurrent read/write.
+    //    read_half: enforcement loop (recv commands from agent).
+    //    write_half: cache-push thread (send PortPidCache to agent).
+    //    try_clone() duplicates the underlying fd so each half has independent
+    //    file-descriptor state — concurrent read/write cannot corrupt framing.
+    let mut read_half = stream.try_clone()?;
+    // Only one thread may write on this half. If a future feature needs to write
+    // from elsewhere (e.g. sending acks/receipts back), route it through this
+    // same thread/channel — do not spawn a second writer on this stream half,
+    // or the length-prefix framing race this design was built to avoid comes back.
+    let write_half = stream;
+
+    // 7. Spawn cache-push thread: builds port→PID cache every 5s and sends
+    //    it to the agent via the write half of the IPC socket.
+    let cache_interval = Duration::from_secs(5);
+    thread::Builder::new()
+        .name("port-pid-cache".to_string())
+        .spawn(move || {
+            info!("cache-push thread started (interval={cache_interval:?})");
+            let mut writer = write_half;
+            loop {
+                let cache = synapse_platform_macos::process_lookup::build_port_pid_cache();
+                let msg = IpcMessage::PortPidCache(cache);
+                if let Err(e) = protocol::send_message(&mut writer, &msg) {
+                    error!("cache-push: send failed: {e}");
+                    break;
+                }
+                thread::sleep(cache_interval);
+            }
+            info!("cache-push thread exiting");
+        })
+        .expect("failed to spawn cache-push thread");
+
+    // 8. Enforcement loop (reads from read_half — never touches write_half).
     info!("entering enforcement loop...");
     let mut backend = MacOsEnforcementBackend::new();
 
     loop {
-        match protocol::recv_message::<EnforcementCommand>(&mut stream) {
+        match protocol::recv_message::<EnforcementCommand>(&mut read_half) {
             Ok(cmd) => {
                 info!("received command: {cmd:?}");
                 let result = match &cmd {

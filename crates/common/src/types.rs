@@ -5,6 +5,7 @@
 // and EnforcementReceipt belong in crates/common/src/types.rs"
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -125,4 +126,23 @@ pub struct EnrichmentResult {
     pub reputation_score: Option<f32>,
     /// Human-readable error string if the lookup failed.
     pub error: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Port→PID Cache (helper → agent via IPC)
+// ---------------------------------------------------------------------------
+
+/// Snapshot of the helper's port→PID cache, sent to the agent every ~5s.
+/// Built by the helper's fd-scan thread; consumed by the agent's enrichment
+/// pool to resolve (port, proto) → PID → process path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortPidCache {
+    /// (local_port, protocol) → owning PID.
+    pub entries: HashMap<(u16, u8), u32>,
+    /// Number of PIDs scanned during the build.
+    pub pid_count: usize,
+    /// Number of file descriptors examined during the build.
+    pub fd_count: usize,
+    /// Wall-clock time to build the cache.
+    pub elapsed: Duration,
 }

@@ -33,6 +33,8 @@ enforcement loop                         line 308
   Block → backend.apply_block(ValidatedBlock)
   Unblock → backend.remove_block(BlockId)
   KillState → backend.kill_state(src, dst, proto)
+cache-push thread                        line 315
+  Sends PortPidCache to agent every 5s
 ```
 
 ## helper/enforce.rs — MacOsEnforcementBackend (180 lines)
@@ -48,15 +50,46 @@ ONLY file that executes pfctl. All via `Command::new("pfctl").args([...])`.
 
 ## Dependencies
 
-`synapse-common`, `libc` 0.2, `mach2` 0.4, `serde` 1.x, `bincode` 1.x, `log` 0.4, `env_logger` 0.11
+`synapse-common`, `libc` 0.2, `mach2` 0.4, `serde` 1.x, `bincode` 1.x, `log` 0.4, `env_logger` 0.11, `libproc` 0.14
 
-## process_lookup.rs — libproc FFI (155 lines)
+## process_lookup.rs — port→PID cache + process attribution (668 lines)
 
-Resolves PID to executable path + process start time. Called from agent's enrichment pool (unprivileged — libproc reads procfs, no root needed).
+Uses `libproc` crate (v0.14, typed structs via bindgen) for all FFI. Runs unprivileged (reads procfs).
 
-- `lookup_process(pid) -> Result<ProcessInfo, String>`
-- `proc_pidpath(pid)` — gets executable path via libproc's `proc_pidpath()`
-- `proc_start_time(pid)` — gets start time via `proc_pidinfo(PROC_PIDTASKINFO)` + mach2 timebase conversion
-- `ProcessInfo { path: String, start_time: f64 }` — start_time is epoch seconds
-- Start-time captured alongside PID to prevent PID-reuse/TOCTOU misattribution
-- Tests: `test_lookup_own_pid` (passes), `test_lookup_invalid_pid` (passes)
+### Key functions
+
+- `lookup_process(pid) -> Result<ProcessInfo, String>` — executable path + start time
+- `build_port_pid_cache() -> PortPidCache` — full per-process fd scan
+- `probe_socket(pid, fd) -> Option<(lport, fport, proto)>` — single socket probe
+
+### Port reading strategy
+
+`insi_lport` and `insi_fport` are stored as BE u16 in the first 2 bytes of a `c_int` field.
+On little-endian ARM, reading as `c_int` (native-endian) gives a wrong value (e.g., port 60202 → c_int 10987).
+**Must use raw byte reading** via `read_port_be(info, offset)` which reads 2 bytes at a fixed offset and applies `u16::from_be_bytes`.
+
+- `OFF_LPORT = 268` (verified by test_probe_socket_lport against lsof ground truth)
+- `OFF_FPORT = 264` (verified by test_probe_socket_fport against lsof ground truth)
+- Offsets computed from: `psi` at 24 (SocketInfo), `soi_proto` at 264, `InSockInfo` starts at soi_proto, `insi_fport` at +0, `insi_lport` at +4.
+
+### SocketFDInfo struct layout (from libproc bindgen)
+
+```
+SocketFDInfo (792 bytes total):
+  [0..24)    prefix (includes ProcFDInfo at offset 8 + extra fields)
+  [24..792)  psi: SocketInfo (768 bytes)
+             VInfoStat (136 bytes) at start
+             soi_proto (SocketInfoProto, 528 bytes) at offset 264 from start
+               pri_in: InSockInfo at offset 264 (first union member)
+                 insi_fport: c_int at offset 264
+                 insi_lport: c_int at offset 268
+```
+
+### Tests (all pass)
+
+- `test_lookup_own_pid` — resolves own executable path and start time
+- `test_lookup_invalid_pid` — fails correctly for nonexistent PID
+- `test_build_port_pid_cache` — 39-53 entries, ~500 PIDs, ~5000 fds, ~2ms
+- `test_probe_socket_lport` — lport matches lsof ground truth exactly
+- `test_probe_socket_fport` — fport matches lsof ground truth exactly
+- `test_struct_sizes` — verifies struct sizes, offsets, read_port_be vs lsof

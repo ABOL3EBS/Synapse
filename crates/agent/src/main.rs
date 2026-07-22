@@ -8,15 +8,19 @@
 
 mod enrichment;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::IpAddr;
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use log::{error, info, warn};
-use synapse_common::{EnforcementCommand, EnrichmentKind, EnrichmentRequest, PacketInfo};
+use synapse_common::{
+    EnforcementCommand, EnrichmentKind, EnrichmentRequest, IpcMessage, PacketInfo,
+};
 use synapse_platform_macos::protocol;
 
 const IPC_SOCKET_PATH: &str = "/tmp/synapse-helper.sock";
@@ -180,7 +184,7 @@ fn main() -> io::Result<()> {
     }
 
     // 1. Connect to helper.
-    let mut stream = UnixStream::connect(IPC_SOCKET_PATH)?;
+    let stream = UnixStream::connect(IPC_SOCKET_PATH)?;
     info!("connected to helper");
 
     // 2. Receive BPF fd from helper via SCM_RIGHTS.
@@ -188,7 +192,65 @@ fn main() -> io::Result<()> {
     let bpf_fd: RawFd = protocol::recv_fd(&stream)?;
     info!("received fd from helper: fd={bpf_fd}");
 
-    // 3. Query the ACTUAL buffer length the helper configured.
+    // 3. Split stream for concurrent read/write.
+    //    write_half: sends EnforcementCommand to helper (main thread).
+    //    read_half: receives IpcMessage::PortPidCache from helper (reader thread).
+    //    try_clone() duplicates the underlying fd so each half has independent
+    //    file-descriptor state — concurrent read/write cannot corrupt framing.
+    // Only one thread may write on this half. If a future feature needs to write
+    // from elsewhere (e.g. sending acks/receipts back), route it through this
+    // same thread/channel — do not spawn a second writer on this stream half,
+    // or the length-prefix framing race this design was built to avoid comes back.
+    let mut write_half = stream.try_clone()?;
+    let read_half = stream;
+
+    // 4. Shared port→PID cache — updated by reader thread, read by main loop.
+    let port_pid_cache: Arc<Mutex<HashMap<(u16, u8), u32>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    // 5. Spawn IPC reader thread: receives cache pushes from helper.
+    {
+        let cache = port_pid_cache.clone();
+        thread::Builder::new()
+            .name("ipc-reader".to_string())
+            .spawn(move || {
+                let mut reader = read_half;
+                loop {
+                    match protocol::recv_message::<IpcMessage>(&mut reader) {
+                        Ok(IpcMessage::PortPidCache(snapshot)) => {
+                            let mut cache = match cache.lock() {
+                                Ok(g) => g,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            let was_empty = cache.is_empty();
+                            *cache = snapshot.entries;
+                            info!(
+                                "port→PID cache updated: {} entries ({} PIDs, {} fds, {:?})",
+                                cache.len(),
+                                snapshot.pid_count,
+                                snapshot.fd_count,
+                                snapshot.elapsed,
+                            );
+                            if was_empty && !cache.is_empty() {
+                                let mut keys: Vec<_> = cache.keys().collect();
+                                keys.sort();
+                                info!("cache keys (first 20): {:?}", &keys[..keys.len().min(20)]);
+                            }
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                            info!("helper disconnected (reader thread)");
+                            break;
+                        }
+                        Err(e) => {
+                            error!("IPC reader error: {e}");
+                            break;
+                        }
+                    }
+                }
+            })
+            .expect("failed to spawn IPC reader thread");
+    }
+
+    // 6. Query the ACTUAL buffer length the helper configured.
     //    bpf(4): "A read call will result in EINVAL if it is passed a buffer
     //    that is not this size."
     let mut buf_len: u32 = 0;
@@ -276,6 +338,28 @@ fn main() -> io::Result<()> {
                     let flow_id = next_flow_id;
                     next_flow_id += 1;
 
+                    // Look up local PID from the port→PID cache.
+                    // Try src_port first (outbound traffic), then dst_port (inbound).
+                    let pid = port_pid_cache.lock().ok().and_then(|cache| {
+                        let key_src = (info_pkt.src_port, info_pkt.protocol);
+                        let key_dst = (info_pkt.dst_port, info_pkt.protocol);
+                        if cache.is_empty() {
+                            info!("PID lookup: cache empty (0 entries)");
+                        }
+                        cache.get(&key_src).or_else(|| cache.get(&key_dst)).copied()
+                    });
+                    if pkt_count <= 50 || pkt_count.is_multiple_of(200) {
+                        info!(
+                            "PID lookup: src=({},{}) dst=({},{}) → {:?} (cache size={})",
+                            info_pkt.src_port,
+                            info_pkt.protocol,
+                            info_pkt.dst_port,
+                            info_pkt.protocol,
+                            pid,
+                            port_pid_cache.lock().map(|c| c.len()).unwrap_or(0),
+                        );
+                    }
+
                     let request = EnrichmentRequest {
                         flow_id,
                         src_ip: info_pkt.src_ip,
@@ -283,7 +367,7 @@ fn main() -> io::Result<()> {
                         src_port: info_pkt.src_port,
                         dst_port: info_pkt.dst_port,
                         protocol: info_pkt.protocol,
-                        pid: None, // v1: PID attribution not yet wired from BPF
+                        pid,
                         kinds: vec![
                             EnrichmentKind::DnsReverse,
                             EnrichmentKind::ProcessAttribution,
@@ -303,7 +387,7 @@ fn main() -> io::Result<()> {
                         ttl: BLOCK_TTL,
                     };
                     info!("sending: {cmd:?}");
-                    if let Err(e) = protocol::send_message(&mut stream, &cmd) {
+                    if let Err(e) = protocol::send_message(&mut write_half, &cmd) {
                         error!("send failed: {e}");
                         break;
                     }

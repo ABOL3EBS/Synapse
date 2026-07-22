@@ -76,7 +76,7 @@ crates/
         │   ├── main.rs          # Root daemon: BPF open, fd handoff, enforcement loop
         │   └── enforce.rs       # MacOsEnforcementBackend — ONLY pfctl caller
         ├── capture.rs           # BPF/libpcap wrapper (runs unprivileged after fd received)
-        └── process_lookup.rs    # libproc PID + process-start-time resolution
+        └── process_lookup.rs    # libproc port→PID cache + process-start-time resolution
 ```
 
 **Rules for new code:**
@@ -113,8 +113,8 @@ crates/
 
 ## Current status summary
 
-- **Built:** helper (BPF ioctls, SCM_RIGHTS fd-passing, pf anchor + flush + reload + enable, enforcement loop), agent (BPF reads, IPv4+IPv6 parsing, IPC, enrichment pool integration), common (types, EnforcementBackend trait with apply_block/remove_block/kill_state/reconcile, enrichment types), protocol.rs (SCM_RIGHTS, bincode IPC), process_lookup.rs (libproc FFI), enrichment/mod.rs (4-thread worker pool with DNS reverse + process attribution + stubs)
-- **Verified:** ICMP/TCP/UDP over IPv4+IPv6 on en0. pfctl table add/delete/show. KillState kills real states (`killed 1 state`, confirmed gone in `pfctl -s state -vv`). pf enabled, anchor active. Process lookup: `test_lookup_own_pid` passes, resolves own executable path and start time.
+- **Built:** helper (BPF ioctls, SCM_RIGHTS fd-passing, pf anchor + flush + reload + enable, enforcement loop, cache-push thread every 5s), agent (BPF reads, IPv4+IPv6 parsing, IPC reader thread + cache storage, PID lookup wired src_port→PID→path), common (types, EnforcementBackend trait with apply_block/remove_block/kill_state/reconcile, enrichment types, IpcMessage enum), protocol.rs (SCM_RIGHTS, bincode IPC, stream split), process_lookup.rs (libproc FFI: lookup_process, build_port_pid_cache, probe_socket with raw BE port reading), enrichment/mod.rs (4-thread worker pool with DNS reverse + process attribution + stubs)
+- **Verified:** ICMP/TCP/UDP over IPv4+IPv6 on en0. pfctl table add/delete/show. KillState kills real states (`killed 1 state`, confirmed gone in `pfctl -s state -vv`). pf enabled, anchor active. Process lookup: `test_lookup_own_pid` passes, resolves own executable path and start time. **Live E2E (2026-07-22):** helper sends PortPidCache (49–51 entries, ~7–8ms), agent receives and resolves Brave Browser connection → pid=743 → `Brave Browser Helper` via `lookup_process`.
 - **Stub:** `reconcile()` returns default. GeoIP and Reputation enrichment return `success: false`.
 - **Not built:** flow tracker, detectors, decision engine, storage, Tauri UI, ONNX
 
