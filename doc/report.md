@@ -202,14 +202,14 @@ Hardcoded offsets `OFF_LPORT=268`, `OFF_FPORT=264` verified by 3 independent tes
 | `crates/platform-macos/src/helper/enforce.rs` | 178 | `MacOsEnforcementBackend` — only pfctl executor |
 | `crates/platform-macos/src/protocol.rs` | 112 | SCM_RIGHTS fd-passing + bincode IPC |
 | `crates/platform-macos/src/process_lookup.rs` | 668 | `libproc` FFI — `build_port_pid_cache`, `probe_socket`, `read_port_be`, `lookup_process` |
-| `crates/agent/src/main.rs` | 530 | Unprivileged — BPF reads, IPv4/IPv6, flow tracker, enrichment, IPC reader thread |
+| `crates/agent/src/main.rs` | 626 | Unprivileged — BPF reads, IPv4/IPv6, flow tracker, enrichment, IPC reader thread, `determine_local_port()` extracted |
 | `crates/agent/src/flow/mod.rs` | 574 | In-memory session window — `FlowKey`, `FlowRecord`, `FlowTracker`, canonicalization, eviction |
 | `crates/agent/src/enrichment/mod.rs` | 495 | 4-thread worker pool — DNS reverse, process attribution, GeoIP/Reputation stubs |
-| **Total** | **3,328** | |
+| **Total** | **3,424** | |
 
 ---
 
-### Test results (22 tests)
+### Test results (26 tests)
 
 | Test | Result |
 |---|---|
@@ -235,6 +235,10 @@ Hardcoded offsets `OFF_LPORT=268`, `OFF_FPORT=264` verified by 3 independent tes
 | `test_local_port_independent_of_canonical_ordering` | ✅ local_port=50000, not canonical a_port=443 |
 | `test_enrichment_dispatched_per_flow_not_per_ip` | ✅ per-flow dispatch (documented v1 inefficiency) |
 | `test_tick_fires_on_wall_clock_not_packet_count` | ✅ expiry based on Instant::now(), not packet count |
+| `test_determine_local_port_inbound_real_code_path` | ✅ inbound 8.8.8.8:443→local_ip:50000 → local_port=50000 (real code path) |
+| `test_determine_local_port_outbound_real_code_path` | ✅ outbound local_ip:50000→8.8.8.8:443 → local_port=50000 (real code path) |
+| `test_determine_local_port_neither_matches_fallback` | ✅ fallback returns src_port when neither IP matches |
+| `test_detect_local_ip_returns_non_loopback` | ✅ detect_local_ip() returns valid non-loopback IP |
 
 ---
 
@@ -583,10 +587,10 @@ pf state showed an entry. Fixed by changing `pass out` → `block out`.
 | `crates/platform-macos/src/helper/enforce.rs` | 178 | `MacOsEnforcementBackend` — only pfctl executor |
 | `crates/platform-macos/src/protocol.rs` | 112 | SCM_RIGHTS fd-passing + bincode IPC |
 | `crates/platform-macos/src/process_lookup.rs` | 668 | `libproc` FFI — `build_port_pid_cache`, `probe_socket`, `read_port_be`, `lookup_process` |
-| `crates/agent/src/main.rs` | 530 | Unprivileged — BPF reads, IPv4/IPv6, flow tracker, enrichment, IPC reader thread |
+| `crates/agent/src/main.rs` | 626 | Unprivileged — BPF reads, IPv4/IPv6, flow tracker, enrichment, IPC reader thread, `determine_local_port()` extracted |
 | `crates/agent/src/flow/mod.rs` | 574 | In-memory session window — `FlowKey`, `FlowRecord`, `FlowTracker`, canonicalization, eviction |
 | `crates/agent/src/enrichment/mod.rs` | 495 | 4-thread worker pool — DNS reverse, process attribution, GeoIP/Reputation stubs |
-| **Total** | **3,328** | |
+| **Total** | **3,424** | |
 
 ### Dependencies
 
@@ -666,7 +670,10 @@ Every step was verified with real terminal output:
 | Flow tracker creation (07-22) | ✅ flows created for each unique session, INFO-level logs visible |
 | DNS enrichment (07-22) | ✅ `ec2-44-203-161-176.compute-1.amazonaws.com`, `abbass-macbook-air.local` |
 | Flow expiry (07-22) | ✅ `tick: expired M flows (N remaining)` logs after 5s silence |
-| 22 unit tests (07-22) | ✅ all pass — 16 agent, 6 platform-macos |
+| 26 unit tests (07-23) | ✅ all pass — 20 agent, 6 platform-macos |
+| `determine_local_port()` inbound test | ✅ real code path with system-detected local IP — returns dst_port |
+| `determine_local_port()` outbound test | ✅ real code path — returns src_port |
+| `detect_local_ip()` returns valid IP | ✅ non-loopback, non-unspecified |
 | Design review: canonicalization swap | ✅ `test_canonicalization_swap_case_local_ip_larger` — identical key |
 | Design review: local_port independence | ✅ `test_local_port_independent_of_canonical_ordering` — correct port |
 | Design review: enrichment dedup | ✅ `test_enrichment_dispatched_per_flow_not_per_ip` — per-flow (documented) |

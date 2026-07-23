@@ -4,7 +4,7 @@ Unprivileged capture loop. Receives BPF fd from helper, reads raw packets, parse
 
 ## Code location
 
-`crates/agent/src/main.rs` (579 lines) — standalone binary crate
+`crates/agent/src/main.rs` (626 lines) — standalone binary crate
 `crates/agent/src/flow/mod.rs` (710 lines) — in-memory session window
 `crates/agent/src/enrichment/mod.rs` (495 lines) — 4-thread enrichment worker pool
 
@@ -55,8 +55,8 @@ loop {
         for each BpfHdr in buffer:
             parse_ip_frame(frame)
             // Resolve local_port + PID from port→PID cache
-            (local_port, pid) = cache.lookup(local_ip_port)
-            // local_ip_port determined by is_local(src_ip) check
+            (local_port, remote_port) = determine_local_port(src_ip, src_port, dst_ip, dst_port, local_ip)
+            // local_port determined by is_local(ip) check against detected local_ip
             // Feed to flow tracker
             update = tracker.update(info, local_port, pid)
             if NewFlow(flow_id):
@@ -100,4 +100,5 @@ loop {
 - Flow creation/expiry logs at INFO level; flow internal details at DEBUG level
 - DNS/GeoIP/Reputation are per-flow dispatch (known v1 inefficiency — redundant lookups for same IP)
 - Process attribution is genuinely flow-specific (different processes on same port)
-- PID lookup uses `is_local(ip)` direction check — correct for both inbound and outbound
+- PID lookup uses `determine_local_port()` with `is_local(ip)` check — correct for both inbound and outbound
+- `determine_local_port()` extracted as testable function — 4 tests exercise real code path with system-detected local IP

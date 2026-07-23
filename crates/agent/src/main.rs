@@ -171,6 +171,26 @@ fn parse_ipv6(frame: &[u8]) -> Option<PacketInfo> {
     })
 }
 
+/// Determine which port is local based on which IP matches the detected local IP.
+/// Returns (local_port, remote_port).
+fn determine_local_port(
+    src_ip: IpAddr,
+    src_port: u16,
+    dst_ip: IpAddr,
+    dst_port: u16,
+    local_ip: IpAddr,
+) -> (u16, u16) {
+    if src_ip == local_ip {
+        (src_port, dst_port)
+    } else if dst_ip == local_ip {
+        (dst_port, src_port)
+    } else {
+        // Neither IP matches local — fall back to src_port as local
+        // (outbound default, but we have no better heuristic).
+        (src_port, dst_port)
+    }
+}
+
 /// Detect the local IP address from the network interface.
 /// Uses getifaddrs() to find IPv4 addresses on non-loopback interfaces.
 /// Returns the first non-loopback IPv4 address found.
@@ -437,16 +457,13 @@ fn main() -> io::Result<()> {
                         })
                     };
                     // Determine which port is local based on which IP matches.
-                    let local = if info_pkt.src_ip == local_ip {
-                        info_pkt.src_port
-                    } else if info_pkt.dst_ip == local_ip {
-                        info_pkt.dst_port
-                    } else {
-                        // Neither IP matches local — fall back to src_port
-                        // (correct for outbound, wrong for inbound, but we
-                        // have no better heuristic without local IP).
-                        info_pkt.src_port
-                    };
+                    let (local, _remote) = determine_local_port(
+                        info_pkt.src_ip,
+                        info_pkt.src_port,
+                        info_pkt.dst_ip,
+                        info_pkt.dst_port,
+                        local_ip,
+                    );
                     lookup(local, info_pkt.protocol).unwrap_or((0, 0))
                 };
 
@@ -586,4 +603,94 @@ fn main() -> io::Result<()> {
         blocked.len()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    /// Test the real determine_local_port() with an inbound packet.
+    /// This is the test that should have existed from the start — it exercises
+    /// the actual production code path, not a hardcoded local_port bypass.
+    ///
+    /// Scenario: inbound packet from 8.8.8.8:443 → local_ip:50000
+    /// Before fix: src_port (443) was tried first — wrong, it's remote.
+    /// After fix: is_local(dst_ip) detects it's local, selects dst_port (50000).
+    #[test]
+    fn test_determine_local_port_inbound_real_code_path() {
+        // Get the real local IP from the system — this is the same function
+        // the production code calls at startup.
+        let local_ip = detect_local_ip()
+            .expect("detect_local_ip() failed — cannot run this test without a network interface");
+
+        // Inbound packet: remote 8.8.8.8:443 → local (local_ip):50000
+        let (local_port, remote_port) = determine_local_port(
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            443,
+            local_ip,
+            50000,
+            local_ip,
+        );
+
+        assert_eq!(
+            local_port, 50000,
+            "inbound packet: local_port must be 50000 (dst_port), NOT 443 (src_port). \
+             This is the real production code path — determine_local_port() with the \
+             actual system-detected local IP."
+        );
+        assert_eq!(remote_port, 443);
+    }
+
+    /// Test the real determine_local_port() with an outbound packet.
+    /// Outbound: local_ip:50000 → 8.8.8.8:443
+    /// src_ip matches local_ip → src_port (50000) is local.
+    #[test]
+    fn test_determine_local_port_outbound_real_code_path() {
+        let local_ip = detect_local_ip()
+            .expect("detect_local_ip() failed — cannot run this test without a network interface");
+
+        let (local_port, remote_port) = determine_local_port(
+            local_ip,
+            50000,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            443,
+            local_ip,
+        );
+
+        assert_eq!(local_port, 50000);
+        assert_eq!(remote_port, 443);
+    }
+
+    /// Test determine_local_port() when neither IP matches local (fallback).
+    /// Both IPs are external — fallback returns src_port as local.
+    #[test]
+    fn test_determine_local_port_neither_matches_fallback() {
+        let local_ip = detect_local_ip()
+            .expect("detect_local_ip() failed — cannot run this test without a network interface");
+
+        // Both IPs are external — neither matches.
+        let (local_port, remote_port) = determine_local_port(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            12345,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            443,
+            local_ip,
+        );
+
+        // Fallback: src_port as local.
+        assert_eq!(local_port, 12345);
+        assert_eq!(remote_port, 443);
+    }
+
+    /// Test detect_local_ip() actually returns something on a live system.
+    #[test]
+    fn test_detect_local_ip_returns_non_loopback() {
+        let ip = detect_local_ip().expect("detect_local_ip() returned None on live system");
+        assert!(!ip.is_unspecified(), "local IP must not be 0.0.0.0");
+        assert!(
+            !ip.is_loopback(),
+            "local IP must not be loopback (127.x.x.x)"
+        );
+    }
 }
