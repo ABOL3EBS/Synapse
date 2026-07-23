@@ -4,9 +4,10 @@ Unprivileged capture loop. Receives BPF fd from helper, reads raw packets, parse
 
 ## Code location
 
-`crates/agent/src/main.rs` (630 lines) — standalone binary crate
+`crates/agent/src/main.rs` (772 lines) — standalone binary crate
 `crates/agent/src/flow/mod.rs` (710 lines) — in-memory session window
 `crates/agent/src/enrichment/mod.rs` (495 lines) — 4-thread enrichment worker pool
+`crates/agent/src/detectors/mod.rs` (290 lines) — detector framework, RuleDetector, timeout enforcement
 
 ## Startup sequence
 
@@ -89,7 +90,7 @@ loop {
 
 ## Dependencies
 
-`synapse-common` (EnforcementCommand, PacketInfo, EnrichmentKind, EnrichmentRequest, IpcMessage), `synapse-platform-macos` (protocol, process_lookup), `libc`, `log`, `env_logger`
+`synapse-common` (EnforcementCommand, PacketInfo, EnrichmentKind, EnrichmentRequest, IpcMessage, Detector trait, DetectorFinding, FlowRecord), `synapse-platform-macos` (protocol, process_lookup), `libc`, `log`, `env_logger`
 
 ## Gotchas
 

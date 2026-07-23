@@ -9,6 +9,7 @@
 // Flow tracker (§4 step 3): in-memory session window with ~100ms ticks.
 // poll() with timeout ensures tick() fires even on quiet networks.
 
+mod detectors;
 mod enrichment;
 mod flow;
 
@@ -369,6 +370,16 @@ fn main() -> io::Result<()> {
     // Start enrichment worker pool (async side-channel, never blocks hot path).
     let enrich_pool = enrichment::EnrichmentPool::new();
 
+    // Register detectors — each wrapped in Arc for timeout enforcement.
+    let detectors: Vec<Arc<dyn synapse_common::Detector>> =
+        vec![Arc::new(detectors::RuleDetector::new())];
+    let detector_timeout = std::time::Duration::from_millis(100); // 100ms budget per detector
+    info!(
+        "registered {} detector(s) with {}ms timeout",
+        detectors.len(),
+        detector_timeout.as_millis()
+    );
+
     // Capture loop — uses poll() with 100ms timeout so tick() fires even
     // on quiet networks. A blocking read() would pin memory forever.
     let mut pkt_count: u64 = 0;
@@ -400,6 +411,44 @@ fn main() -> io::Result<()> {
                 expired.len(),
                 tracker.len()
             );
+            // Run detectors on each expired flow (log only — no decision engine yet).
+            for &flow_id in &expired {
+                if let Some(flow_ref) = tracker.get(flow_id) {
+                    // Convert tracker FlowRecord → common FlowRecord for detectors.
+                    let common_flow = synapse_common::FlowRecord {
+                        flow_id: flow_ref.flow_id,
+                        src_ip: flow_ref.key.a_ip,
+                        dst_ip: flow_ref.key.b_ip,
+                        src_port: flow_ref.key.a_port,
+                        dst_port: flow_ref.key.b_port,
+                        protocol: flow_ref.key.protocol,
+                        local_port: flow_ref.local_port,
+                        pid: flow_ref.pid,
+                        packet_count: flow_ref.packet_count,
+                        byte_count: flow_ref.byte_count,
+                        dns_name: flow_ref.dns_name.clone(),
+                        process_path: flow_ref.process_path.clone(),
+                        country_code: flow_ref.country_code.clone(),
+                        reputation_score: flow_ref.reputation_score,
+                    };
+                    let findings =
+                        detectors::run_detectors(&detectors, &common_flow, detector_timeout);
+                    // Log findings — decision engine will consume these later.
+                    for finding in &findings {
+                        if finding.score > 0.0 {
+                            info!(
+                                "DETECT flow={} {:?} score={:.2} severity={:?} status={:?} evidence={:?}",
+                                flow_id,
+                                finding.detector_id,
+                                finding.score,
+                                finding.severity,
+                                finding.status,
+                                finding.evidence,
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         if poll_ret == 0 {

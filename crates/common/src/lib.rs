@@ -10,9 +10,13 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 pub use types::{
-    BlockId, DesiredFirewallState, EnforcementReceipt, EnrichmentKind, EnrichmentRequest,
-    EnrichmentResult, PortPidCache, ReconciliationReport, ValidatedBlock,
+    BlockId, DesiredFirewallState, DetectorConfig, DetectorFinding, DetectorId, DetectorStatus,
+    EnforcementReceipt, EnrichmentKind, EnrichmentRequest, EnrichmentResult, Evidence, FlowRecord,
+    PortPidCache, ReconciliationReport, Severity, ValidatedBlock,
 };
+
+// Re-export the Detector trait and run_detector_with_timeout function.
+pub use types::{run_detector_with_timeout, Detector};
 
 // ---------------------------------------------------------------------------
 // Enforcement Protocol
