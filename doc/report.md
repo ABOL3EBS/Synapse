@@ -1,5 +1,253 @@
 # Synapse IPS — Day Report
 
+## 2026-07-22
+
+---
+
+### What was done today
+
+**1. Port→PID cache — full pipeline built and verified end-to-end.**
+
+Apple DTS confirmed there is no sysctl MIB to query which process owns a socket on macOS. The only mechanism is a per-process fd scan. Today we built the complete pipeline: `build_port_pid_cache()` scans all processes via `proc_listpids(PROC_ALL_PIDS)`, enumerates each process's fds via `proc_pidinfo(PROC_PIDLISTFDS)`, and probes each socket fd via `proc_pidinfo(PROC_PIDFDINFO)` to extract `SocketFDInfo`. The cache is serialized into `PortPidCache`, sent to the agent via the existing SCM_RIGHTS IPC channel every 5 seconds, and used to resolve `src_port → PID → executable path` on every packet.
+
+**Port byte-order fix.** `insi_lport` and `insi_fport` in `InSockInfo` are stored as big-endian u16 in the first 2 bytes of a `c_int` field. On little-endian ARM, reading the full `c_int` as native-endian gives a wrong value (e.g., port 60202 → c_int 10987). Fixed with `read_port_be()` — reads 2 raw bytes at a hardcoded offset and applies `u16::from_be_bytes`. Offsets (268 for lport, 264 for fport) were verified by 3 independent tests against lsof ground truth.
+
+**NULL pointer bug.** `proc_listpids` and `proc_pidinfo` distinguish NULL pointer (query size) from non-null with size=0 (returns 0 silently). Passing a zeroed buffer with size=0 returned 0 fds. Fixed by passing `std::ptr::null_mut()` for size queries.
+
+**Stack-copy offset bug.** Computing struct field offsets via `&(*copy).field` on a `ptr::read()` copy gives garbage addresses — it measures distance to the stack-local copy, not the original struct. Fixed by using pointer arithmetic on the original struct.
+
+**libproc integration.** Added `libproc = "0.14"` dependency to `platform-macos/Cargo.toml`. The crate provides typed `#[repr(C)]` structs (via bindgen) for all FFI: `SocketFDInfo` (792 bytes), `SocketInfo` (768), `SocketInfoProto` (528), `InSockInfo` (80), `ProcFDInfo` (8). Struct sizes verified by `test_struct_sizes`.
+
+**IPC extended.** `IpcMessage` enum now carries `PortPidCache`. Agent-side IPC reader thread receives cache, stores in `Arc<Mutex<HashMap<(u16, u8), u32>>>`. Main loop locks cache, resolves `src_port` first, `dst_port` fallback, passes PID to flow tracker.
+
+**Live E2E verified.** Helper sends 49–51 entries (~483 PIDs, ~6675 fds, ~7–8ms root scan). Agent receives cache, resolves Brave Browser connection to `pid=743 → Brave Browser Helper`.
+
+---
+
+**2. Flow tracker — in-memory session window built and verified.**
+
+Replaced the placeholder per-destination `HashSet<IpAddr>` with a proper flow tracker. Every unique `(src_ip, src_port, dst_ip, dst_port, proto)` tuple creates a `FlowRecord` with timestamps, packet/byte counts, local_port, PID, and enrichment attachment slots.
+
+**Direction-agnostic canonicalization.** `FlowKey` sorts `(ip, port)` as bound pairs — forward and response packets produce the same key. This means a TCP SYN and its ACK both update the same flow. The canonicalization is: if `(ip_a, port_a)` > `(ip_b, port_b)`, swap them. This is correct because flow tracking is about the session, not the direction.
+
+**local_port stored separately.** The canonical key discards direction, but port→PID cache lookup requires knowing which side is local. `local_port` is set once at flow creation from the original packet's `src_port` (or `dst_port` if src is remote), independent of the key's ordering.
+
+**PID stored once.** Resolved at creation from `local_port` via port→PID cache. Not updated after — process may change, but PID is a snapshot at creation time.
+
+**poll()-based capture loop.** Replaced blocking `read()` with `poll()` + 100ms timeout. `tick()` fires on every iteration (even on timeout), expiring flows older than 5 seconds. This ensures memory is reclaimed on quiet networks, not only on packet arrival.
+
+**MAX_FLOWS eviction.** Hard cap of 100,000 concurrent flows. On overflow, oldest flow (by `first_seen`) is evicted with a warning log. Prevents unbounded memory growth under heavy traffic.
+
+**Enrichment attachment.** `attach_enrichment()` merges DNS, process path, GeoIP, and reputation results into the flow record. Results arrive asynchronously from the enrichment worker pool — never gate the hot path.
+
+**9 unit tests pass.** Canonicalization (forward/response identity, loopback, IPv6, different protocols), new vs existing flow, forward+response same flow, max flows eviction, tick expiry, attach enrichment.
+
+---
+
+**3. Enrichment pipeline fixes.**
+
+Added `flow_id: u64` field to `EnrichmentResult` so enrichment results can be routed back to the correct flow. All 7 `EnrichmentResult` constructors in `enrichment/mod.rs` updated. Main.rs capture loop now attaches results to flows via `tracker.attach_enrichment()`.
+
+---
+
+**4. Logging improvements.**
+
+Flow creation now logs at INFO level: `flow N created: src → dst (proto=X, local_port=Y, pid=Z)`. Tick expiry logs at INFO level: `tick: expired M flows (N remaining)`. Failed enrichment results logged at DEBUG level. These changes made the flow tracker observable without needing `RUST_LOG=debug`.
+
+---
+
+### Architecture — detailed
+
+#### Process model (current state)
+
+```
+synapsed-helper (root)                   synapse-agent (unprivileged)
+┌──────────────────────────────┐        ┌────────────────────────────────────┐
+│ 1. Open /dev/bpf*            │        │ 1. Receive fd via SCM_RIGHTS      │
+│ 2. Set buffer (BIOCSBLEN)    │        │ 2. Query BIOCGBLEN                │
+│ 3. Bind interface (BIOCSETIF) │        │ 3. Raw read() from fd             │
+│ 4. Immediate mode            │──fd───▶│ 4. Parse BpfHdr + IPv4/IPv6       │
+│ 5. Set filter (BIOCSETF)     │        │ 5. Resolve local_port + PID       │
+│ 6. Flush + load pf anchor    │        │ 6. Feed to FlowTracker            │
+│ 7. Enable pf (pfctl -e)      │        │ 7. Dispatch enrichment (async)    │
+│ 8. SCM_RIGHTS fd handoff     │        │ 8. Attach results to flows        │
+│ 9. Cache-push thread (5s)    │──IPC──▶│ 9. Send Block/Unblock commands    │
+│    → PortPidCache            │◀───────│                                   │
+│ 10. Enforcement loop         │        └────────────────────────────────────┘
+│    Block → apply_block()     │
+│    Unblock → remove_block()  │
+│    KillState → kill_state()  │
+└──────────────────────────────┘
+```
+
+#### Data flow — packet to flow record
+
+```
+BPF fd → read() → BpfHdr parsing → parse_ip_frame() → PacketInfo
+                                                            │
+                                                            ▼
+                                              ┌─────────────────────────┐
+                                              │ Port→PID Cache Lookup   │
+                                              │  src_port → PID?        │
+                                              │  else dst_port → PID?   │
+                                              │  else (0, None)         │
+                                              └────────────┬────────────┘
+                                                           │
+                                                           ▼
+                                              ┌─────────────────────────┐
+                                              │ FlowTracker::update()   │
+                                              │  FlowKey::canonicalize() │
+                                              │  if new: create record  │
+                                              │  if existing: update    │
+                                              └────────────┬────────────┘
+                                                           │
+                                                           ▼
+                                              ┌─────────────────────────┐
+                                              │ Enrichment Dispatch     │
+                                              │  DnsReverse (getnameinfo)│
+                                              │  ProcessAttribution     │
+                                              │  GeoIp (stub)           │
+                                              │  Reputation (stub)      │
+                                              └────────────┬────────────┘
+                                                           │
+                                              ┌─────────────────────────┐
+                                              │ drain_results()         │
+                                              │  attach_enrichment()    │
+                                              │  → FlowRecord populated │
+                                              └─────────────────────────┘
+```
+
+#### FlowKey canonicalization
+
+```rust
+pub struct FlowKey {
+    pub ip_a: IpAddr,   // lower IP
+    pub port_a: u16,    // lower port
+    pub ip_b: IpAddr,   // higher IP
+    pub port_b: u16,    // higher port
+    pub protocol: u8,
+}
+```
+
+If `(src_ip, src_port)` > `(dst_ip, dst_port)` lexicographically, swap them. This ensures:
+- `192.168.1.1:50000 → 8.8.8.8:443` and `8.8.8.8:443 → 192.168.1.1:50000` produce the same key
+- Loopback (`127.0.0.1:12345 → 127.0.0.1:80`) is handled correctly
+- IPv6 addresses compared by `Ord` implementation
+
+#### Port→PID cache structure
+
+```rust
+// Key: (port, protocol) — u16 + u8
+// Value: PID of the process owning that socket
+type PortPidCache = HashMap<(u16, u8), u32>;
+```
+
+Lookup priority: `src_port` first (correct for outbound traffic), `dst_port` fallback (correct for inbound). Cache refreshed every 5 seconds by helper's root-scanning thread.
+
+#### SocketFDInfo struct layout (verified by tests)
+
+```
+SocketFDInfo (792 bytes total):
+  [0..24)    prefix (includes ProcFDInfo at offset 8)
+  [24..792)  psi: SocketInfo (768 bytes)
+             VInfoStat (136 bytes) at start
+             soi_proto (SocketInfoProto, 528 bytes) at offset 264 from start
+               pri_in: InSockInfo at offset 264
+                 insi_fport: c_int at offset 264 (BE u16 in first 2 bytes)
+                 insi_lport: c_int at offset 268 (BE u16 in first 2 bytes)
+```
+
+Hardcoded offsets `OFF_LPORT=268`, `OFF_FPORT=264` verified by 3 independent tests against lsof ground truth. Known shortcoming: fragile if Apple changes struct layout.
+
+---
+
+### Commits (chronological)
+
+| Hash | Description |
+|---|---|
+| `2f304e5` | **feat: end-to-end port→PID cache with libproc typed structs and SCM_RIGHTS IPC** — 10 files, +766/-79. libproc FFI, `read_port_be()`, `build_port_pid_cache()`, `probe_socket()`, IPC reader thread, PID lookup wired in agent |
+| `ee190bb` | **feat: in-memory flow tracker with direction-agnostic canonicalization, ~100ms ticks, and enrichment attachment** — 9 files, +915/-67. FlowTracker, FlowKey, FlowRecord, poll()-based capture loop, enrichment integration, 9 tests |
+
+---
+
+### Bugs found
+
+#### Bug 7: Port byte-order on little-endian ARM
+- **File:** `process_lookup.rs` (`probe_socket()`)
+- **Was:** Reading `insi_lport`/`insi_fport` as `c_int` (native-endian) — gives wrong value on LE ARM (port 60202 → c_int 10987)
+- **Fix:** `read_port_be()` — raw BE bytes at hardcoded offsets, `u16::from_be_bytes`
+- **Verified:** `test_probe_socket_lport` and `test_probe_socket_fport` match lsof ground truth
+
+#### Bug 8: NULL pointer vs non-null empty buffer
+- **File:** `process_lookup.rs` (`list_all_pids()`, `list_pid_fds()`)
+- **Was:** Passing zeroed buffer with size=0 to `proc_listpids`/`proc_pidinfo` — returns 0 silently (interprets as "no space" not "query size")
+- **Fix:** Pass `std::ptr::null_mut()` for size queries
+- **Impact:** Without this fix, port→PID cache was always empty
+
+#### Bug 9: Stack-copy offset computation
+- **File:** `process_lookup.rs` (`probe_socket()`)
+- **Was:** `&(*copy).field` on a `ptr::read()` copy — measures distance to stack-local copy, not original struct
+- **Fix:** Pointer arithmetic on original struct (`&mut si.field as *mut T as usize - &mut si as *mut T as usize`)
+- **Impact:** All struct field offsets were garbage
+
+---
+
+### File inventory (current)
+
+| File | Lines | Purpose |
+|---|---|---|
+| `crates/common/src/lib.rs` | 96 | `EnforcementCommand`, `PacketInfo`, `EnforcementBackend` trait, `IpcMessage` re-export |
+| `crates/common/src/types.rs` | 150 | `ValidatedBlock`, `BlockId`, `EnforcementReceipt`, `PortPidCache`, `IpcMessage`, `EnrichmentRequest/Result/Kind` |
+| `crates/platform-macos/src/helper/main.rs` | 389 | Root daemon — BPF ioctls, fd handoff, pf anchor, enforcement loop, cache-push thread |
+| `crates/platform-macos/src/helper/enforce.rs` | 178 | `MacOsEnforcementBackend` — only pfctl executor |
+| `crates/platform-macos/src/protocol.rs` | 112 | SCM_RIGHTS fd-passing + bincode IPC |
+| `crates/platform-macos/src/process_lookup.rs` | 668 | `libproc` FFI — `build_port_pid_cache`, `probe_socket`, `read_port_be`, `lookup_process` |
+| `crates/agent/src/main.rs` | 530 | Unprivileged — BPF reads, IPv4/IPv6, flow tracker, enrichment, IPC reader thread |
+| `crates/agent/src/flow/mod.rs` | 574 | In-memory session window — `FlowKey`, `FlowRecord`, `FlowTracker`, canonicalization, eviction |
+| `crates/agent/src/enrichment/mod.rs` | 495 | 4-thread worker pool — DNS reverse, process attribution, GeoIP/Reputation stubs |
+| **Total** | **3,192** | |
+
+---
+
+### Test results (18 tests)
+
+| Test | Result |
+|---|---|
+| `test_lookup_own_pid` | ✅ resolves own executable path and start time |
+| `test_lookup_invalid_pid` | ✅ fails correctly for nonexistent PID |
+| `test_build_port_pid_cache` | ✅ 39–53 entries, ~500 PIDs, ~5000 fds, ~2ms |
+| `test_probe_socket_lport` | ✅ lport matches lsof ground truth |
+| `test_probe_socket_fport` | ✅ fport matches lsof ground truth |
+| `test_struct_sizes` | ✅ verifies struct sizes, offsets, read_port_be vs lsof |
+| `test_enrichment_pool_dispatch_and_collect` | ✅ 4-thread pool dispatches and collects results |
+| `test_is_public_ip` | ✅ public vs private IP classification |
+| `test_dns_reverse_localhost` | ✅ resolves `127.0.0.1` to `localhost` |
+| `test_canonicalization_forward_and_response_produce_same_key` | ✅ direction-agnostic |
+| `test_canonicalization_same_ip_loopback` | ✅ loopback handled correctly |
+| `test_canonicalization_ipv6` | ✅ IPv6 canonicalization works |
+| `test_canonicalization_different_protocols_are_different_flows` | ✅ TCP≠UDP |
+| `test_update_returns_new_vs_existing` | ✅ NewFlow vs ExistingFlow |
+| `test_forward_and_response_update_same_flow` | ✅ SYN+ACK same flow |
+| `test_max_flows_evicts_oldest` | ✅ oldest evicted at MAX_FLOWS |
+| `test_tick_expires_old_flows` | ✅ flows expire after FLOW_EXPIRY_SECS |
+| `test_attach_enrichment` | ✅ enrichment attaches to flow record |
+
+---
+
+### Known shortcomings (documented, not blocking)
+
+1. **Hardcoded port offsets (268/264)** — `process_lookup.rs` reads `insi_lport`/`insi_fport` at fixed byte offsets. Fragile if Apple changes `SocketFDInfo` layout. Will revisit with dynamic offset computation.
+
+2. **Per-flow DNS/GeoIP/Reputation dispatch** — enrichment is dispatched per-flow, not per-destination-IP. Redundant lookups for flows to the same IP. Fix: global `HashMap<IpAddr, EnrichmentState>` cache.
+
+3. **`FlowRecord` fields `#[allow(dead_code)]`** — `flow_id`, `local_port`, `pid` exist for detector/decision pipeline but are not yet consumed.
+
+4. **GeoIP and Reputation stubs** — return `success: false`. Real implementation deferred.
+
+5. **`reconcile()` stub** — returns `ReconciliationReport::default()`. Real reconciliation deferred.
+
+---
+
 ## 2026-07-21
 
 ---
@@ -309,25 +557,28 @@ pf state showed an entry. Fixed by changing `pass out` → `block out`.
 
 ---
 
-## 4. File inventory
+## 4. File inventory (current as of 07-22)
 
 | File | Lines | Purpose |
 |---|---|---|
-| `crates/common/src/lib.rs` | 81 | `EnforcementCommand`, `PacketInfo`, `EnforcementBackend` trait, IPC constants |
-| `crates/common/src/types.rs` | 62 | `ValidatedBlock`, `BlockId`, `DesiredFirewallState`, `EnforcementReceipt`, `ReconciliationReport` |
-| `crates/platform-macos/src/helper/main.rs` | 347 | Root daemon — BPF ioctls, fd handoff, pf anchor, enforcement loop |
-| `crates/platform-macos/src/helper/enforce.rs` | 180 | `MacOsEnforcementBackend` — only pfctl executor |
-| `crates/agent/src/main.rs` | 289 | Unprivileged — BPF reads, IPv4+IPv6 parsing, IPC |
+| `crates/common/src/lib.rs` | 96 | `EnforcementCommand`, `PacketInfo`, `EnforcementBackend` trait, `IpcMessage` re-export |
+| `crates/common/src/types.rs` | 150 | `ValidatedBlock`, `BlockId`, `EnforcementReceipt`, `PortPidCache`, `IpcMessage`, `EnrichmentRequest/Result/Kind` |
+| `crates/platform-macos/src/helper/main.rs` | 389 | Root daemon — BPF ioctls, fd handoff, pf anchor, enforcement loop, cache-push thread |
+| `crates/platform-macos/src/helper/enforce.rs` | 178 | `MacOsEnforcementBackend` — only pfctl executor |
 | `crates/platform-macos/src/protocol.rs` | 112 | SCM_RIGHTS fd-passing + bincode IPC |
-| `crates/platform-macos/src/lib.rs` | 11 | Re-exports `pub mod protocol` |
-| **Total** | **1,082** | |
+| `crates/platform-macos/src/process_lookup.rs` | 668 | `libproc` FFI — `build_port_pid_cache`, `probe_socket`, `read_port_be`, `lookup_process` |
+| `crates/agent/src/main.rs` | 530 | Unprivileged — BPF reads, IPv4/IPv6, flow tracker, enrichment, IPC reader thread |
+| `crates/agent/src/flow/mod.rs` | 574 | In-memory session window — `FlowKey`, `FlowRecord`, `FlowTracker`, canonicalization, eviction |
+| `crates/agent/src/enrichment/mod.rs` | 495 | 4-thread worker pool — DNS reverse, process attribution, GeoIP/Reputation stubs |
+| **Total** | **3,192** | |
 
 ### Dependencies
 
 | Crate | Dependencies |
 |---|---|
 | `synapse-common` | serde 1.x, bincode 1.x |
-| `synapse-platform-macos` | synapse-common, libc 0.2, serde 1.x, bincode 1.x, log 0.4, env_logger 0.11 |
+| `synapse-platform-macos` | synapse-common, libc 0.2, serde 1.x, bincode 1.x, log 0.4, env_logger 0.11, libproc 0.14 |
+| `synapse-agent` | synapse-common, synapse-platform-macos, libc 0.2, log 0.4, env_logger 0.11 |
 
 ### Documentation files
 
@@ -335,9 +586,12 @@ pf state showed an entry. Fixed by changing `pass out` → `block out`.
 |---|---|
 | `opencode.md` | Agent context — hard rules, conventions, architecture, status |
 | `doc/STATUS.md` | What's built (source of truth) |
+| `doc/report.md` | Day-by-day report with architecture, bugs, test results |
 | `doc/Synapse-IPS-Architecture.md` | Design blueprint (~500 lines) |
-| `crates/common/context.md` | Module map + trait signatures |
+| `doc/components/*/context.md` | Per-component agentic context (6 files) |
+| `crates/common/context.md` | Module map + type inventory |
 | `crates/platform-macos/context.md` | Call trees with line numbers |
+| `crates/agent/src/flow/README.md` | Flow tracker agentic context |
 | `README.md` | Human-facing overview with ASCII art |
 
 ---
@@ -350,16 +604,19 @@ Per §6 architecture doc, the order is:
 2. ~~SCM_RIGHTS fd-passing~~ ✅
 3. ~~Typed IPC (Block/Unblock/KillState)~~ ✅
 4. ~~pf enforcement end-to-end~~ ✅
-5. **Enrichment** — async DNS, geo, process attribution via libproc
-6. **Detector framework** — `Detector` trait + Rule engine + ONNX inference
-7. **Flow tracker** — in-memory session window (~100ms ticks)
-8. **Decision engine** — weighted scoring, policy thresholds
-9. **Storage** — SQLite (WAL mode), single-writer worker
-10. **Dashboard** — Tauri + React
+5. ~~Enrichment~~ ✅ — async DNS, process attribution via libproc
+6. ~~Port→PID cache~~ ✅ — libproc FFI, SCM_RIGHTS IPC, per-process fd scan
+7. ~~Flow tracker~~ ✅ — in-memory session window, ~100ms ticks, direction-agnostic
+8. **Detector framework** — `Detector` trait + Rule engine + ONNX inference
+9. **Decision engine** — weighted scoring, policy thresholds
+10. **Storage** — SQLite (WAL mode), single-writer worker
+11. **Dashboard** — Tauri + React
 
-### Stub: `reconcile()`
+### Stubs
 
-Returns `Ok(ReconciliationReport::default())`. Real reconciliation (§4a) = detect-and-recover from anchor eviction by other tools. Separate work item.
+- **`reconcile()`** — returns `ReconciliationReport::default()`. Real reconciliation (§4a) = detect-and-recover from anchor eviction.
+- **GeoIP enrichment** — returns `success: false`. Real implementation deferred.
+- **Reputation enrichment** — returns `success: false`. Real implementation deferred.
 
 ---
 
@@ -388,3 +645,9 @@ Every step was verified with real terminal output:
 | pf enabled after helper start | ✅ `Status: Enabled for 0 days 00:00:52` |
 | Anchor active in main ruleset | ✅ `pfctl -sr \| grep synapse` shows rules |
 | Outbound block verified | ✅ curl to 8.8.8.8 times out, `pfctl -s state -vv \| grep 8.8.8.8` = empty (no state created) |
+| Port→PID cache (07-22) | ✅ 49–51 entries, ~483 PIDs, ~6675 fds, ~7–8ms root scan |
+| Port→PID live resolve (07-22) | ✅ Brave Browser → pid=743 → `Brave Browser Helper` |
+| Flow tracker creation (07-22) | ✅ flows created for each unique session, INFO-level logs visible |
+| DNS enrichment (07-22) | ✅ `ec2-44-203-161-176.compute-1.amazonaws.com`, `abbass-macbook-air.local` |
+| Flow expiry (07-22) | ✅ `tick: expired M flows (N remaining)` logs after 5s silence |
+| 18 unit tests (07-22) | ✅ all pass — 12 agent, 6 platform-macos |
