@@ -205,11 +205,11 @@ Hardcoded offsets `OFF_LPORT=268`, `OFF_FPORT=264` verified by 3 independent tes
 | `crates/agent/src/main.rs` | 530 | Unprivileged — BPF reads, IPv4/IPv6, flow tracker, enrichment, IPC reader thread |
 | `crates/agent/src/flow/mod.rs` | 574 | In-memory session window — `FlowKey`, `FlowRecord`, `FlowTracker`, canonicalization, eviction |
 | `crates/agent/src/enrichment/mod.rs` | 495 | 4-thread worker pool — DNS reverse, process attribution, GeoIP/Reputation stubs |
-| **Total** | **3,192** | |
+| **Total** | **3,328** | |
 
 ---
 
-### Test results (18 tests)
+### Test results (22 tests)
 
 | Test | Result |
 |---|---|
@@ -231,8 +231,24 @@ Hardcoded offsets `OFF_LPORT=268`, `OFF_FPORT=264` verified by 3 independent tes
 | `test_max_flows_evicts_oldest` | ✅ oldest evicted at MAX_FLOWS |
 | `test_tick_expires_old_flows` | ✅ flows expire after FLOW_EXPIRY_SECS |
 | `test_attach_enrichment` | ✅ enrichment attaches to flow record |
+| `test_canonicalization_swap_case_local_ip_larger` | ✅ swap case (local IP > remote IP) produces identical key |
+| `test_local_port_independent_of_canonical_ordering` | ✅ local_port=50000, not canonical a_port=443 |
+| `test_enrichment_dispatched_per_flow_not_per_ip` | ✅ per-flow dispatch (documented v1 inefficiency) |
+| `test_tick_fires_on_wall_clock_not_packet_count` | ✅ expiry based on Instant::now(), not packet count |
 
 ---
+
+### Design review verification (4 items)
+
+Four specific things from the design review were never confirmed. All four now verified with dedicated unit tests:
+
+**1. Canonicalization — swap case verified.** `test_canonicalization_swap_case_local_ip_larger`: forward packet `192.168.1.100:50000 → 8.8.8.8:443` and response `8.8.8.8:443 → 192.168.1.100:50000` produce identical `FlowKey { a_ip: 8.8.8.8, a_port: 443, b_ip: 192.168.1.100, b_port: 50000 }`. The canonical ordering puts the smaller IP first. The previous test only covered the non-swap case (local IP < remote IP).
+
+**2. Local port independent of canonical ordering verified.** `test_local_port_independent_of_canonical_ordering`: in the swap case (local IP 192.168.1.100 > remote IP 8.8.8.8), `FlowRecord.local_port = 50000` (the real local port), NOT `443` (the canonical `a_port`). PID resolved from `local_port=50000`, not from canonical key ordering. This is critical because port→PID cache lookup requires knowing which side is local — canonicalization discards that information.
+
+**3. Enrichment dedup: per-flow (redundant), documented.** `test_enrichment_dispatched_per_flow_not_per_ip`: two flows to the same destination IP (same IP, different source ports) produce two `NewFlow` events, each triggering `enrich_pool.dispatch()`. DNS/GeoIP/Reputation are dispatched redundantly per-flow. **Known v1 inefficiency** — documented in `flow/mod.rs` header comment, `STATUS.md` shortcomings, and this report. Only process attribution is genuinely flow-specific (different processes can bind the same port). Fix deferred to v2: global `HashMap<IpAddr, EnrichmentState>` cache.
+
+**4. Flow-count bound and tick cadence verified.** `MAX_FLOWS = 100_000` with oldest-eviction overflow (`test_max_flows_evicts_oldest`). `tick()` uses `Instant::now()` (wall-clock), fires on every `poll()` iteration (100ms timeout) — works even during quiet/stalled capture, not only on packet arrival. `test_tick_fires_on_wall_clock_not_packet_count` proves expiry based on real time elapsed, not packet count. This was the resource-exhaustion concern under §1a (actively hostile traffic) — now bounded.
 
 ### Known shortcomings (documented, not blocking)
 
@@ -570,7 +586,7 @@ pf state showed an entry. Fixed by changing `pass out` → `block out`.
 | `crates/agent/src/main.rs` | 530 | Unprivileged — BPF reads, IPv4/IPv6, flow tracker, enrichment, IPC reader thread |
 | `crates/agent/src/flow/mod.rs` | 574 | In-memory session window — `FlowKey`, `FlowRecord`, `FlowTracker`, canonicalization, eviction |
 | `crates/agent/src/enrichment/mod.rs` | 495 | 4-thread worker pool — DNS reverse, process attribution, GeoIP/Reputation stubs |
-| **Total** | **3,192** | |
+| **Total** | **3,328** | |
 
 ### Dependencies
 
@@ -650,4 +666,8 @@ Every step was verified with real terminal output:
 | Flow tracker creation (07-22) | ✅ flows created for each unique session, INFO-level logs visible |
 | DNS enrichment (07-22) | ✅ `ec2-44-203-161-176.compute-1.amazonaws.com`, `abbass-macbook-air.local` |
 | Flow expiry (07-22) | ✅ `tick: expired M flows (N remaining)` logs after 5s silence |
-| 18 unit tests (07-22) | ✅ all pass — 12 agent, 6 platform-macos |
+| 22 unit tests (07-22) | ✅ all pass — 16 agent, 6 platform-macos |
+| Design review: canonicalization swap | ✅ `test_canonicalization_swap_case_local_ip_larger` — identical key |
+| Design review: local_port independence | ✅ `test_local_port_independent_of_canonical_ordering` — correct port |
+| Design review: enrichment dedup | ✅ `test_enrichment_dispatched_per_flow_not_per_ip` — per-flow (documented) |
+| Design review: flow-count bound | ✅ `test_tick_fires_on_wall_clock_not_packet_count` — wall-clock expiry |

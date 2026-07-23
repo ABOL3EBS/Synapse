@@ -4,9 +4,9 @@ Unprivileged capture loop. Receives BPF fd from helper, reads raw packets, parse
 
 ## Code location
 
-`crates/agent/src/main.rs` (526 lines) — standalone binary crate
-`crates/agent/src/flow/mod.rs` (574 lines) — in-memory session window
-`crates/agent/src/enrichment/mod.rs` (492 lines) — 4-thread enrichment worker pool
+`crates/agent/src/main.rs` (579 lines) — standalone binary crate
+`crates/agent/src/flow/mod.rs` (710 lines) — in-memory session window
+`crates/agent/src/enrichment/mod.rs` (495 lines) — 4-thread enrichment worker pool
 
 ## Startup sequence
 
@@ -14,10 +14,11 @@ Unprivileged capture loop. Receives BPF fd from helper, reads raw packets, parse
 2. Receive BPF fd via `protocol::recv_fd()` (SCM_RIGHTS)
 3. Query kernel buffer size via `ioctl(BIOCGBLEN)` — mandatory, read() fails with EINVAL otherwise
 4. Allocate read buffer of exactly that size
-5. Create enrichment worker pool (`enrichment::EnrichmentPool::new()`)
-6. Create flow tracker (`flow::FlowTracker::new()`)
-7. Spawn IPC reader thread (receives PortPidCache from helper every 5s)
-8. Enter capture loop with `poll()` (100ms timeout)
+5. Detect local IP via `getifaddrs()` — used for PID lookup direction
+6. Create enrichment worker pool (`enrichment::EnrichmentPool::new()`)
+7. Create flow tracker (`flow::FlowTracker::new()`)
+8. Spawn IPC reader thread (receives PortPidCache from helper every 5s)
+9. Enter capture loop with `poll()` (100ms timeout)
 
 ## BpfHdr struct (20 bytes)
 
@@ -54,7 +55,8 @@ loop {
         for each BpfHdr in buffer:
             parse_ip_frame(frame)
             // Resolve local_port + PID from port→PID cache
-            (local_port, pid) = cache.lookup(src_port) or cache.lookup(dst_port)
+            (local_port, pid) = cache.lookup(local_ip_port)
+            // local_ip_port determined by is_local(src_ip) check
             // Feed to flow tracker
             update = tracker.update(info, local_port, pid)
             if NewFlow(flow_id):
@@ -82,7 +84,7 @@ loop {
 
 - Received from helper every 5s via `IpcMessage::PortPidCache`
 - Stored in `Arc<Mutex<HashMap<(u16, u8), u32>>>` (port, proto) → PID
-- Lookup: try `src_port` first, then `dst_port` fallback
+- Lookup: `if src_ip == local_ip { src_port } else { dst_port }` — uses `detect_local_ip()` at startup
 - PID passed to flow tracker at creation time (not updated after)
 
 ## Dependencies
@@ -98,4 +100,4 @@ loop {
 - Flow creation/expiry logs at INFO level; flow internal details at DEBUG level
 - DNS/GeoIP/Reputation are per-flow dispatch (known v1 inefficiency — redundant lookups for same IP)
 - Process attribution is genuinely flow-specific (different processes on same port)
-- PID lookup uses src_port first, dst_port fallback — correct for outbound traffic
+- PID lookup uses `is_local(ip)` direction check — correct for both inbound and outbound

@@ -171,6 +171,48 @@ fn parse_ipv6(frame: &[u8]) -> Option<PacketInfo> {
     })
 }
 
+/// Detect the local IP address from the network interface.
+/// Uses getifaddrs() to find IPv4 addresses on non-loopback interfaces.
+/// Returns the first non-loopback IPv4 address found.
+fn detect_local_ip() -> Option<IpAddr> {
+    use std::ffi::CStr;
+
+    let mut ifa_ptr: *mut libc::ifaddrs = std::ptr::null_mut();
+    let ret = unsafe { libc::getifaddrs(&mut ifa_ptr) };
+    if ret != 0 {
+        return None;
+    }
+
+    let mut result = None;
+    let mut ptr = ifa_ptr;
+    while !ptr.is_null() {
+        let ifa = unsafe { &*ptr };
+        // Skip loopback interfaces.
+        if ifa.ifa_flags & libc::IFF_LOOPBACK as u32 != 0 {
+            ptr = ifa.ifa_next;
+            continue;
+        }
+        // Only IPv4 (AF_INET).
+        if !ifa.ifa_addr.is_null() && unsafe { (*ifa.ifa_addr).sa_family } == libc::AF_INET as u8 {
+            let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+            let octets = sin.sin_addr.s_addr.to_ne_bytes();
+            let ip = IpAddr::V4(std::net::Ipv4Addr::new(
+                octets[0], octets[1], octets[2], octets[3],
+            ));
+            // Skip 0.0.0.0 and 255.255.255.255.
+            if !ip.is_unspecified() {
+                let name = unsafe { CStr::from_ptr(ifa.ifa_name) };
+                debug!("detected local IP: {} on {}", ip, name.to_string_lossy());
+                result = Some(ip);
+                break;
+            }
+        }
+        ptr = ifa.ifa_next;
+    }
+    unsafe { libc::freeifaddrs(ifa_ptr) };
+    result
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -266,6 +308,13 @@ fn main() -> io::Result<()> {
     }
     let buf_len = buf_len as usize;
     info!("BPF buffer length from kernel: {buf_len} bytes");
+
+    // Detect local IP from network interface — used for port→PID direction.
+    let local_ip = detect_local_ip().unwrap_or_else(|| {
+        warn!("could not detect local IP — PID lookup will use src_port-first heuristic");
+        IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))
+    });
+    info!("local IP detected: {local_ip}");
 
     info!("capture started — watching for {TEST_TARGET_IP}");
 
@@ -375,8 +424,9 @@ fn main() -> io::Result<()> {
                 }
 
                 // Resolve local_port and PID from the port→PID cache.
-                // local_port is stored on the FlowRecord, independent of
-                // the canonical key's ordering (which discards direction).
+                // local_port is determined by comparing packet IPs to the
+                // detected local IP — NOT by IP-magnitude comparison (that's
+                // canonicalization, which discards direction).
                 let (local_port, pid) = {
                     let cache_guard = port_pid_cache.lock().ok();
                     let cache = cache_guard.as_ref();
@@ -386,9 +436,18 @@ fn main() -> io::Result<()> {
                             c.get(&key).map(|&pid| (port, pid))
                         })
                     };
-                    lookup(info_pkt.src_port, info_pkt.protocol)
-                        .or_else(|| lookup(info_pkt.dst_port, info_pkt.protocol))
-                        .unwrap_or((0, 0))
+                    // Determine which port is local based on which IP matches.
+                    let local = if info_pkt.src_ip == local_ip {
+                        info_pkt.src_port
+                    } else if info_pkt.dst_ip == local_ip {
+                        info_pkt.dst_port
+                    } else {
+                        // Neither IP matches local — fall back to src_port
+                        // (correct for outbound, wrong for inbound, but we
+                        // have no better heuristic without local IP).
+                        info_pkt.src_port
+                    };
+                    lookup(local, info_pkt.protocol).unwrap_or((0, 0))
                 };
 
                 // Feed packet to the flow tracker.
