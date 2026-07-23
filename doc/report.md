@@ -40,7 +40,7 @@ Replaced the placeholder per-destination `HashSet<IpAddr>` with a proper flow tr
 
 **Enrichment attachment.** `attach_enrichment()` merges DNS, process path, GeoIP, and reputation results into the flow record. Results arrive asynchronously from the enrichment worker pool — never gate the hot path.
 
-**9 unit tests pass.** Canonicalization (forward/response identity, loopback, IPv6, different protocols), new vs existing flow, forward+response same flow, max flows eviction, tick expiry, attach enrichment.
+**16 unit tests pass** (as of 07-24). Canonicalization (forward/response identity, loopback, IPv6, different protocols), new vs existing flow, forward+response same flow, max flows eviction, tick expiry, attach enrichment, re-evaluation (due_for_re_evaluate, mark_evaluated, evaluation interval, max re-eval per tick).
 
 ---
 
@@ -267,11 +267,106 @@ Four specific things from the design review were never confirmed. All four now v
 
 2. **Per-flow DNS/GeoIP/Reputation dispatch** — enrichment is dispatched per-flow, not per-destination-IP. Redundant lookups for flows to the same IP. Fix: global `HashMap<IpAddr, EnrichmentState>` cache.
 
-3. **`FlowRecord` fields `#[allow(dead_code)]`** — `flow_id`, `local_port`, `pid` exist for detector/decision pipeline but are not yet consumed.
+3. **`FlowRecord` fields now consumed** — `flow_id`, `local_port`, `pid` used by detector framework and decision engine (resolved 07-23/07-24).
 
 4. **GeoIP and Reputation stubs** — return `success: false`. Real implementation deferred.
 
 5. **`reconcile()` stub** — returns `ReconciliationReport::default()`. Real reconciliation deferred.
+
+---
+
+## 2026-07-23
+
+---
+
+### What was done today
+
+**1. `local_port` direction bug — fixed.**
+
+PID lookup used `src_port` first, `dst_port` fallback, with no `is_local(ip)` check. For inbound packets (src=remote, dst=local), `src_port` is remote — could return wrong PID if remote port was in cache. Fixed by implementing `detect_local_ip()` via `getifaddrs()` at startup, stored in `Arc<Mutex<Option<IpAddr>>>`. Direction check: `if src_ip == local_ip { src_port } else { dst_port }`.
+
+**2. `detect_local_ip()` benchmarked — too expensive for per-packet.**
+
+Measured at 9.065 µs/call (100k iterations). At >10k pkt/s, this would consume >90ms/s of CPU just for local IP detection. Switched to 5s background refresh thread — capture loop reads shared `Arc<Mutex<Option<IpAddr>>>`, zero syscalls per packet.
+
+**3. `determine_local_port()` extracted as testable function.**
+
+Pure function: `(src_ip, src_port, dst_ip, dst_port, local_ip) → local_port`. 4 tests exercise real code path with system-detected local IP:
+- `test_determine_local_port_inbound_real_code_path` — 8.8.8.8:443→local_ip:50000 → local_port=50000
+- `test_determine_local_port_outbound_real_code_path` — local_ip:50000→8.8.8.8:443 → local_port=50000
+- `test_determine_local_port_neither_matches_fallback` — returns src_port
+- `test_detect_local_ip_returns_non_loopback` — returns valid non-loopback IP
+
+**4. Detector framework (§4b) — implemented and verified.**
+
+Architecture doc §4b made real:
+- Types in `common/src/types.rs`: `DetectorId`, `Severity`, `Evidence`, `DetectorStatus` (Completed/TimedOut/Errored), `DetectorFinding`, `Detector` trait (`Send + Sync`), `run_detector_with_timeout()`, `FlowRecord` (common type), `DetectorConfig`
+- `run_detector_with_timeout()` takes `Arc<dyn Detector>`, runs `evaluate()` on its own thread, uses `recv_timeout()` with configurable budget. Returns `TimedOut` finding if exceeded — does NOT join the detector thread.
+- `RuleDetector` in `detectors/mod.rs`: placeholder v1 rules — `dns_blocklist`, `suspicious_port` (4444/5555/6666/7777/8888/9999/31337), `high_packet_count` (>1000).
+- `run_detectors()` runs all registered detectors with timeout, logs findings at INFO with `DETECT` prefix (score > 0 only).
+- Wired into capture loop on flow expiry AND active-flow re-evaluation — log only.
+- Timeout test proves mechanism: 500ms sleeper with 50ms budget returns `TimedOut` within budget.
+
+**Commits (chronological):**
+
+| Hash | Description |
+|---|---|
+| `e583025` | fix: local_port direction — detect local IP, use is_local(ip) check |
+| `f17416c` | fix: extract determine_local_port(), add real-path tests for inbound direction |
+| `8b0f9e3` | fix: benchmark detect_local_ip(), switch to 5s background refresh |
+| `95d90dc` | feat: detector framework (§4b) — Detector trait, timeout enforcement, RuleDetector |
+
+---
+
+## 2026-07-24
+
+---
+
+### What was done today
+
+**1. Decision engine — built and verified.**
+
+`DecisionEngine` in `crates/agent/src/decision/mod.rs` (397 lines):
+- Weighted scoring: `score × confidence × status_weight`. TimedOut=0.1x, Errored=0.0x.
+- Block threshold=0.5, Alert threshold=0.2.
+- TTL from most severe Completed finding, clamped [30s, 24h].
+- `Verdict` enum: `Allow`, `Block { ttl, reason }`, `Alert { reason }`.
+- `FlowFeatures` extracted from FlowRecord.
+- `DecisionConfig` with thresholds + severity→TTL map + min/max TTL clamps.
+- 11 unit tests pass: default config thresholds, no findings → Allow, high score → Block, medium → Alert, low → Allow, TTL clamping, TTL min/max, multiple findings cumulative, Errored zeroed, TimedOut down-weighted.
+
+**2. Active-flow re-evaluation — implemented and verified.**
+
+Flow tracker gained re-evaluation capability:
+- `FlowRecord.last_evaluated: Instant` field.
+- `EVALUATION_INTERVAL_SECS = 1`, `MAX_RE_EVAL_PER_TICK = 100`.
+- `tick()` returns `(expired: Vec<u64>, due_for_re_evaluate: Vec<u64>)` — tuple.
+- `mark_evaluated(flow_id)` bumps `last_evaluated` regardless of finding status.
+- 3 new tests: re-evaluate list, mark_evaluated prevents immediate re-eval, MAX_RE_EVAL cap.
+
+**3. Capture loop integration — log-only verdicts.**
+
+Decision engine wired into capture loop:
+- `DecisionEngine::new(DecisionConfig::default())` at startup.
+- On flow expiry: run detectors → extract features → decide → log verdict.
+- On active-flow re-evaluation: same pipeline.
+- Verdicts logged with `BLOCK`/`ALERT`/`RE-BLOCK`/`RE-ALERT` prefixes.
+- **Zero enforcement calls** — grep-confirmed. Decision engine runs in observation mode until detector pipeline is trusted.
+
+**4. Verification.**
+
+- `cargo build --workspace` — clean
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean
+- `cargo fmt --all -- --check` — clean
+- `cargo test --workspace` — 47 tests pass (41 agent + 6 platform-macos)
+- Commit `fb77993`: `feat: decision engine with weighted scoring and active-flow re-evaluation`
+- Pushed to `main`
+
+**Commits (chronological):**
+
+| Hash | Description |
+|---|---|
+| `fb77993` | feat: decision engine with weighted scoring and active-flow re-evaluation — 5 files, +760/-34 |
 
 ---
 

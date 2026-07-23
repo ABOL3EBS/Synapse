@@ -1,13 +1,14 @@
-# Agent Engine — BPF Reads + Flow Tracker + Enrichment Integration
+# Agent Engine — BPF Reads + Flow Tracker + Enrichment + Detectors + Decision Engine
 
-Unprivileged capture loop. Receives BPF fd from helper, reads raw packets, parses into `PacketInfo`, feeds flow tracker, dispatches enrichment, attaches results to flows.
+Unprivileged capture loop. Receives BPF fd from helper, reads raw packets, parses into `PacketInfo`, feeds flow tracker, dispatches enrichment, attaches results to flows, runs detectors, makes decisions (log-only).
 
 ## Code location
 
-`crates/agent/src/main.rs` (772 lines) — standalone binary crate
-`crates/agent/src/flow/mod.rs` (710 lines) — in-memory session window
+`crates/agent/src/main.rs` (819 lines) — standalone binary crate
+`crates/agent/src/flow/mod.rs` (898 lines) — in-memory session window
 `crates/agent/src/enrichment/mod.rs` (495 lines) — 4-thread enrichment worker pool
-`crates/agent/src/detectors/mod.rs` (290 lines) — detector framework, RuleDetector, timeout enforcement
+`crates/agent/src/detectors/mod.rs` (343 lines) — detector framework, RuleDetector, timeout enforcement
+`crates/agent/src/decision/mod.rs` (397 lines) — DecisionEngine, weighted scoring, Verdict, active-flow re-evaluation
 
 ## Startup sequence
 
@@ -18,8 +19,9 @@ Unprivileged capture loop. Receives BPF fd from helper, reads raw packets, parse
 5. Detect local IP via `getifaddrs()` — shared `Arc<Mutex<Option<IpAddr>>>` with 5s background refresh (benchmarked: 9.065 us/call, too expensive for per-packet)
 6. Create enrichment worker pool (`enrichment::EnrichmentPool::new()`)
 7. Create flow tracker (`flow::FlowTracker::new()`)
-8. Spawn IPC reader thread (receives PortPidCache from helper every 5s)
-9. Enter capture loop with `poll()` (100ms timeout)
+8. Create decision engine (`decision::DecisionEngine::new(DecisionConfig::default())`)
+9. Spawn IPC reader thread (receives PortPidCache from helper every 5s)
+10. Enter capture loop with `poll()` (100ms timeout)
 
 ## BpfHdr struct (20 bytes)
 
@@ -49,7 +51,25 @@ Returns `Option<PacketInfo>` — malformed frames silently skipped.
 ```
 loop {
     poll(bpf_fd, timeout=100ms)     // timeout ensures tick() fires on quiet networks
-    tracker.tick()                   // expire stale flows, reclaim memory
+    let (expired, re_evaluate) = tracker.tick()  // expire stale + find flows due for re-eval
+
+    // Re-evaluate active flows (1s interval, MAX_RE_EVAL_PER_TICK=100)
+    for flow_id in re_evaluate:
+        let record = tracker.get(flow_id)              // returns flow::FlowRecord
+        let common_record = convert_to_common(record)  // flow::FlowRecord → common::types::FlowRecord
+        let flow_age = record.age()                    // Instant::now() - first_seen
+        let features = FlowFeatures::from_flow(&common_record, flow_age)
+        let findings = run_detectors(&detectors, &common_record, DETECTOR_TIMEOUT)
+        let verdict = decision_engine.evaluate(&features, &findings)
+        match verdict:
+            Block { .. } => log "RE-BLOCK: flow {flow_id} ..."
+            Alert { .. } => log "RE-ALERT: flow {flow_id} ..."
+            Allow => log "RE-ALLOW: flow {flow_id} ..."
+        tracker.mark_evaluated(flow_id)
+
+    // Expire old flows
+    for flow_id in expired:
+        // (detectors already ran on re-evaluation if needed)
 
     if data available:
         libc::read(bpf_fd, buf)      // one read can return multiple packets
@@ -62,7 +82,7 @@ loop {
             update = tracker.update(info, local_port, pid)
             if NewFlow(flow_id):
                 log "flow N created: ..."
-                enrich_pool.dispatch(EnrichmentRequest { flow_id, ... })
+                enrich_pool.dispatch(EnrichmentRequest { flow_id, src_ip, dst_ip, src_port, dst_port, protocol, pid, kinds })
             if hit test target IP && not blocked:
                 send_message(Block { ip, ttl })
 
@@ -75,11 +95,34 @@ loop {
 ## Flow tracker (`flow/mod.rs`)
 
 - `FlowKey`: direction-agnostic canonical `(ip, port)` pair — forward and response produce the same key
-- `FlowRecord`: stores `flow_id`, `key`, `local_port`, `pid`, timestamps, packet/byte counts, enrichment results
+- `FlowRecord` (flow-tracker version, not `common::types::FlowRecord`): stores `flow_id`, `key`, `local_port`, `pid`, timestamps (`first_seen`, `last_seen`, `last_evaluated` as `Instant`), packet/byte counts, enrichment results
 - `FlowTracker`: `HashMap<u64, FlowRecord>` + `HashMap<FlowKey, u64>` index
 - `MAX_FLOWS = 100_000`, oldest-eviction on overflow
 - `FLOW_EXPIRY_SECS = 5`, expired on every `tick()` call (100ms poll timeout)
+- `tick()` returns `(expired: Vec<u64>, due_for_re_evaluate: Vec<u64>)` — tuple
+- `EVALUATION_INTERVAL_SECS = 1`, `MAX_RE_EVAL_PER_TICK = 100`
+- `mark_evaluated(flow_id)` bumps `last_evaluated` regardless of finding status
 - Enrichment results attached via `attach_enrichment()` — DNS, process path, GeoIP, reputation
+
+## Detector framework (`detectors/mod.rs`)
+
+- `Detector` trait: `fn evaluate(&self, flow: &FlowRecord) -> DetectorFinding` (single finding, not Vec)
+- `run_detector_with_timeout(detector: Arc<dyn Detector>, flow: &FlowRecord, budget: Duration)` — runs on separate thread, `recv_timeout()` enforces budget
+- `RuleDetector`: placeholder v1 rules (dns_blocklist, suspicious_port, high_packet_count)
+- `run_detectors(detectors: &[Arc<dyn Detector>], flow: &FlowRecord, timeout: Duration) -> Vec<DetectorFinding>` — runs all with timeout, returns one finding per detector
+- **No catch_unwind yet** — panics silently detach (known limitation)
+- **No circuit breaker** — failing detectors retried every interval (known limitation)
+
+## Decision engine (`decision/mod.rs`)
+
+- `DecisionEngine::new(config: DecisionConfig)` — creates engine
+- `evaluate(features: &FlowFeatures, findings: &[DetectorFinding]) -> Verdict` — weighted scoring: `score × confidence × status_weight`
+  - Completed=1.0x, TimedOut=0.1x, Errored=0.0x
+  - Block threshold=0.5, Alert threshold=0.2
+  - TTL from most severe Completed finding, clamped [min_ttl, max_ttl]
+- `Verdict` enum: `Allow`, `Block { ttl, reason }`, `Alert { reason }`
+- **No uncertainty/findings_summary fields yet** — known limitation
+- **Log-only** — zero enforcement calls until detector pipeline is trusted
 
 ## Port→PID cache
 
@@ -90,7 +133,7 @@ loop {
 
 ## Dependencies
 
-`synapse-common` (EnforcementCommand, PacketInfo, EnrichmentKind, EnrichmentRequest, IpcMessage, Detector trait, DetectorFinding, FlowRecord), `synapse-platform-macos` (protocol, process_lookup), `libc`, `log`, `env_logger`
+`synapse-common` (EnforcementCommand, PacketInfo, EnrichmentKind, EnrichmentRequest, IpcMessage, Detector trait, DetectorFinding, DetectorId, FlowRecord, DecisionConfig, Verdict, FlowFeatures, run_detector_with_timeout), `synapse-platform-macos` (protocol, process_lookup), `libc`, `log`, `env_logger`
 
 ## Gotchas
 
@@ -103,3 +146,5 @@ loop {
 - Process attribution is genuinely flow-specific (different processes on same port)
 - PID lookup uses `determine_local_port()` with `is_local(ip)` check — correct for both inbound and outbound
 - `determine_local_port()` extracted as testable function — 4 tests exercise real code path with system-detected local IP
+- Re-evaluation uses HashMap iteration (non-deterministic, starvation risk — fix: timing wheel)
+- Decision engine is log-only — no enforcement calls yet

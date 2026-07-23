@@ -1,4 +1,4 @@
-# Synapse IPS — macOS Architecture Blueprint (v3, Free Tier)
+# Synapse IPS — macOS Architecture Blueprint (v4, Free Tier)
 
 **Platform:** macOS only
 **Enforcement path:** BPF packet capture + `pf` firewall (no paid Apple Developer account required)
@@ -159,9 +159,10 @@ There's also a direct conflict with the stated free-tier rationale: **Windows ke
         │  └──────────────┬────────────────┘                     │
         │                 ▼                                     │
         │  ┌─────────────────────────────┐                     │
-        │  │  Decision Engine                │  weighted scoring:   │
-        │  │  (AI score + rule hits −        │  merges all signals  │
-        │  │   trust adjustments = verdict)  │  into final verdict  │
+        │  │  Decision Engine                │  score × confidence  │
+        │  │  score × confidence ×           │  × status_weight     │
+        │  │  status_weight → verdict        │  → Verdict enum      │
+        │  │  BUILT — log-only in v1         │  Allow/Block/Alert   │
         │  └──────────────┬────────────────┘                     │
         │                 ▼                                     │
         │  ┌─────────────────────────────┐                     │
@@ -195,6 +196,8 @@ There's also a direct conflict with the stated free-tier rationale: **Windows ke
 | **Enforcement** | `pf` via `pfctl`, invoked only by `synapsed-helper` behind an `EnforcementBackend` trait (typed values only — `IpAddr`/`Duration`, never strings — passed as argv, never shell-interpolated); direct ioctl planned as a latency optimization, not a security fix | Native macOS firewall since Leopard. Anchor tables for dynamic block/allow. No kernel driver, no NE entitlement. Typed values close the injection risk at the data layer; argv-based invocation (never `sh -c` string building) closes it at the execution layer — both are required, neither alone is sufficient. See §4c. |
 | **Process Attribution** | `libproc` bindings / parsed `lsof`-equivalent syscalls | Maps a flow to a PID/executable path without Endpoint Security entitlement. |
 | **Agent Engine** | Rust, `std::thread` + `crossbeam` | No `tokio`. This isn't a web server — treat it like an OS service. Avoids async runtime bloat for what is fundamentally a tight capture/process loop. A hybrid `tokio`+`crossbeam` runtime was proposed in review and declined for v1 — the actual driver of that proposal was a control-plane backend that doesn't exist yet. See §1b. |
+| **Decision Engine** | Rust, weighted scoring (score × confidence × status_weight) | `DecisionEngine` merges all detector findings into a single verdict (Allow/Block/Alert). TimedOut findings down-weighted (0.1×), Errored excluded (0×). TTL from most severe Completed finding, clamped [30s, 24h]. Log-only in v1 — zero enforcement calls until detector pipeline is trusted. |
+| **Active-flow Re-evaluation** | Per-flow `last_evaluated` timestamp, 1s interval, MAX_RE_EVAL_PER_TICK=100 | `tick()` returns `(expired, due_for_re_evaluate)` tuple. Flows re-scored every second if they have findings, enabling detection to evolve as enrichment arrives or behavior changes. |
 | **Concurrency** | `crossbeam` channels, `rayon` (only if a detector needs data-parallel scoring) | Predictable, low-overhead, no reactor/executor overhead. |
 | **Detection Scheduling** | Each detector call wrapped in a `DetectorFinding` (score, confidence, severity, evidence, `latency_us`, `status`) with an enforced timeout per detector | Makes the existing "no detector blocks on its own" principle actually true instead of aspirational — a hung ONNX inference or reputation lookup reports `TimedOut`/`Errored` and the decision engine proceeds with whatever findings it has. See §4b. |
 | **Inference** | ONNX Runtime (Rust bindings, `ort` crate) | Compiles trained models to native C++ execution speed, runs inside the agent process — fully local, no cloud call. |
@@ -218,8 +221,9 @@ The hot path (packets in, verdict out) and enrichment run as two decoupled seque
 2. **Fast-Path:** Immediate match against known-bad rules/blocklists — including reputation-feed IPs **pre-seeded into the pf block table proactively**, before any traffic to them occurs — sends a typed `Block` command to the helper. This closes the first-packet exposure gap for *known* threats; it does not (and cannot, given a passive-tap architecture) prevent the triggering packet of a *novel* threat from being delivered. That gap is accepted and tracked, not hidden (see §1, first bullet).
 3. **Flow Tracking:** Traffic aggregated into sessions over an in-memory window (~100ms ticks), attaching whatever enrichment context has landed by this point (see below) without blocking for it, and producing feature vectors (packet_frequency, byte_ratio, connection_duration, destination reputation, **detection latency / flow-age-at-decision**, etc.). Flow-age is tracked explicitly so the decision engine knows how much of a given flow had already been delivered before a verdict was reached.
 4. **Detection:** Feature vectors run through every registered detector (rules, ONNX, reputation) independently. Each call is wrapped in a `DetectorFinding` with an enforced per-detector latency budget (see §4b) — no detector blocks the others or the decision engine, by construction, not just by intent.
-5. **Decision:** Weighted scoring merges all detector findings into a single verdict, weighting down or ignoring findings with a `TimedOut`/`Errored` status rather than treating a missing result as a silent zero. Example: `AI score 85 + known-malware-domain +90 + unsigned-binary +30 − trusted-process −40 = 165 → BLOCK`. This is what prevents any single false positive (or missing detector result) from being fatal.
-6. **Enforce:** The agent calls `EnforcementBackend::apply_block(...)` (or `remove_block`) — never a raw string — which `synapsed-helper` is the sole implementer of (see §4c). The trait, not just the wire format, is what guarantees typed-and-argv-safe execution.
+5. **Decision:** `DecisionEngine` (built, log-only) merges all detector findings into a single `Verdict` via weighted scoring: `score × confidence × status_weight`. TimedOut findings weighted at 0.1×, Errored at 0× — this prevents any single false positive or missing detector result from being fatal. Block threshold=0.5, Alert threshold=0.2. TTL derived from most severe Completed finding, clamped [30s, 24h]. Currently wired into capture loop with verdicts logged at INFO — zero enforcement calls until detector pipeline is proven trusted.
+6. **Active-flow Re-evaluation:** Flows are re-scored every `EVALUATION_INTERVAL_SECS` (1s), bounded by `MAX_RE_EVAL_PER_TICK` (100). `tick()` returns `(expired, due_for_re_evaluate)` — expired flows are removed, stale flows are re-evaluated through detectors + decision engine. This enables detection to evolve as enrichment arrives or behavior changes over a flow's lifetime.
+7. **Enforce:** The agent calls `EnforcementBackend::apply_block(...)` (or `remove_block`) — never a raw string — which `synapsed-helper` is the sole implementer of (see §4c). The trait, not just the wire format, is what guarantees typed-and-argv-safe execution. **Not yet wired** — decision engine currently logs verdicts only.
 7. **Log:** Every decision and its inputs flow through an event queue to a single SQLite storage worker (WAL mode) in the unprivileged agent — never a direct write from the hot path, and never touched by the privileged helper.
 
 **Enrichment (separate, asynchronous sequence):**
@@ -278,6 +282,7 @@ Typed values at the enforcement IPC boundary (`IpAddr`, `Duration`, structured e
 pub trait EnforcementBackend {
     fn apply_block(&mut self, block: ValidatedBlock) -> Result<EnforcementReceipt>;
     fn remove_block(&mut self, block_id: BlockId) -> Result<EnforcementReceipt>;
+    fn kill_state(&mut self, src: IpAddr, dst: IpAddr, proto: u8) -> Result<EnforcementReceipt>;
     fn reconcile(&mut self, desired: &DesiredFirewallState)
         -> Result<ReconciliationReport>;
 }
@@ -301,29 +306,33 @@ synapse/
 │   ├── common/                   # Shared data contracts — no logic
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── lib.rs
-│   │       └── types.rs          # NetworkEvent, FlowAggregate, Decision, Verdict,
-│   │                             #   DetectorFinding/DetectorStatus (§4b), and
-│   │                             #   ValidatedBlock/BlockId/DesiredFirewallState/
-│   │                             #   ReconciliationReport/EnforcementReceipt (§4c) —
-│   │                             #   shared by both agent (caller) and platform-macos
-│   │                             #   (implementer) without either depending on the
-│   │                             #   other's internals
+│   │       ├── lib.rs            # 101 lines — re-exports all types + trait
+│   │       └── types.rs          # 438 lines — ValidatedBlock, BlockId, DesiredFirewallState,
+│   │                             #   EnforcementReceipt, ReconciliationReport, PortPidCache,
+│   │                             #   EnrichmentKind/Request/Result, DetectorId, Severity,
+│   │                             #   Evidence, DetectorStatus, DetectorFinding, Detector trait,
+│   │                             #   run_detector_with_timeout(), FlowRecord, DecisionConfig,
+│   │                             #   Verdict, FlowFeatures — shared by both agent (caller) and
+│   │                             #   platform-macos (implementer) without either depending on
+│   │                             #   the other's internals
 │   │
 │   ├── agent/                    # Core processing service — runs unprivileged
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── main.rs           # Engine pipeline & worker threads
-│   │       ├── enrichment/       # Async worker pool — process attribution (libproc),
-│   │       │                     #   DNS, reputation lookups. Dispatched on flow
-│   │       │                     #   creation, attaches to the flow whenever it
-│   │       │                     #   completes; never awaited inline on the hot path.
-│   │       ├── flow/             # In-memory session tracking window
-│   │       ├── detectors/        # Detector trait + Rule / ONNX / Reputation impls,
+│   │       ├── main.rs           # 819 lines — engine pipeline, worker threads, capture loop
+│   │       ├── detectors/        # 343 lines — Detector trait + RuleDetector impl,
 │   │       │                     #   each wrapped with a per-detector timeout that
 │   │       │                     #   produces a DetectorFinding (§4b)
-│   │       ├── decision/         # Weighted scoring matrix, policy thresholds
-│   │       └── storage/          # SQLite connection, event queue, single-writer worker
+│   │       ├── enrichment/       # 495 lines — async worker pool (DNS, process attribution,
+│   │       │                     #   GeoIP/Reputation stubs). Dispatched on flow creation,
+│   │       │                     #   attaches to the flow whenever it completes; never
+│   │       │                     #   awaited inline on the hot path.
+│   │       ├── flow/             # 898 lines — in-memory session tracking window,
+│   │       │                     #   direction-agnostic canonicalization, MAX_FLOWS eviction,
+│   │       │                     #   active-flow re-evaluation (1s interval)
+│   │       ├── decision/         # 397 lines — DecisionEngine with weighted scoring,
+│   │       │                     #   Verdict enum, FlowFeatures, DecisionConfig, 11 unit tests
+│   │       └── storage/          # SQLite connection, event queue, single-writer worker (not built)
 │   │
 │   └── platform-macos/           # Native macOS integration — the enforcement boundary
 │       ├── Cargo.toml
@@ -334,30 +343,20 @@ synapse/
 │           │                     #   (§4c) — shared contract between helper & agent
 │           ├── helper/           # synapsed-helper: root, launchd daemon
 │           │   ├── main.rs       # Opens BPF device, hands fd to agent via SCM_RIGHTS
-│           │   ├── enforce.rs    # ONLY implementer of EnforcementBackend for macOS —
-│           │   │                 #   ONLY caller of pfctl, always via argv (Command::arg),
-│           │   │                 #   never via a shell/sh -c string
-│           │   └── reconcile.rs  # EnforcementBackend::reconcile() impl — periodic
-│           │                     #   anchor-eviction detection & recovery (§4a/§4c)
-│           ├── capture.rs        # BPF/libpcap capture wrapper (runs in unprivileged agent
-│           │                     #   once the fd is received)
+│           │   └── enforce.rs    # ONLY implementer of EnforcementBackend for macOS —
+│           │                     #   ONLY caller of pfctl, always via argv (Command::arg),
+│           │                     #   never via a shell/sh -c string
+│           ├── protocol.rs       # SCM_RIGHTS fd-passing + bincode IPC (stream split)
 │           └── process_lookup.rs # libproc-based PID + process-start-time resolution
 │                                 #   (start-time captured alongside PID to avoid
 │                                 #   PID-reuse/TOCTOU misattribution)
-│
-├── models/                       # Exported .onnx artifacts (trained offline in Python)
-│
-└── src-tauri/                    # UI presentation layer
-    ├── Cargo.toml
-    └── src/                      # Tauri IPC handlers → agent Unix socket
-        └── ui/                   # React + Tailwind + shadcn frontend
 ```
 
 **Why this shape:**
 - `common` has zero logic — just types — so both `agent` and `src-tauri` can depend on it without pulling in engine internals.
 - `platform-macos` is the *only* crate that knows about BPF, `pf`, or (later) `NetworkExtension`. `agent` only ever talks to it through a small trait/interface (e.g., `Capture`, `Enforcer`), so the eventual NE migration is contained.
-- `platform-macos` itself splits along the **privilege boundary, not just the platform boundary**: `helper/` is the entire root-privileged surface (BPF open, fd handoff, pfctl, anchor reconciliation) and is deliberately kept as small and auditable as possible; `capture.rs` and `process_lookup.rs` run inside the unprivileged `agent` process once handed the fd. A memory-safety or logic bug in packet parsing, DNS parsing, or process attribution — all of which touch attacker-influenced data — is no longer a root-level bug.
-- `protocol.rs` is the load-bearing file for this boundary: it defines both the *shape* enforcement commands can take (typed `IpAddr`/`Duration`/enum variants — a data-layer guarantee) and the `EnforcementBackend` trait that forces safe, argv-based execution on whoever implements it (an execution-layer guarantee). Neither guarantee alone is sufficient; see §4c for why both are required.
+- `platform-macos` itself splits along the **privilege boundary, not just the platform boundary**: `helper/` is the entire root-privileged surface (BPF open, fd handoff, pfctl, anchor reconciliation) and is deliberately kept as small and auditable as possible; `process_lookup.rs` runs inside the `platform-macos` crate (called by the agent). A memory-safety or logic bug in packet parsing, DNS parsing, or process attribution — all of which touch attacker-influenced data — is no longer a root-level bug.
+- `protocol.rs` is the load-bearing file for this boundary: it defines the SCM_RIGHTS fd-passing and bincode IPC serialization. The `EnforcementBackend` trait lives in `common/src/lib.rs` (the shared data contracts crate), not in `protocol.rs`.
 - No `platform` abstraction pretending to be cross-platform before it needs to be — write it concretely for macOS now, generalize only if/when a second platform is real.
 
 ---
@@ -366,9 +365,28 @@ synapse/
 
 Before ML, before UI: get a minimal pipeline that can **capture one flow via BPF (fd opened by `synapsed-helper`, handed to an unprivileged `synapse-agent` via `SCM_RIGHTS`), log it, and block one test IP by calling `EnforcementBackend::apply_block` on the agent side, which sends a typed command to the helper — the only process that calls `pfctl`, always via argv, never a shell** — end to end, on your own machine. This is a deliberately higher bar than "just get pfctl to block something as root" because it proves the actual v1 claim: that the privilege boundary, the typed-and-safely-invoked enforcement trait, and the IPC layer all hold up together, not just that enforcement works when everything runs as root in one process. IPC is not a later milestone — the typed command handoff between agent and helper *is* this milestone, not a prerequisite deferred past it (see §1b if this is unclear). Get this working before anything else gets built on top of it.
 
+### Milestone status (as of 2026-07-24)
+
+| # | Item | Status |
+|---|---|---|
+| 1 | BPF capture (fd opened by helper, handed to agent) | ✅ Done |
+| 2 | SCM_RIGHTS fd-passing | ✅ Done |
+| 3 | Typed IPC (Block/Unblock/KillState + PortPidCache) | ✅ Done |
+| 4 | pf enforcement end-to-end (apply_block, remove_block, kill_state) | ✅ Done |
+| 5 | Enrichment pipeline (DNS, process attribution, GeoIP/Reputation stubs) | ✅ Done |
+| 6 | Port→PID cache (libproc FFI, per-process fd scan, 5s refresh) | ✅ Done |
+| 7 | Flow tracker (direction-agnostic canonicalization, ~100ms ticks, MAX_FLOWS) | ✅ Done |
+| 8 | Detector framework (Detector trait, timeout enforcement, RuleDetector) | ✅ Done |
+| 9 | Decision engine (weighted scoring, Verdict, active-flow re-evaluation) | ✅ Done (log-only) |
+| 10 | Storage (SQLite WAL single-writer worker) | Not built |
+| 11 | Dashboard (Tauri + React) | Not built |
+| 12 | ONNX model inference | Not built |
+| 13 | Enforcement wiring (decision engine → EnforcementBackend) | Not built — blocked until detector pipeline is trusted |
+
 ---
 
 ## Changelog
 
 - **v2:** Added explicit threat model (§1a); split into privileged `synapsed-helper` / unprivileged `synapse-agent` processes (§1, §2, §5); replaced shell-out `pfctl` string paths with a typed-only enforcement protocol; reframed "instant pfctl block" as fast reactive enforcement with tracked detection latency, not inline prevention (§1, §4); added reputation-feed pre-seeding to the fast path (§4); added `pf` coexistence detect-and-recover behavior (§4a); added process start-time to PID attribution to avoid PID-reuse TOCTOU (§5). Deferred to v2+ and out of scope for this doc: anti-tamper/self-defense, ONNX model/weight integrity protection, event-queue backpressure tuning, IPC auth hardening beyond socket permissions, and flow-window size tuning — see §1a for why these are explicitly out of scope rather than omitted by oversight.
 - **v3 (post internal architecture review):** Adopted three concrete fixes surfaced in review: (1) enrichment decoupled into an async side-channel that never gates the hot path (§4, fixes a real latency bug in the v2 diagram where enrichment sat as a serial stage); (2) per-detector latency budgets via a `DetectorFinding` struct with a `status` field, which actually enforces the "no detector blocks on its own" principle v2 only stated (§4b); (3) enforcement formalized as an `EnforcementBackend` trait rather than a bare wire protocol, making both the typed-data guarantee and the argv-safe-execution guarantee part of one contract, and folding `pf` reconciliation into `reconcile()` (§4c). Also added §1b, documenting three proposals considered and declined for v1 — cross-platform support now, a `tokio`/hybrid runtime, and a centralized control-plane backend — with reasoning, plus a correction of a misconception that IPC was being postponed (it wasn't; see §6). Nothing in §1a, §2's privilege split, or the free-tier/no-signing rationale changed in this revision.
+- **v4 (detector framework + decision engine):** §4b made real — `Detector` trait + `DetectorFinding` + `run_detector_with_timeout()` implemented in `common/src/types.rs`, `RuleDetector` with placeholder v1 rules in `detectors/mod.rs`, wired into capture loop on flow expiry and active-flow re-evaluation (log-only). `DecisionEngine` built in `decision/mod.rs` with weighted scoring (`score × confidence × status_weight`), `Verdict` enum (Allow/Block/Alert), `FlowFeatures`, `DecisionConfig` (block/alert thresholds, severity→TTL map, min/max TTL clamps). Active-flow re-evaluation: `FlowRecord.last_evaluated` timestamp, `EVALUATION_INTERVAL_SECS` (1s), `MAX_RE_EVAL_PER_TICK` (100), `tick()` returns `(expired, due_for_re_evaluate)` tuple. `detect_local_ip()` via `getifaddrs()` at startup with 5s background refresh (benchmarked 9.065 µs/call — too expensive for per-packet). `determine_local_port()` extracted as testable function with `is_local(ip)` direction check. 47 tests pass across workspace (41 agent + 6 platform-macos). Decision engine wired into capture loop with verdicts logged — zero enforcement calls until detector pipeline is trusted. §6 milestone updated: items 1–9 done, 10–13 not built.
