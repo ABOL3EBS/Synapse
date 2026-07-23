@@ -4,7 +4,7 @@ Unprivileged capture loop. Receives BPF fd from helper, reads raw packets, parse
 
 ## Code location
 
-`crates/agent/src/main.rs` (626 lines) — standalone binary crate
+`crates/agent/src/main.rs` (630 lines) — standalone binary crate
 `crates/agent/src/flow/mod.rs` (710 lines) — in-memory session window
 `crates/agent/src/enrichment/mod.rs` (495 lines) — 4-thread enrichment worker pool
 
@@ -14,7 +14,7 @@ Unprivileged capture loop. Receives BPF fd from helper, reads raw packets, parse
 2. Receive BPF fd via `protocol::recv_fd()` (SCM_RIGHTS)
 3. Query kernel buffer size via `ioctl(BIOCGBLEN)` — mandatory, read() fails with EINVAL otherwise
 4. Allocate read buffer of exactly that size
-5. Detect local IP via `getifaddrs()` — used for PID lookup direction
+5. Detect local IP via `getifaddrs()` — shared `Arc<Mutex<Option<IpAddr>>>` with 5s background refresh (benchmarked: 9.065 us/call, too expensive for per-packet)
 6. Create enrichment worker pool (`enrichment::EnrichmentPool::new()`)
 7. Create flow tracker (`flow::FlowTracker::new()`)
 8. Spawn IPC reader thread (receives PortPidCache from helper every 5s)
@@ -84,7 +84,7 @@ loop {
 
 - Received from helper every 5s via `IpcMessage::PortPidCache`
 - Stored in `Arc<Mutex<HashMap<(u16, u8), u32>>>` (port, proto) → PID
-- Lookup: `if src_ip == local_ip { src_port } else { dst_port }` — uses `detect_local_ip()` at startup
+- Lookup: `determine_local_port(src_ip, src_port, dst_ip, dst_port, local_ip)` — reads `local_ip` from `Arc<Mutex<Option<IpAddr>>>` refreshed every 5s
 - PID passed to flow tracker at creation time (not updated after)
 
 ## Dependencies

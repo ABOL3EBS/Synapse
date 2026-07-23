@@ -202,10 +202,10 @@ Hardcoded offsets `OFF_LPORT=268`, `OFF_FPORT=264` verified by 3 independent tes
 | `crates/platform-macos/src/helper/enforce.rs` | 178 | `MacOsEnforcementBackend` — only pfctl executor |
 | `crates/platform-macos/src/protocol.rs` | 112 | SCM_RIGHTS fd-passing + bincode IPC |
 | `crates/platform-macos/src/process_lookup.rs` | 668 | `libproc` FFI — `build_port_pid_cache`, `probe_socket`, `read_port_be`, `lookup_process` |
-| `crates/agent/src/main.rs` | 626 | Unprivileged — BPF reads, IPv4/IPv6, flow tracker, enrichment, IPC reader thread, `determine_local_port()` extracted |
+| `crates/agent/src/main.rs` | 630 | Unprivileged — BPF reads, IPv4/IPv6, flow tracker, enrichment, IPC reader thread, `determine_local_port()` extracted, local IP refresh thread |
 | `crates/agent/src/flow/mod.rs` | 574 | In-memory session window — `FlowKey`, `FlowRecord`, `FlowTracker`, canonicalization, eviction |
 | `crates/agent/src/enrichment/mod.rs` | 495 | 4-thread worker pool — DNS reverse, process attribution, GeoIP/Reputation stubs |
-| **Total** | **3,424** | |
+| **Total** | **3,428** | |
 
 ---
 
@@ -587,10 +587,10 @@ pf state showed an entry. Fixed by changing `pass out` → `block out`.
 | `crates/platform-macos/src/helper/enforce.rs` | 178 | `MacOsEnforcementBackend` — only pfctl executor |
 | `crates/platform-macos/src/protocol.rs` | 112 | SCM_RIGHTS fd-passing + bincode IPC |
 | `crates/platform-macos/src/process_lookup.rs` | 668 | `libproc` FFI — `build_port_pid_cache`, `probe_socket`, `read_port_be`, `lookup_process` |
-| `crates/agent/src/main.rs` | 626 | Unprivileged — BPF reads, IPv4/IPv6, flow tracker, enrichment, IPC reader thread, `determine_local_port()` extracted |
+| `crates/agent/src/main.rs` | 630 | Unprivileged — BPF reads, IPv4/IPv6, flow tracker, enrichment, IPC reader thread, `determine_local_port()` extracted, local IP refresh thread |
 | `crates/agent/src/flow/mod.rs` | 574 | In-memory session window — `FlowKey`, `FlowRecord`, `FlowTracker`, canonicalization, eviction |
 | `crates/agent/src/enrichment/mod.rs` | 495 | 4-thread worker pool — DNS reverse, process attribution, GeoIP/Reputation stubs |
-| **Total** | **3,424** | |
+| **Total** | **3,428** | |
 
 ### Dependencies
 
@@ -674,6 +674,7 @@ Every step was verified with real terminal output:
 | `determine_local_port()` inbound test | ✅ real code path with system-detected local IP — returns dst_port |
 | `determine_local_port()` outbound test | ✅ real code path — returns src_port |
 | `detect_local_ip()` returns valid IP | ✅ non-loopback, non-unspecified |
+| `detect_local_ip()` benchmark | ✅ 9.065 us/call (100k iterations) — too expensive for per-packet, switched to 5s background refresh |
 | Design review: canonicalization swap | ✅ `test_canonicalization_swap_case_local_ip_larger` — identical key |
 | Design review: local_port independence | ✅ `test_local_port_independent_of_canonical_ordering` — correct port |
 | Design review: enrichment dedup | ✅ `test_enrichment_dispatched_per_flow_not_per_ip` — per-flow (documented) |

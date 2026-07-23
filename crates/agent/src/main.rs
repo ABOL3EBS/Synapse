@@ -330,11 +330,30 @@ fn main() -> io::Result<()> {
     info!("BPF buffer length from kernel: {buf_len} bytes");
 
     // Detect local IP from network interface — used for port→PID direction.
-    let local_ip = detect_local_ip().unwrap_or_else(|| {
-        warn!("could not detect local IP — PID lookup will use src_port-first heuristic");
-        IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))
-    });
-    info!("local IP detected: {local_ip}");
+    // Shared with a background refresh thread (handles DHCP/VPN changes).
+    let local_ip_cache: Arc<Mutex<Option<IpAddr>>> =
+        Arc::new(Mutex::new(detect_local_ip().inspect(|&ip| {
+            info!("local IP detected: {ip}");
+        })));
+    {
+        let cache = local_ip_cache.clone();
+        std::thread::Builder::new()
+            .name("local-ip-refresh".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let new_ip = detect_local_ip();
+                if let Ok(mut guard) = cache.lock() {
+                    if *guard != new_ip {
+                        match new_ip {
+                            Some(ip) => info!("local IP changed: {:?} → {}", *guard, ip),
+                            None => warn!("local IP lost (interface down?)"),
+                        }
+                        *guard = new_ip;
+                    }
+                }
+            })
+            .expect("failed to spawn local-ip-refresh thread");
+    }
 
     info!("capture started — watching for {TEST_TARGET_IP}");
 
@@ -457,12 +476,18 @@ fn main() -> io::Result<()> {
                         })
                     };
                     // Determine which port is local based on which IP matches.
+                    // Read local_ip from the periodically-refreshed cache.
+                    let current_local_ip = local_ip_cache
+                        .lock()
+                        .ok()
+                        .and_then(|g| *g)
+                        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)));
                     let (local, _remote) = determine_local_port(
                         info_pkt.src_ip,
                         info_pkt.src_port,
                         info_pkt.dst_ip,
                         info_pkt.dst_port,
-                        local_ip,
+                        current_local_ip,
                     );
                     lookup(local, info_pkt.protocol).unwrap_or((0, 0))
                 };
