@@ -1,24 +1,24 @@
 # Implementation Status — Synapse IPS
 
-**Last verified:** 2026-07-24. Ground-truth ledger — if this file and the architecture doc disagree, this file wins.
+**Last verified:** 2026-07-25. Ground-truth ledger — if this file and the architecture doc disagree, this file wins.
 
 ## Built and working
 
 | Component | File | Lines | Key details |
 |---|---|---|---|
-| Common types | `crates/common/src/lib.rs` | 101 | `EnforcementCommand`, `PacketInfo`, `EnforcementBackend` trait, `EnrichmentRequest`, `EnrichmentResult`, `EnrichmentKind`, IPC constants, re-exports `Detector`, `run_detector_with_timeout`, `DecisionConfig`, `Verdict`, `FlowFeatures` |
-| Shared types | `crates/common/src/types.rs` | 438 | `ValidatedBlock`, `BlockId`, `DesiredFirewallState`, `EnforcementReceipt`, `ReconciliationReport`, `PortPidCache` (HashMap-based), `IpcMessage` enum, enrichment types, `DetectorId` (enum), `Severity` (enum), `Evidence` (`description` + `detail`), `DetectorStatus`, `DetectorFinding`, `Detector` trait (returns single finding), `run_detector_with_timeout()`, `FlowRecord`, `DecisionConfig` (`ttl_by_severity: HashMap<Severity, Duration>`), `Verdict`, `FlowFeatures` (`from_flow()` constructor) |
-| Helper daemon | `crates/platform-macos/src/helper/main.rs` | 389 | BPF raw ioctls, SCM_RIGHTS fd handoff, pf anchor init, enforcement loop, cache-push thread (5s interval). |
-| Enforcement backend | `crates/platform-macos/src/helper/enforce.rs` | 178 | `MacOsEnforcementBackend` — only pfctl executor, idempotent apply_block, TTL auto-unblock, kill_state, stub reconcile |
+| Common types | `crates/common/src/lib.rs` | 114 | `EnforcementCommand`, `PacketInfo`, `EnforcementBackend` trait, `EnrichmentRequest`, `EnrichmentResult`, `EnrichmentKind`, IPC constants (`PF_ANCHOR_NAME`, `PF_TABLE_NAME`, `IPC_SOCKET_PATH`), re-exports `Detector`, `run_detector_with_timeout`, `DecisionConfig`, `Verdict`, `FlowFeatures` |
+| Shared types | `crates/common/src/types.rs` | 456 | `ValidatedBlock`, `BlockId`, `DesiredFirewallState`, `EnforcementReceipt`, `ReconciliationReport`, `PortPidCache` (HashMap-based), `IpcMessage` enum, enrichment types, `DetectorId` (enum), `Severity` (enum), `Evidence` (`description` + `detail`), `DetectorStatus`, `DetectorFinding`, `Detector` trait (returns single finding), `run_detector_with_timeout()` with `catch_unwind` (panic → `Errored`), `FlowRecord`, `DecisionConfig` (`ttl_by_severity: HashMap<Severity, Duration>`), `Verdict`, `FlowFeatures` (`from_flow()` constructor) |
+| Helper daemon | `crates/platform-macos/src/helper/main.rs` | 385 | BPF raw ioctls, SCM_RIGHTS fd handoff, pf anchor init, enforcement loop, cache-push thread (5s interval). Socket permissions 0660. |
+| Enforcement backend | `crates/platform-macos/src/helper/enforce.rs` | 196 | `MacOsEnforcementBackend` — only pfctl executor, idempotent apply_block with AtomicBool TTL cancellation, kill_state, stub reconcile |
 | Process lookup | `crates/platform-macos/src/process_lookup.rs` | 668 | `libproc` crate (v0.14) typed structs for all FFI. **Port→PID cache** (`build_port_pid_cache`): per-process fd scan. **Port reading** via `read_port_be()` — raw BE bytes at verified offsets (268/264), bypasses c_int native-endian corruption on LE ARM. |
-| Agent binary | `crates/agent/src/main.rs` | 819 | BPF reads, IPv4+IPv6 parsing, enrichment pool integration, stream split for IPC reader thread, `detect_local_ip()` via getifaddrs (5s background refresh, benchmarked at 9.065 us/call), `determine_local_port()` with `is_local(ip)` direction check, flow tracker integration, detector framework wired on flow expiry, decision engine wired (log-only verdicts), active-flow re-evaluation |
+| Agent binary | `crates/agent/src/main.rs` | 762 | BPF reads, IPv4+IPv6 parsing, enrichment pool integration, stream split for IPC reader thread, `detect_local_ip()` via getifaddrs (5s background refresh, benchmarked at 9.065 us/call), `determine_local_port()` with `is_local(ip)` direction check, flow tracker integration, detector framework wired on flow expiry, decision engine wired (log-only verdicts), active-flow re-evaluation |
 | Detector framework | `crates/agent/src/detectors/mod.rs` | 343 | `RuleDetector` (placeholder v1 rules: dns_blocklist, suspicious_port, high_packet_count), timeout enforcement via `run_detector_with_timeout()`, `SlowDetector` test proving timeout works |
 | Decision engine | `crates/agent/src/decision/mod.rs` | 397 | `DecisionEngine` with weighted scoring (score × confidence × status_weight), `Verdict` enum (Allow/Block/Alert), `FlowFeatures` extraction, `DecisionConfig` with block/alert thresholds + severity→TTL map. 11 unit tests. Wired into capture loop — log-only, zero enforcement calls. |
 | Enrichment pool | `crates/agent/src/enrichment/mod.rs` | 495 | 4-thread worker pool (`std::thread` + `mpsc`), DNS reverse via `getnameinfo`, process attribution via libproc, GeoIP/Reputation stubs |
-| Flow tracker | `crates/agent/src/flow/mod.rs` | 898 | In-memory session window with ~100ms ticks via `poll()` timeout. Direction-agnostic canonicalization, MAX_FLOWS eviction, local_port + PID stored per-flow, enrichment attachment, `last_evaluated` per-flow, `EVALUATION_INTERVAL_SECS` (1s), `MAX_RE_EVAL_PER_TICK` (100). `tick()` returns `(expired, due_for_re_evaluate)` tuple. |
+| Flow tracker | `crates/agent/src/flow/mod.rs` | 975 | In-memory session window with ~100ms ticks via `poll()` timeout. Direction-agnostic canonicalization, MAX_FLOWS eviction with O(log n) `BinaryHeap`, local_port + PID stored per-flow, enrichment attachment, `last_evaluated` per-flow, `EVALUATION_INTERVAL_SECS` (1s), `MAX_RE_EVAL_PER_TICK` (100). `tick()` returns `(expired, due_for_re_evaluate)` tuple. Batched re-evaluation scan (every 10th tick). |
 | IPC protocol | `crates/platform-macos/src/protocol.rs` | 112 | `send_fd`/`recv_fd` (SCM_RIGHTS), `send_message`/`recv_message` (bincode, length-prefixed), stream split via `try_clone()` |
 
-**Total:** 4,838 lines across 11 files.
+**Total:** 4,903 lines across 11 files.
 
 **Verified end-to-end (2026-07-22):** Helper sends PortPidCache (49–51 entries, ~483 PIDs, ~6675 fds, 62–64 probe_ok, ~7–8ms root scan). Agent receives cache, looks up src_port on each packet, resolves to correct PID + executable path. Live test: Brave Browser connection to 142.251.142.74:443 resolved to pid=743 → `Brave Browser Helper`.
 
@@ -49,8 +49,8 @@
 - `Detector` trait + `DetectorFinding` + `run_detector_with_timeout()` in `common/src/types.rs`
 - `RuleDetector` with placeholder v1 rules (dns_blocklist, suspicious_port, high_packet_count)
 - Timeout enforcement: `run_detector_with_timeout()` runs `evaluate()` on its own thread, uses `recv_timeout()` with configurable budget. Returns `TimedOut` if exceeded.
+- Panic safety: `evaluate()` wrapped in `catch_unwind` — panics produce `Errored` finding instead of crashing the thread.
 - Wired into capture loop on flow expiry AND active-flow re-evaluation — log only
-- **No `catch_unwind` yet** — panics silently detach (known limitation)
 - **No circuit breaker** — consistently-failing detectors retried every interval (known limitation)
 
 ### Decision engine — verified (log-only)
@@ -72,7 +72,7 @@
 - `EVALUATION_INTERVAL_SECS = 1`, `MAX_RE_EVAL_PER_TICK = 100`
 - `tick()` returns `(expired: Vec<u64>, due_for_re_evaluate: Vec<u64>)` — tuple
 - `mark_evaluated(flow_id)` bumps `last_evaluated` regardless of finding status
-- **Current implementation iterates `HashMap` for re-evaluation candidates — non-deterministic order, starvation risk** (known limitation, architecture plan approved for timing wheel scheduler)
+- **Batched scan** — re-evaluation candidates collected every 10th tick (~1s), not every tick. Fixes starvation risk from non-deterministic HashMap iteration.
 
 ## Stub (known incomplete — not done)
 
@@ -86,15 +86,11 @@
 
 2. **Per-flow DNS/GeoIP/Reputation dispatch** — enrichment is dispatched per-flow, not per-destination-IP. This means redundant lookups for flows to the same IP. Fix: global `HashMap<IpAddr, EnrichmentState>` cache. Only process attribution is genuinely flow-specific.
 
-3. **No `catch_unwind` in detector timeout** — `run_detector_with_timeout()` spawns a thread for each detector. If the thread panics, it silently detaches. Fix: wrap `evaluate()` in `catch_unwind`, return `Errored` on panic.
+3. **No circuit breaker for failing detectors** — `run_detectors()` retries all detectors every interval regardless of failure history. A consistently-errored detector wastes thread budget. Fix: per-detector `consecutive_failures` counter, skip after 5 failures.
 
-4. **No circuit breaker for failing detectors** — `run_detectors()` retries all detectors every interval regardless of failure history. A consistently-errored detector wastes thread budget. Fix: per-detector `consecutive_failures` counter, skip after 5 failures.
+4. **Decision engine has no uncertainty/findings_summary** — `Verdict::Block` and `Verdict::Alert` lack an `uncertainty` field and per-finding evidence summary. Fix: add fields for dashboard audit trail.
 
-5. **Re-evaluation uses HashMap iteration** — `tick()` collects re-evaluation candidates by iterating the entire `flows` HashMap, checking `last_evaluated`. Non-deterministic order, starvation risk for flows with high IDs. Fix: timing wheel scheduler (architecture plan approved).
-
-6. **Decision engine has no uncertainty/findings_summary** — `Verdict::Block` and `Verdict::Alert` lack an `uncertainty` field and per-finding evidence summary. Fix: add fields for dashboard audit trail.
-
-7. **All config is hardcoded** — block/alert thresholds, TTLs, detector budgets are constants in `DecisionConfig`. No TOML/YAML config file loading. Fix: config system with secure defaults.
+5. **All config is hardcoded** — block/alert thresholds, TTLs, detector budgets are constants in `DecisionConfig`. No TOML/YAML config file loading. Fix: config system with secure defaults.
 
 ## Not built
 
@@ -102,3 +98,21 @@
 - Tauri UI dashboard
 - ONNX model inference (detector framework exists, no model loaded)
 - Windows/Linux support (intentionally excluded — §1b)
+
+## Audit fixes (2026-07-25)
+
+9 fixes from Linus-style code audit, ordered easiest→hardest:
+
+| # | Fix | File | Status |
+|---|---|---|---|
+| 1 | Deduplicated PF_ANCHOR_NAME/PF_TABLE_NAME/IPC_SOCKET_PATH | `common/src/lib.rs` | Verified |
+| 2 | Removed dead code (TEST_TARGET_IP, BLOCK_TTL, blocked HashSet) | `agent/main.rs` | Verified |
+| 3 | Updated stale line counts in docs | `doc/STATUS.md`, `doc/report.md` | Verified |
+| 4 | Added `catch_unwind` to `run_detector_with_timeout()` | `common/src/types.rs` | Verified |
+| 5 | Changed IPC socket permissions 0o666→0o660 | `platform-macos/helper/main.rs` | Verified |
+| 6 | TTL cancellation via `AtomicBool` in `apply_block()` | `platform-macos/helper/enforce.rs` | Verified |
+| 7 | `From<flow::FlowRecord>` impl, eliminated `.clone().into()` boilerplate | `agent/flow/mod.rs` | Verified |
+| 8 | O(log n) eviction via `BinaryHeap` (replaces linear scan) | `agent/flow/mod.rs` | Verified |
+| 9 | Batched re-evaluation scan every 10th tick (~1s) | `agent/flow/mod.rs` | Verified |
+
+All 47 tests pass. clippy clean. fmt clean.

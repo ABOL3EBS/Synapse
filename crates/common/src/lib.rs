@@ -80,6 +80,19 @@ pub const IPC_MAGIC: [u8; 4] = *b"SYNP";
 pub const IPC_VERSION: u8 = 1;
 
 // ---------------------------------------------------------------------------
+// pf Anchor Constants (shared between helper and enforcement backend)
+// ---------------------------------------------------------------------------
+
+/// pf anchor name — must match in helper/main.rs ensure_anchor() and enforce.rs.
+pub const PF_ANCHOR_NAME: &str = "com.synapse.ips";
+
+/// pf table name inside the anchor — dynamic IP blocklist.
+pub const PF_TABLE_NAME: &str = "synapse_blocklist";
+
+/// Unix domain socket path for helper ↔ agent IPC.
+pub const IPC_SOCKET_PATH: &str = "/tmp/synapse-helper.sock";
+
+// ---------------------------------------------------------------------------
 // Enforcement Backend Trait (§4c)
 // ---------------------------------------------------------------------------
 // The only safe execution guarantee isn't just typed data — it's that the

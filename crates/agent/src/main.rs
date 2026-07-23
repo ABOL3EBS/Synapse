@@ -14,24 +14,17 @@ mod detectors;
 mod enrichment;
 mod flow;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 
 use log::{debug, error, info, warn};
-use synapse_common::{
-    EnforcementCommand, EnrichmentKind, EnrichmentRequest, IpcMessage, PacketInfo,
-};
+use synapse_common::{EnrichmentKind, EnrichmentRequest, IpcMessage, PacketInfo, IPC_SOCKET_PATH};
 use synapse_platform_macos::protocol;
-
-const IPC_SOCKET_PATH: &str = "/tmp/synapse-helper.sock";
-const TEST_TARGET_IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 100));
-const BLOCK_TTL: Duration = Duration::from_secs(300);
 
 /// BPF word alignment — packets are padded to this boundary between entries.
 /// On macOS/BSD this is 4 (sizeof(long) on 32-bit, traditional BPF alignment).
@@ -269,7 +262,7 @@ fn main() -> io::Result<()> {
     // from elsewhere (e.g. sending acks/receipts back), route it through this
     // same thread/channel — do not spawn a second writer on this stream half,
     // or the length-prefix framing race this design was built to avoid comes back.
-    let mut write_half = stream.try_clone()?;
+    let mut _write_half = stream.try_clone()?;
     let read_half = stream;
 
     // 4. Shared port→PID cache — updated by reader thread, read by main loop.
@@ -357,16 +350,13 @@ fn main() -> io::Result<()> {
             .expect("failed to spawn local-ip-refresh thread");
     }
 
-    info!("capture started — watching for {TEST_TARGET_IP}");
+    info!("capture started — watching for packets on BPF fd");
 
     // Allocate read buffer of EXACTLY the kernel-reported size.
     let mut read_buf = vec![0u8; buf_len];
 
     // Flow tracker — session window with ~100ms ticks.
     let mut tracker = flow::FlowTracker::new();
-
-    // Track blocked test-target IPs (milestone 1 testing artifact).
-    let mut blocked: HashSet<IpAddr> = HashSet::new();
 
     // Start enrichment worker pool (async side-channel, never blocks hot path).
     let enrich_pool = enrichment::EnrichmentPool::new();
@@ -422,22 +412,7 @@ fn main() -> io::Result<()> {
             // Run detectors + decision engine on expired flows.
             for &flow_id in &expired {
                 if let Some(flow_ref) = tracker.get(flow_id) {
-                    let common_flow = synapse_common::FlowRecord {
-                        flow_id: flow_ref.flow_id,
-                        src_ip: flow_ref.key.a_ip,
-                        dst_ip: flow_ref.key.b_ip,
-                        src_port: flow_ref.key.a_port,
-                        dst_port: flow_ref.key.b_port,
-                        protocol: flow_ref.key.protocol,
-                        local_port: flow_ref.local_port,
-                        pid: flow_ref.pid,
-                        packet_count: flow_ref.packet_count,
-                        byte_count: flow_ref.byte_count,
-                        dns_name: flow_ref.dns_name.clone(),
-                        process_path: flow_ref.process_path.clone(),
-                        country_code: flow_ref.country_code.clone(),
-                        reputation_score: flow_ref.reputation_score,
-                    };
+                    let common_flow: synapse_common::FlowRecord = flow_ref.clone().into();
                     let findings =
                         detectors::run_detectors(&detectors, &common_flow, detector_timeout);
                     // Feed findings to decision engine — verdict is logged only.
@@ -462,22 +437,7 @@ fn main() -> io::Result<()> {
             // last_evaluated timestamp so they're not re-evaluated every tick.
             for &flow_id in &re_evaluate {
                 if let Some(flow_ref) = tracker.get(flow_id) {
-                    let common_flow = synapse_common::FlowRecord {
-                        flow_id: flow_ref.flow_id,
-                        src_ip: flow_ref.key.a_ip,
-                        dst_ip: flow_ref.key.b_ip,
-                        src_port: flow_ref.key.a_port,
-                        dst_port: flow_ref.key.b_port,
-                        protocol: flow_ref.key.protocol,
-                        local_port: flow_ref.local_port,
-                        pid: flow_ref.pid,
-                        packet_count: flow_ref.packet_count,
-                        byte_count: flow_ref.byte_count,
-                        dns_name: flow_ref.dns_name.clone(),
-                        process_path: flow_ref.process_path.clone(),
-                        country_code: flow_ref.country_code.clone(),
-                        reputation_score: flow_ref.reputation_score,
-                    };
+                    let common_flow: synapse_common::FlowRecord = flow_ref.clone().into();
                     let findings =
                         detectors::run_detectors(&detectors, &common_flow, detector_timeout);
                     // Feed findings to decision engine — verdict is logged only.
@@ -546,17 +506,14 @@ fn main() -> io::Result<()> {
             let frame = &read_buf[data_start..data_end];
 
             if let Some(info_pkt) = parse_ip_frame(frame) {
-                let hit = info_pkt.src_ip == TEST_TARGET_IP || info_pkt.dst_ip == TEST_TARGET_IP;
-
-                if pkt_count.is_multiple_of(10) || hit {
+                if pkt_count.is_multiple_of(10) {
                     info!(
-                        "pkt#{pkt_count}: {}:{} → {}:{} (proto={}){}",
+                        "pkt#{pkt_count}: {}:{} → {}:{} (proto={})",
                         info_pkt.src_ip,
                         info_pkt.src_port,
                         info_pkt.dst_ip,
                         info_pkt.dst_port,
                         info_pkt.protocol,
-                        if hit { " *** TARGET ***" } else { "" }
                     );
                 }
 
@@ -634,19 +591,6 @@ fn main() -> io::Result<()> {
                         warn!("enrichment dispatch failed: {e}");
                     }
                 }
-
-                if hit && !blocked.contains(&TEST_TARGET_IP) {
-                    let cmd = EnforcementCommand::Block {
-                        ip: TEST_TARGET_IP,
-                        ttl: BLOCK_TTL,
-                    };
-                    info!("sending: {cmd:?}");
-                    if let Err(e) = protocol::send_message(&mut write_half, &cmd) {
-                        error!("send failed: {e}");
-                        break;
-                    }
-                    blocked.insert(TEST_TARGET_IP);
-                }
             }
 
             offset += hdr.next_offset();
@@ -721,9 +665,8 @@ fn main() -> io::Result<()> {
     }
 
     info!(
-        "agent shutting down — {pkt_count} packets, {} flows tracked, {} blocked",
-        tracker.len(),
-        blocked.len()
+        "agent shutting down — {pkt_count} packets, {} flows tracked",
+        tracker.len()
     );
     Ok(())
 }

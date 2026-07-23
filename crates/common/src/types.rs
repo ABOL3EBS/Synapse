@@ -400,6 +400,7 @@ pub fn run_detector_with_timeout(
     let id = detector.id();
     let version = detector.version().to_string();
     let flow = flow.clone();
+    let version_clone = version.clone();
 
     // Channel for the detector thread to send its result back.
     let (tx, rx) = mpsc::channel::<DetectorFinding>();
@@ -408,10 +409,27 @@ pub fn run_detector_with_timeout(
     let _handle = thread::Builder::new()
         .name(format!("detector-{:?}", id))
         .spawn(move || {
-            let result = detector.evaluate(&flow);
+            // catch_unwind ensures a panicking detector doesn't silently
+            // detach — the panic message is captured and sent as Errored.
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| detector.evaluate(&flow)));
+
+            let finding = match result {
+                Ok(finding) => finding,
+                Err(panic) => {
+                    let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = panic.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "detector panicked (non-string payload)".to_string()
+                    };
+                    DetectorFinding::errored(id, &version_clone, &msg, 0)
+                }
+            };
             // If the receiver has already been dropped (timeout fired),
             // this send will fail silently — the thread finishes and is dropped.
-            let _ = tx.send(result);
+            let _ = tx.send(finding);
         });
 
     let start = Instant::now();

@@ -19,18 +19,13 @@ use std::thread;
 use std::time::Duration;
 
 use log::{error, info, warn};
-use synapse_common::{BlockId, EnforcementBackend, EnforcementCommand, IpcMessage, ValidatedBlock};
+use synapse_common::{
+    BlockId, EnforcementBackend, EnforcementCommand, IpcMessage, ValidatedBlock, IPC_SOCKET_PATH,
+    PF_ANCHOR_NAME, PF_TABLE_NAME,
+};
 use synapse_platform_macos::protocol;
 
 use enforce::MacOsEnforcementBackend;
-
-// ---------------------------------------------------------------------------
-// pf Constants
-// ---------------------------------------------------------------------------
-
-const PF_ANCHOR_NAME: &str = "com.synapse.ips";
-const PF_TABLE_NAME: &str = "synapse_blocklist";
-const IPC_SOCKET_PATH: &str = "/tmp/synapse-helper.sock";
 
 // ---------------------------------------------------------------------------
 // BPF filter for IP traffic (both IPv4 and IPv6)
@@ -299,9 +294,10 @@ fn main() -> io::Result<()> {
     // 4. Create IPC socket and wait for agent.
     let _ = std::fs::remove_file(IPC_SOCKET_PATH);
     let listener = std::os::unix::net::UnixListener::bind(IPC_SOCKET_PATH)?;
-    // chmod so unprivileged agent can connect.
-    std::fs::set_permissions(IPC_SOCKET_PATH, std::fs::Permissions::from_mode(0o666))?;
-    info!("listening on {IPC_SOCKET_PATH} (mode 0666)");
+    // chmod 0660 — owner (root) + group rw only. No world access.
+    // Agent must be in the socket's group (typically wheel on macOS) to connect.
+    std::fs::set_permissions(IPC_SOCKET_PATH, std::fs::Permissions::from_mode(0o660))?;
+    info!("listening on {IPC_SOCKET_PATH} (mode 0660)");
 
     info!("waiting for synapse-agent to connect...");
     let (stream, _addr) = listener.accept()?;

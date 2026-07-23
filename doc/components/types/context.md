@@ -4,8 +4,8 @@ Zero-logic crate. Everything here is types, traits, and constants — no impleme
 
 ## Code location
 
-- `crates/common/src/lib.rs` (101 lines) — `EnforcementCommand`, `PacketInfo`, `EnforcementBackend` trait, `IPC_MAGIC`/`IPC_VERSION` constants, re-exports all public types from `types.rs`
-- `crates/common/src/types.rs` (438 lines) — all shared types
+- `crates/common/src/lib.rs` (114 lines) — `EnforcementCommand`, `PacketInfo`, `EnforcementBackend` trait, `IPC_MAGIC`/`IPC_VERSION` constants, re-exports all public types from `types.rs`
+- `crates/common/src/types.rs` (456 lines) — all shared types
 
 ## EnforcementCommand (wire format)
 
@@ -175,7 +175,7 @@ pub fn run_detector_with_timeout(
 ) -> DetectorFinding
 ```
 
-Runs `evaluate()` on a separate thread, `recv_timeout()` enforces budget. Returns `TimedOut` or `Errored` finding on failure.
+Runs `evaluate()` on a separate thread, `recv_timeout()` enforces budget. `evaluate()` is wrapped in `catch_unwind` — panics produce an `Errored` finding instead of crashing the thread. Returns `TimedOut` if budget exceeded, `Errored` on panic or receive error.
 
 ## Decision types (types.rs)
 

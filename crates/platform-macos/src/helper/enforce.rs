@@ -6,27 +6,31 @@
 // invoke pfctl, and it must do so via std::process::Command::new("pfctl")
 // .arg(...).arg(...) — never through a shell."
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use log::{error, info, warn};
 use synapse_common::{
     BlockId, DesiredFirewallState, EnforcementBackend, EnforcementReceipt, ReconciliationReport,
-    ValidatedBlock,
+    ValidatedBlock, PF_ANCHOR_NAME, PF_TABLE_NAME,
 };
-
-const PF_ANCHOR_NAME: &str = "com.synapse.ips";
-const PF_TABLE_NAME: &str = "synapse_blocklist";
 
 /// macOS enforcement backend — owns the set of active blocks and the pf anchor.
 pub struct MacOsEnforcementBackend {
     active_blocks: HashSet<IpAddr>,
+    /// Cancellation flags for TTL auto-unblock threads.
+    /// On remove_block(), the flag is set to true so the sleeping thread
+    /// skips the unblock — avoids a double-unblock and misleading log.
+    cancel_handles: HashMap<IpAddr, Arc<AtomicBool>>,
 }
 
 impl MacOsEnforcementBackend {
     pub fn new() -> Self {
         Self {
             active_blocks: HashSet::new(),
+            cancel_handles: HashMap::new(),
         }
     }
 
@@ -100,10 +104,19 @@ impl EnforcementBackend for MacOsEnforcementBackend {
         // v1 tradeoff: one OS thread per active block, no cap. Fine at
         // current traffic volumes; if block counts grow, replace with a
         // single timer-wheel or a thread with a channel of wake events.
+        //
+        // Cancellation: Arc<AtomicBool> flag lets remove_block() abort the
+        // unblock without waiting for the sleep to finish.
         let ip = block.ip;
         let ttl = block.ttl;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.cancel_handles.insert(ip, Arc::clone(&cancelled));
         std::thread::spawn(move || {
             std::thread::sleep(ttl);
+            if cancelled.load(Ordering::Relaxed) {
+                // remove_block() already handled unblock — skip.
+                return;
+            }
             if let Err(e) = Self::unblock_ip(ip) {
                 error!("TTL unblock failed for {ip}: {e}");
             }
@@ -119,6 +132,11 @@ impl EnforcementBackend for MacOsEnforcementBackend {
 
     fn remove_block(&mut self, block_id: BlockId) -> Result<EnforcementReceipt, String> {
         let ip = block_id.0;
+
+        // Cancel the TTL auto-unblock thread if it's still sleeping.
+        if let Some(cancelled) = self.cancel_handles.remove(&ip) {
+            cancelled.store(true, Ordering::Relaxed);
+        }
 
         Self::unblock_ip(ip)?;
         self.active_blocks.remove(&ip);

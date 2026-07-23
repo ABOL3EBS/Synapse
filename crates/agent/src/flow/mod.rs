@@ -13,7 +13,8 @@
 // - MAX_FLOWS = 100_000 defensive bound. Evict oldest on overflow.
 // - tick() must fire on poll() timeout, not only on packet arrival.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::net::IpAddr;
 use std::time::Instant;
 
@@ -155,6 +156,27 @@ pub struct FlowRecord {
     pub last_evaluated: Instant,
 }
 
+impl From<FlowRecord> for synapse_common::FlowRecord {
+    fn from(flow: FlowRecord) -> Self {
+        Self {
+            flow_id: flow.flow_id,
+            src_ip: flow.key.a_ip,
+            dst_ip: flow.key.b_ip,
+            src_port: flow.key.a_port,
+            dst_port: flow.key.b_port,
+            protocol: flow.key.protocol,
+            local_port: flow.local_port,
+            pid: flow.pid,
+            packet_count: flow.packet_count,
+            byte_count: flow.byte_count,
+            dns_name: flow.dns_name,
+            process_path: flow.process_path,
+            country_code: flow.country_code,
+            reputation_score: flow.reputation_score,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // FlowTracker — the session window
 // ---------------------------------------------------------------------------
@@ -165,6 +187,13 @@ pub struct FlowTracker {
     index: HashMap<FlowKey, u64>,
     /// Flow ID → flow record.
     flows: HashMap<u64, FlowRecord>,
+    /// Min-heap for O(log n) eviction of oldest flow.
+    /// Entries are (first_seen, flow_id) in Reverse order so pop() yields oldest.
+    /// Stale entries (flows already removed by expiry) are lazily skipped.
+    eviction_heap: BinaryHeap<Reverse<(Instant, u64)>>,
+    /// Monotonic counter — incremented on every tick(), used to batch
+    /// the re-evaluation scan to once per second (every 10 ticks at 100ms).
+    tick_count: u64,
     /// Next flow ID (monotonically increasing).
     next_id: u64,
 }
@@ -174,6 +203,8 @@ impl FlowTracker {
         Self {
             index: HashMap::new(),
             flows: HashMap::new(),
+            eviction_heap: BinaryHeap::new(),
+            tick_count: 0,
             next_id: 1,
         }
     }
@@ -221,6 +252,7 @@ impl FlowTracker {
 
         self.index.insert(key, flow_id);
         self.flows.insert(flow_id, flow);
+        self.eviction_heap.push(Reverse((now, flow_id)));
 
         debug!(
             "flow {} created: {:?} local_port={}",
@@ -262,17 +294,23 @@ impl FlowTracker {
         }
 
         // Phase 2: Find active flows due for re-evaluation.
-        // Bounded by MAX_RE_EVAL_PER_TICK to prevent a single tick from
-        // stalling the capture loop when many flows align on the same boundary.
-        let mut due_for_re_evaluate = Vec::new();
-        for (&flow_id, flow) in &self.flows {
-            if now.duration_since(flow.last_evaluated).as_secs() >= EVALUATION_INTERVAL_SECS {
-                due_for_re_evaluate.push(flow_id);
-                if due_for_re_evaluate.len() >= MAX_RE_EVAL_PER_TICK {
-                    break;
+        // Scan runs once per second (every 10 ticks at 100ms poll timeout),
+        // not every tick — bounds per-tick cost to O(expiry) only.
+        self.tick_count += 1;
+        let due_for_re_evaluate = if self.tick_count.is_multiple_of(10) {
+            let mut due = Vec::new();
+            for (&flow_id, flow) in &self.flows {
+                if now.duration_since(flow.last_evaluated).as_secs() >= EVALUATION_INTERVAL_SECS {
+                    due.push(flow_id);
+                    if due.len() >= MAX_RE_EVAL_PER_TICK {
+                        break;
+                    }
                 }
             }
-        }
+            due
+        } else {
+            Vec::new()
+        };
 
         if !expired.is_empty() || !due_for_re_evaluate.is_empty() {
             debug!(
@@ -288,17 +326,24 @@ impl FlowTracker {
 
     /// Evict the oldest flow (by first_seen) to make room.
     /// Called when flow count hits MAX_FLOWS.
+    /// Uses the min-heap for O(log n) amortized eviction. Stale entries
+    /// (flows already removed by expiry) are lazily skipped.
     fn evict_oldest(&mut self) {
-        if let Some((&oldest_id, _)) = self.flows.iter().min_by_key(|(_, flow)| flow.first_seen) {
-            if let Some(flow) = self.flows.remove(&oldest_id) {
+        while let Some(Reverse((first_seen, flow_id))) = self.eviction_heap.pop() {
+            // Skip stale entries — flow was already removed by tick() expiry.
+            if !self.flows.contains_key(&flow_id) {
+                continue;
+            }
+            if let Some(flow) = self.flows.remove(&flow_id) {
                 self.index.remove(&flow.key);
                 warn!(
                     "flow tracker at capacity ({}), evicting oldest flow {} (key={:?}, age={:?})",
                     MAX_FLOWS,
-                    oldest_id,
+                    flow_id,
                     flow.key,
-                    flow.first_seen.elapsed(),
+                    first_seen.elapsed(),
                 );
+                return;
             }
         }
     }
@@ -781,6 +826,8 @@ mod tests {
     /// Test: active flow with stale last_evaluated appears in re-evaluate list.
     /// A flow that keeps receiving packets never expires, but after 1s without
     /// re-evaluation it should appear in the due_for_re_evaluate list.
+    /// Re-evaluation scan runs every 10th tick (batched), so we tick enough
+    /// times to hit the scan boundary.
     #[test]
     fn test_tick_returns_re_evaluate_for_stale_last_evaluated() {
         let mut tracker = FlowTracker::new();
@@ -809,19 +856,27 @@ mod tests {
                 Instant::now() - std::time::Duration::from_secs(EVALUATION_INTERVAL_SECS + 1);
         }
 
-        let (expired, re_eval) = tracker.tick();
-        assert!(
-            expired.is_empty(),
-            "flow is still active, should not expire"
-        );
-        assert_eq!(re_eval.len(), 1);
-        assert_eq!(re_eval[0], id);
+        // Tick until the scan fires (every 10th tick).
+        let mut found_re_eval = Vec::new();
+        for _ in 0..15 {
+            let (expired, re_eval) = tracker.tick();
+            assert!(
+                expired.is_empty(),
+                "flow is still active, should not expire"
+            );
+            if !re_eval.is_empty() {
+                found_re_eval = re_eval;
+                break;
+            }
+        }
+        assert_eq!(found_re_eval.len(), 1);
+        assert_eq!(found_re_eval[0], id);
         // Flow is still in the tracker.
         assert_eq!(tracker.len(), 1);
     }
 
     /// Test: mark_evaluated() bumps last_evaluated regardless of finding status.
-    /// After marking, the flow should NOT appear in re-evaluate on next tick.
+    /// After marking, the flow should NOT appear in re-evaluate on next scan tick.
     #[test]
     fn test_mark_evaluated_prevents_immediate_re_evaluate() {
         let mut tracker = FlowTracker::new();
@@ -844,24 +899,38 @@ mod tests {
                 Instant::now() - std::time::Duration::from_secs(EVALUATION_INTERVAL_SECS + 1);
         }
 
-        // Confirm it's due.
-        let (_, re_eval) = tracker.tick();
-        assert_eq!(re_eval.len(), 1);
+        // Tick until scan fires and confirm it's due.
+        let mut found_re_eval = Vec::new();
+        for _ in 0..15 {
+            let (_, re_eval) = tracker.tick();
+            if !re_eval.is_empty() {
+                found_re_eval = re_eval;
+                break;
+            }
+        }
+        assert_eq!(found_re_eval.len(), 1);
 
         // Mark as evaluated.
         tracker.mark_evaluated(id);
 
-        // Now it should NOT be due on the next tick.
-        let (_, re_eval) = tracker.tick();
+        // Now it should NOT be due on the next scan tick.
+        let mut found_after_mark = false;
+        for _ in 0..15 {
+            let (_, re_eval) = tracker.tick();
+            if !re_eval.is_empty() {
+                found_after_mark = true;
+                break;
+            }
+        }
         assert!(
-            re_eval.is_empty(),
+            !found_after_mark,
             "after mark_evaluated, flow should not be due immediately"
         );
     }
 
     /// Test: MAX_RE_EVAL_PER_TICK caps the re-evaluation batch.
     /// Create more flows than the cap, backdate all their last_evaluated,
-    /// verify only MAX_RE_EVAL_PER_TICK are returned.
+    /// verify only MAX_RE_EVAL_PER_TICK are returned on a scan tick.
     #[test]
     fn test_re_evaluate_capped_at_max_re_eval_per_tick() {
         let mut tracker = FlowTracker::new();
@@ -886,9 +955,17 @@ mod tests {
             }
         }
 
-        let (_, re_eval) = tracker.tick();
+        // Tick until scan fires.
+        let mut found_re_eval = Vec::new();
+        for _ in 0..15 {
+            let (_, re_eval) = tracker.tick();
+            if !re_eval.is_empty() {
+                found_re_eval = re_eval;
+                break;
+            }
+        }
         assert_eq!(
-            re_eval.len(),
+            found_re_eval.len(),
             MAX_RE_EVAL_PER_TICK,
             "re-evaluation should be capped at MAX_RE_EVAL_PER_TICK"
         );

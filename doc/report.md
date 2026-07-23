@@ -196,20 +196,22 @@ Hardcoded offsets `OFF_LPORT=268`, `OFF_FPORT=264` verified by 3 independent tes
 
 | File | Lines | Purpose |
 |---|---|---|
-| `crates/common/src/lib.rs` | 96 | `EnforcementCommand`, `PacketInfo`, `EnforcementBackend` trait, `IpcMessage` re-export |
-| `crates/common/src/types.rs` | 150 | `ValidatedBlock`, `BlockId`, `EnforcementReceipt`, `PortPidCache`, `IpcMessage`, `EnrichmentRequest/Result/Kind` |
-| `crates/platform-macos/src/helper/main.rs` | 389 | Root daemon — BPF ioctls, fd handoff, pf anchor, enforcement loop, cache-push thread |
-| `crates/platform-macos/src/helper/enforce.rs` | 178 | `MacOsEnforcementBackend` — only pfctl executor |
+| `crates/common/src/lib.rs` | 114 | `EnforcementCommand`, `PacketInfo`, `EnforcementBackend` trait, `IpcMessage` re-export, `PF_ANCHOR_NAME`/`PF_TABLE_NAME`/`IPC_SOCKET_PATH` constants |
+| `crates/common/src/types.rs` | 456 | `ValidatedBlock`, `BlockId`, `EnforcementReceipt`, `PortPidCache`, `IpcMessage`, `EnrichmentRequest/Result/Kind` |
+| `crates/platform-macos/src/helper/main.rs` | 385 | Root daemon — BPF ioctls, fd handoff, pf anchor, enforcement loop, cache-push thread. Socket permissions 0660. |
+| `crates/platform-macos/src/helper/enforce.rs` | 196 | `MacOsEnforcementBackend` — only pfctl executor, AtomicBool TTL cancellation |
 | `crates/platform-macos/src/protocol.rs` | 112 | SCM_RIGHTS fd-passing + bincode IPC |
 | `crates/platform-macos/src/process_lookup.rs` | 668 | `libproc` FFI — `build_port_pid_cache`, `probe_socket`, `read_port_be`, `lookup_process` |
-| `crates/agent/src/main.rs` | 772 | Unprivileged — BPF reads, IPv4/IPv6, flow tracker, enrichment, IPC reader thread, `determine_local_port()` extracted, local IP refresh thread, detector framework wired on flow expiry |
-| `crates/agent/src/flow/mod.rs` | 574 | In-memory session window — `FlowKey`, `FlowRecord`, `FlowTracker`, canonicalization, eviction |
+| `crates/agent/src/main.rs` | 762 | Unprivileged — BPF reads, IPv4/IPv6, flow tracker, enrichment, IPC reader thread, `determine_local_port()` extracted, local IP refresh thread, detector framework wired on flow expiry |
+| `crates/agent/src/flow/mod.rs` | 975 | In-memory session window — `FlowKey`, `FlowRecord`, `FlowTracker`, canonicalization, BinaryHeap eviction, batched re-evaluation scan |
 | `crates/agent/src/enrichment/mod.rs` | 495 | 4-thread worker pool — DNS reverse, process attribution, GeoIP/Reputation stubs |
-| **Total** | **3,718** | |
+| `crates/agent/src/detectors/mod.rs` | 343 | `RuleDetector`, timeout enforcement via `run_detector_with_timeout()`, `catch_unwind` panic safety |
+| `crates/agent/src/decision/mod.rs` | 397 | `DecisionEngine` with weighted scoring, `Verdict`, active-flow re-evaluation |
+| **Total** | **4,903** | |
 
 ---
 
-### Test results (33 tests)
+### Test results (47 tests)
 
 | Test | Result |
 |---|---|
@@ -679,20 +681,22 @@ pf state showed an entry. Fixed by changing `pass out` → `block out`.
 
 ---
 
-## 4. File inventory (current as of 07-22)
+## 4. File inventory (current as of 07-25)
 
 | File | Lines | Purpose |
 |---|---|---|
-| `crates/common/src/lib.rs` | 96 | `EnforcementCommand`, `PacketInfo`, `EnforcementBackend` trait, `IpcMessage` re-export |
-| `crates/common/src/types.rs` | 150 | `ValidatedBlock`, `BlockId`, `EnforcementReceipt`, `PortPidCache`, `IpcMessage`, `EnrichmentRequest/Result/Kind` |
-| `crates/platform-macos/src/helper/main.rs` | 389 | Root daemon — BPF ioctls, fd handoff, pf anchor, enforcement loop, cache-push thread |
-| `crates/platform-macos/src/helper/enforce.rs` | 178 | `MacOsEnforcementBackend` — only pfctl executor |
+| `crates/common/src/lib.rs` | 114 | `EnforcementCommand`, `PacketInfo`, `EnforcementBackend` trait, `IpcMessage` re-export, `PF_ANCHOR_NAME`/`PF_TABLE_NAME`/`IPC_SOCKET_PATH` constants |
+| `crates/common/src/types.rs` | 456 | `ValidatedBlock`, `BlockId`, `EnforcementReceipt`, `PortPidCache`, `IpcMessage`, `EnrichmentRequest/Result/Kind`, detector types with `catch_unwind` |
+| `crates/platform-macos/src/helper/main.rs` | 385 | Root daemon — BPF ioctls, fd handoff, pf anchor, enforcement loop, cache-push thread. Socket permissions 0660. |
+| `crates/platform-macos/src/helper/enforce.rs` | 196 | `MacOsEnforcementBackend` — only pfctl executor, AtomicBool TTL cancellation |
 | `crates/platform-macos/src/protocol.rs` | 112 | SCM_RIGHTS fd-passing + bincode IPC |
 | `crates/platform-macos/src/process_lookup.rs` | 668 | `libproc` FFI — `build_port_pid_cache`, `probe_socket`, `read_port_be`, `lookup_process` |
-| `crates/agent/src/main.rs` | 772 | Unprivileged — BPF reads, IPv4/IPv6, flow tracker, enrichment, IPC reader thread, `determine_local_port()` extracted, local IP refresh thread, detector framework wired on flow expiry |
-| `crates/agent/src/flow/mod.rs` | 574 | In-memory session window — `FlowKey`, `FlowRecord`, `FlowTracker`, canonicalization, eviction |
+| `crates/agent/src/main.rs` | 762 | Unprivileged — BPF reads, IPv4/IPv6, flow tracker, enrichment, IPC reader thread, `determine_local_port()` extracted, local IP refresh thread, detector framework wired on flow expiry |
+| `crates/agent/src/flow/mod.rs` | 975 | In-memory session window — `FlowKey`, `FlowRecord`, `FlowTracker`, canonicalization, BinaryHeap eviction, batched re-evaluation scan |
 | `crates/agent/src/enrichment/mod.rs` | 495 | 4-thread worker pool — DNS reverse, process attribution, GeoIP/Reputation stubs |
-| **Total** | **3,718** | |
+| `crates/agent/src/detectors/mod.rs` | 343 | `RuleDetector`, timeout enforcement via `run_detector_with_timeout()`, `catch_unwind` panic safety |
+| `crates/agent/src/decision/mod.rs` | 397 | `DecisionEngine` with weighted scoring, `Verdict`, active-flow re-evaluation |
+| **Total** | **4,903** | |
 
 ### Dependencies
 
@@ -718,6 +722,26 @@ pf state showed an entry. Fixed by changing `pass out` → `block out`.
 
 ---
 
+## 4b. Audit fixes (2026-07-25)
+
+9 fixes from Linus-style code audit, ordered easiest→hardest:
+
+| # | Fix | File | Status |
+|---|---|---|---|
+| 1 | Deduplicated PF_ANCHOR_NAME/PF_TABLE_NAME/IPC_SOCKET_PATH | `common/src/lib.rs` | Verified |
+| 2 | Removed dead code (TEST_TARGET_IP, BLOCK_TTL, blocked HashSet) | `agent/main.rs` | Verified |
+| 3 | Updated stale line counts in docs | `doc/STATUS.md`, `doc/report.md` | Verified |
+| 4 | Added `catch_unwind` to `run_detector_with_timeout()` | `common/src/types.rs` | Verified |
+| 5 | Changed IPC socket permissions 0o666→0o660 | `platform-macos/helper/main.rs` | Verified |
+| 6 | TTL cancellation via `AtomicBool` in `apply_block()` | `platform-macos/helper/enforce.rs` | Verified |
+| 7 | `From<flow::FlowRecord>` impl, eliminated `.clone().into()` boilerplate | `agent/flow/mod.rs` | Verified |
+| 8 | O(log n) eviction via `BinaryHeap` (replaces linear scan) | `agent/flow/mod.rs` | Verified |
+| 9 | Batched re-evaluation scan every 10th tick (~1s) | `agent/flow/mod.rs` | Verified |
+
+All 47 tests pass. clippy clean. fmt clean.
+
+---
+
 ## 5. What's next (not built)
 
 Per §6 architecture doc, the order is:
@@ -729,8 +753,8 @@ Per §6 architecture doc, the order is:
 5. ~~Enrichment~~ ✅ — async DNS, process attribution via libproc
 6. ~~Port→PID cache~~ ✅ — libproc FFI, SCM_RIGHTS IPC, per-process fd scan
 7. ~~Flow tracker~~ ✅ — in-memory session window, ~100ms ticks, direction-agnostic
-8. **Detector framework** — `Detector` trait + Rule engine + ONNX inference
-9. **Decision engine** — weighted scoring, policy thresholds
+8. ~~Detector framework~~ ✅ — `Detector` trait + RuleDetector, timeout enforcement, `catch_unwind`
+9. ~~Decision engine~~ ✅ — weighted scoring, active-flow re-evaluation (log-only)
 10. **Storage** — SQLite (WAL mode), single-writer worker
 11. **Dashboard** — Tauri + React
 
@@ -772,7 +796,7 @@ Every step was verified with real terminal output:
 | Flow tracker creation (07-22) | ✅ flows created for each unique session, INFO-level logs visible |
 | DNS enrichment (07-22) | ✅ `ec2-44-203-161-176.compute-1.amazonaws.com`, `abbass-macbook-air.local` |
 | Flow expiry (07-22) | ✅ `tick: expired M flows (N remaining)` logs after 5s silence |
-| 33 unit tests (07-23) | ✅ all pass — 27 agent, 6 platform-macos |
+| 47 unit tests (07-25) | ✅ all pass — 41 agent, 6 platform-macos |
 | `determine_local_port()` inbound test | ✅ real code path with system-detected local IP — returns dst_port |
 | `determine_local_port()` outbound test | ✅ real code path — returns src_port |
 | `detect_local_ip()` returns valid IP | ✅ non-loopback, non-unspecified |
