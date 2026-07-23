@@ -9,6 +9,7 @@
 // Flow tracker (§4 step 3): in-memory session window with ~100ms ticks.
 // poll() with timeout ensures tick() fires even on quiet networks.
 
+mod decision;
 mod detectors;
 mod enrichment;
 mod flow;
@@ -380,6 +381,11 @@ fn main() -> io::Result<()> {
         detector_timeout.as_millis()
     );
 
+    // Decision engine — weighted scoring, threshold comparison, TTL from severity.
+    // Log-only mode: verdicts are logged, no enforcement commands sent.
+    let decision_engine = decision::DecisionEngine::new(synapse_common::DecisionConfig::default());
+    info!("decision engine initialized (log-only mode — no enforcement)");
+
     // Capture loop — uses poll() with 100ms timeout so tick() fires even
     // on quiet networks. A blocking read() would pin memory forever.
     let mut pkt_count: u64 = 0;
@@ -404,17 +410,18 @@ fn main() -> io::Result<()> {
 
         // Always tick on every iteration — even on timeout.
         // Expires stale flows and reclaims memory.
-        let expired = tracker.tick();
-        if !expired.is_empty() {
+        // Returns (expired, due_for_re_evaluate).
+        let (expired, re_evaluate) = tracker.tick();
+        if !expired.is_empty() || !re_evaluate.is_empty() {
             info!(
-                "tick: expired {} flows ({} remaining)",
+                "tick: expired {} flows, re-evaluate {} flows ({} remaining)",
                 expired.len(),
+                re_evaluate.len(),
                 tracker.len()
             );
-            // Run detectors on each expired flow (log only — no decision engine yet).
+            // Run detectors + decision engine on expired flows.
             for &flow_id in &expired {
                 if let Some(flow_ref) = tracker.get(flow_id) {
-                    // Convert tracker FlowRecord → common FlowRecord for detectors.
                     let common_flow = synapse_common::FlowRecord {
                         flow_id: flow_ref.flow_id,
                         src_ip: flow_ref.key.a_ip,
@@ -433,20 +440,62 @@ fn main() -> io::Result<()> {
                     };
                     let findings =
                         detectors::run_detectors(&detectors, &common_flow, detector_timeout);
-                    // Log findings — decision engine will consume these later.
-                    for finding in &findings {
-                        if finding.score > 0.0 {
-                            info!(
-                                "DETECT flow={} {:?} score={:.2} severity={:?} status={:?} evidence={:?}",
-                                flow_id,
-                                finding.detector_id,
-                                finding.score,
-                                finding.severity,
-                                finding.status,
-                                finding.evidence,
-                            );
+                    // Feed findings to decision engine — verdict is logged only.
+                    let features = synapse_common::FlowFeatures::from_flow(
+                        &common_flow,
+                        flow_ref.first_seen.elapsed(),
+                    );
+                    let verdict = decision_engine.evaluate(&features, &findings);
+                    match &verdict {
+                        synapse_common::Verdict::Allow => {}
+                        synapse_common::Verdict::Alert { reason } => {
+                            info!("ALERT flow={} {}", flow_id, reason);
+                        }
+                        synapse_common::Verdict::Block { ttl, reason } => {
+                            info!("BLOCK flow={} ttl={:?} {}", flow_id, ttl, reason);
                         }
                     }
+                }
+            }
+            // Re-run detectors on active flows due for periodic re-evaluation.
+            // These flows stay in the tracker — mark_evaluated() bumps their
+            // last_evaluated timestamp so they're not re-evaluated every tick.
+            for &flow_id in &re_evaluate {
+                if let Some(flow_ref) = tracker.get(flow_id) {
+                    let common_flow = synapse_common::FlowRecord {
+                        flow_id: flow_ref.flow_id,
+                        src_ip: flow_ref.key.a_ip,
+                        dst_ip: flow_ref.key.b_ip,
+                        src_port: flow_ref.key.a_port,
+                        dst_port: flow_ref.key.b_port,
+                        protocol: flow_ref.key.protocol,
+                        local_port: flow_ref.local_port,
+                        pid: flow_ref.pid,
+                        packet_count: flow_ref.packet_count,
+                        byte_count: flow_ref.byte_count,
+                        dns_name: flow_ref.dns_name.clone(),
+                        process_path: flow_ref.process_path.clone(),
+                        country_code: flow_ref.country_code.clone(),
+                        reputation_score: flow_ref.reputation_score,
+                    };
+                    let findings =
+                        detectors::run_detectors(&detectors, &common_flow, detector_timeout);
+                    // Feed findings to decision engine — verdict is logged only.
+                    let features = synapse_common::FlowFeatures::from_flow(
+                        &common_flow,
+                        flow_ref.first_seen.elapsed(),
+                    );
+                    let verdict = decision_engine.evaluate(&features, &findings);
+                    match &verdict {
+                        synapse_common::Verdict::Allow => {}
+                        synapse_common::Verdict::Alert { reason } => {
+                            info!("RE-ALERT flow={} {}", flow_id, reason);
+                        }
+                        synapse_common::Verdict::Block { ttl, reason } => {
+                            info!("RE-BLOCK flow={} ttl={:?} {}", flow_id, ttl, reason);
+                        }
+                    }
+                    tracker.mark_evaluated(flow_id);
                 }
             }
         }

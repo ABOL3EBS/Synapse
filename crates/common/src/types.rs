@@ -279,6 +279,115 @@ pub struct FlowRecord {
     pub reputation_score: Option<f32>,
 }
 
+// ---------------------------------------------------------------------------
+// Decision Engine (§4 step 5)
+// ---------------------------------------------------------------------------
+
+/// Verdict produced by the decision engine after evaluating all detector
+/// findings for a flow. This is the output that drives enforcement (future)
+/// and logging (current).
+#[derive(Debug, Clone)]
+pub enum Verdict {
+    /// No threshold exceeded — flow is allowed.
+    Allow,
+    /// Score exceeds block threshold — flow should be blocked.
+    Block {
+        /// TTL for the block, derived from the most severe Completed finding.
+        ttl: Duration,
+        /// Human-readable reason summarizing why the block was triggered.
+        reason: String,
+    },
+    /// Score exceeds alert threshold but not block threshold — log but don't block.
+    Alert {
+        /// Human-readable reason for the alert.
+        reason: String,
+    },
+}
+
+/// Extracted features from a flow record, passed to the decision engine.
+/// Separates flow statistics from enrichment results so the decision engine
+/// can weight them independently.
+#[derive(Debug, Clone)]
+pub struct FlowFeatures {
+    pub flow_id: u64,
+    pub packet_count: u64,
+    pub byte_count: u64,
+    /// Flow age in milliseconds (now - first_seen).
+    pub duration_ms: u64,
+    /// Packets per second (packet_count / duration_sec).
+    pub packet_frequency: f64,
+    pub protocol: u8,
+    pub dst_port: u16,
+    pub has_dns_name: bool,
+    pub has_process_path: bool,
+    pub reputation_score: Option<f32>,
+}
+
+impl FlowFeatures {
+    /// Extract features from a FlowRecord and flow start time.
+    pub fn from_flow(flow: &FlowRecord, flow_age: Duration) -> Self {
+        let duration_ms = flow_age.as_millis() as u64;
+        let duration_sec = flow_age.as_secs_f64();
+        let packet_frequency = if duration_sec > 0.0 {
+            flow.packet_count as f64 / duration_sec
+        } else {
+            0.0
+        };
+
+        Self {
+            flow_id: flow.flow_id,
+            packet_count: flow.packet_count,
+            byte_count: flow.byte_count,
+            duration_ms,
+            packet_frequency,
+            protocol: flow.protocol,
+            dst_port: flow.dst_port,
+            has_dns_name: flow.dns_name.is_some(),
+            has_process_path: flow.process_path.is_some(),
+            reputation_score: flow.reputation_score,
+        }
+    }
+}
+
+/// Configuration for the decision engine's weighted scoring.
+#[derive(Debug, Clone)]
+pub struct DecisionConfig {
+    /// Score threshold above which a Block verdict is produced.
+    pub block_threshold: f32,
+    /// Score threshold above which an Alert verdict is produced (below block_threshold).
+    pub alert_threshold: f32,
+    /// TTL for blocks, keyed by the most severe Completed finding's severity.
+    pub ttl_by_severity: std::collections::HashMap<Severity, Duration>,
+    /// Minimum TTL floor — prevents rapid block/unblock cycling.
+    pub min_ttl: Duration,
+    /// Maximum TTL cap — prevents permanent blocks from a single finding.
+    pub max_ttl: Duration,
+    /// Status weight for TimedOut findings (down-weighted, not zeroed).
+    pub timed_out_weight: f32,
+    /// Status weight for Errored findings (zeroed).
+    pub errored_weight: f32,
+}
+
+impl Default for DecisionConfig {
+    fn default() -> Self {
+        let mut ttl_by_severity = std::collections::HashMap::new();
+        ttl_by_severity.insert(Severity::Critical, Duration::from_secs(3600)); // 1 hour
+        ttl_by_severity.insert(Severity::High, Duration::from_secs(900)); // 15 min
+        ttl_by_severity.insert(Severity::Medium, Duration::from_secs(300)); // 5 min
+        ttl_by_severity.insert(Severity::Low, Duration::from_secs(60)); // 1 min
+
+        Self {
+            block_threshold: 0.5,
+            alert_threshold: 0.2,
+            ttl_by_severity,
+            min_ttl: Duration::from_secs(30),
+            max_ttl: Duration::from_secs(86400), // 24 hours
+            timed_out_weight: 0.1,
+            errored_weight: 0.0,
+        }
+    }
+}
+
 /// Run a detector against a flow with an enforced timeout.
 /// Returns a DetectorFinding — either the detector's result or a TimedOut/Errored finding.
 /// The detector runs on its own thread; if it exceeds `budget`, we return TimedOut

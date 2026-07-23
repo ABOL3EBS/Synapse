@@ -34,6 +34,17 @@ const MAX_FLOWS: usize = 100_000;
 /// are reclaimed on tick().
 const FLOW_EXPIRY_SECS: u64 = 5;
 
+/// Re-evaluation interval for active flows. Flows with packets arriving
+/// continuously are re-evaluated by detectors at this cadence, not just
+/// at expiry. Keeps active C2 connections under detection without waiting
+/// for idle timeout.
+const EVALUATION_INTERVAL_SECS: u64 = 1;
+
+/// Maximum number of active flows to re-evaluate per tick.
+/// Bounds tick duration when many flows align on the same re-evaluation
+/// boundary (e.g. startup burst). Overflow is evaluated in subsequent ticks.
+const MAX_RE_EVAL_PER_TICK: usize = 100;
+
 // ---------------------------------------------------------------------------
 // FlowKey — direction-agnostic canonical 5-tuple
 // ---------------------------------------------------------------------------
@@ -139,6 +150,9 @@ pub struct FlowRecord {
     pub country_code: Option<String>,
     /// Reputation score 0.0–1.0 (stub in v1).
     pub reputation_score: Option<f32>,
+    /// When detectors were last run on this flow.
+    /// Updated by mark_evaluated() after each detection pass.
+    pub last_evaluated: Instant,
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +216,7 @@ impl FlowTracker {
             process_start_time: None,
             country_code: None,
             reputation_score: None,
+            last_evaluated: now,
         };
 
         self.index.insert(key, flow_id);
@@ -214,12 +229,19 @@ impl FlowTracker {
         FlowUpdate::NewFlow(flow_id)
     }
 
-    /// Expire flows older than FLOW_EXPIRY_SECS.
-    /// Returns the list of expired flow IDs (for future detection handoff).
+    /// Expire flows older than FLOW_EXPIRY_SECS and find active flows due for
+    /// re-evaluation. Returns (expired, due_for_re_evaluate).
+    ///
+    /// - **expired**: flows past FLOW_EXPIRY_SECS (5s idle) — caller should
+    ///   evaluate and remove from tracker.
+    /// - **due_for_re_evaluate**: active flows where now - last_evaluated > 1s —
+    ///   caller should re-run detectors and call mark_evaluated(). Capped at
+    ///   MAX_RE_EVAL_PER_TICK to bound tick duration.
+    ///
     /// Must be called on every capture-loop iteration (via poll() timeout),
     /// not only when a packet arrives — a quiet-but-stale network must not
     /// leave memory pinned.
-    pub fn tick(&mut self) -> Vec<u64> {
+    pub fn tick(&mut self) -> (Vec<u64>, Vec<u64>) {
         let now = Instant::now();
         let mut expired = Vec::new();
 
@@ -239,15 +261,29 @@ impl FlowTracker {
             }
         }
 
-        if !expired.is_empty() {
+        // Phase 2: Find active flows due for re-evaluation.
+        // Bounded by MAX_RE_EVAL_PER_TICK to prevent a single tick from
+        // stalling the capture loop when many flows align on the same boundary.
+        let mut due_for_re_evaluate = Vec::new();
+        for (&flow_id, flow) in &self.flows {
+            if now.duration_since(flow.last_evaluated).as_secs() >= EVALUATION_INTERVAL_SECS {
+                due_for_re_evaluate.push(flow_id);
+                if due_for_re_evaluate.len() >= MAX_RE_EVAL_PER_TICK {
+                    break;
+                }
+            }
+        }
+
+        if !expired.is_empty() || !due_for_re_evaluate.is_empty() {
             debug!(
-                "tick: expired {} flows ({} remaining)",
+                "tick: expired {} flows, re-evaluate {} flows ({} remaining)",
                 expired.len(),
+                due_for_re_evaluate.len(),
                 self.flows.len()
             );
         }
 
-        expired
+        (expired, due_for_re_evaluate)
     }
 
     /// Evict the oldest flow (by first_seen) to make room.
@@ -300,6 +336,17 @@ impl FlowTracker {
     #[allow(dead_code)]
     pub fn get(&self, flow_id: u64) -> Option<&FlowRecord> {
         self.flows.get(&flow_id)
+    }
+
+    /// Mark a flow as evaluated — bumps last_evaluated to now.
+    /// Called after detectors + decision engine run on a flow, regardless
+    /// of finding status (TimedOut/Errored detectors don't get special
+    /// backoff — the re-evaluation interval is a property of the flow,
+    /// not the detector).
+    pub fn mark_evaluated(&mut self, flow_id: u64) {
+        if let Some(flow) = self.flows.get_mut(&flow_id) {
+            flow.last_evaluated = Instant::now();
+        }
     }
 
     /// Number of currently tracked flows.
@@ -516,9 +563,10 @@ mod tests {
         tracker.update(&pkt, 5000, None);
         assert_eq!(tracker.len(), 1);
 
-        // Immediately — nothing should expire.
-        let expired = tracker.tick();
+        // Immediately — nothing should expire, nothing due for re-eval.
+        let (expired, re_eval) = tracker.tick();
         assert!(expired.is_empty());
+        assert!(re_eval.is_empty());
 
         // Manually backdate the flow's last_seen to simulate staleness.
         {
@@ -527,10 +575,12 @@ mod tests {
         }
 
         // Now tick should expire it.
-        let expired = tracker.tick();
+        let (expired, re_eval) = tracker.tick();
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0], 1);
         assert!(tracker.is_empty());
+        // Expired flows are removed — nothing left for re-evaluation.
+        assert!(re_eval.is_empty());
     }
 
     #[test]
@@ -708,21 +758,141 @@ mod tests {
             _ => panic!("expected NewFlow"),
         };
         // Immediately — flow should NOT be expired.
-        assert!(
-            tracker.tick().is_empty(),
-            "flow should not expire immediately"
-        );
+        let (expired, _) = tracker.tick();
+        assert!(expired.is_empty(), "flow should not expire immediately");
 
         // Backdate last_seen to trigger expiry (simulates wall-clock passage).
         if let Some(flow) = tracker.get_mut(id) {
             flow.last_seen = Instant::now() - std::time::Duration::from_secs(FLOW_EXPIRY_SECS + 1);
         }
-        let expired = tracker.tick();
+        let (expired, _) = tracker.tick();
         assert_eq!(
             expired.len(),
             1,
             "flow should expire after FLOW_EXPIRY_SECS"
         );
         assert_eq!(expired[0], id);
+    }
+
+    // -----------------------------------------------------------------------
+    // Re-evaluation tests — active flow detection (§4 step 3)
+    // -----------------------------------------------------------------------
+
+    /// Test: active flow with stale last_evaluated appears in re-evaluate list.
+    /// A flow that keeps receiving packets never expires, but after 1s without
+    /// re-evaluation it should appear in the due_for_re_evaluate list.
+    #[test]
+    fn test_tick_returns_re_evaluate_for_stale_last_evaluated() {
+        let mut tracker = FlowTracker::new();
+        let pkt = make_packet(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            5000,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            443,
+            6,
+        );
+        let id = match tracker.update(&pkt, 5000, None) {
+            FlowUpdate::NewFlow(id) => id,
+            _ => panic!("expected NewFlow"),
+        };
+
+        // Immediately — last_evaluated == now, so not due.
+        let (expired, re_eval) = tracker.tick();
+        assert!(expired.is_empty());
+        assert!(re_eval.is_empty());
+
+        // Backdate last_evaluated by 2s (past EVALUATION_INTERVAL_SECS).
+        // Keep last_seen fresh so the flow doesn't expire.
+        {
+            let flow = tracker.get_mut(id).unwrap();
+            flow.last_evaluated =
+                Instant::now() - std::time::Duration::from_secs(EVALUATION_INTERVAL_SECS + 1);
+        }
+
+        let (expired, re_eval) = tracker.tick();
+        assert!(
+            expired.is_empty(),
+            "flow is still active, should not expire"
+        );
+        assert_eq!(re_eval.len(), 1);
+        assert_eq!(re_eval[0], id);
+        // Flow is still in the tracker.
+        assert_eq!(tracker.len(), 1);
+    }
+
+    /// Test: mark_evaluated() bumps last_evaluated regardless of finding status.
+    /// After marking, the flow should NOT appear in re-evaluate on next tick.
+    #[test]
+    fn test_mark_evaluated_prevents_immediate_re_evaluate() {
+        let mut tracker = FlowTracker::new();
+        let pkt = make_packet(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            5000,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            443,
+            6,
+        );
+        let id = match tracker.update(&pkt, 5000, None) {
+            FlowUpdate::NewFlow(id) => id,
+            _ => panic!("expected NewFlow"),
+        };
+
+        // Backdate last_evaluated to make it due.
+        {
+            let flow = tracker.get_mut(id).unwrap();
+            flow.last_evaluated =
+                Instant::now() - std::time::Duration::from_secs(EVALUATION_INTERVAL_SECS + 1);
+        }
+
+        // Confirm it's due.
+        let (_, re_eval) = tracker.tick();
+        assert_eq!(re_eval.len(), 1);
+
+        // Mark as evaluated.
+        tracker.mark_evaluated(id);
+
+        // Now it should NOT be due on the next tick.
+        let (_, re_eval) = tracker.tick();
+        assert!(
+            re_eval.is_empty(),
+            "after mark_evaluated, flow should not be due immediately"
+        );
+    }
+
+    /// Test: MAX_RE_EVAL_PER_TICK caps the re-evaluation batch.
+    /// Create more flows than the cap, backdate all their last_evaluated,
+    /// verify only MAX_RE_EVAL_PER_TICK are returned.
+    #[test]
+    fn test_re_evaluate_capped_at_max_re_eval_per_tick() {
+        let mut tracker = FlowTracker::new();
+        // Create 150 flows (more than MAX_RE_EVAL_PER_TICK=100).
+        for i in 0..150u16 {
+            let pkt = make_packet(
+                IpAddr::V4(Ipv4Addr::new(10, (i / 256) as u8, (i % 256) as u8, 1)),
+                5000 + i,
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+                443,
+                6,
+            );
+            tracker.update(&pkt, 5000 + i, None);
+        }
+        assert_eq!(tracker.len(), 150);
+
+        // Backdate all last_evaluated to make them all due.
+        for id in 1..=150 {
+            if let Some(flow) = tracker.get_mut(id) {
+                flow.last_evaluated =
+                    Instant::now() - std::time::Duration::from_secs(EVALUATION_INTERVAL_SECS + 1);
+            }
+        }
+
+        let (_, re_eval) = tracker.tick();
+        assert_eq!(
+            re_eval.len(),
+            MAX_RE_EVAL_PER_TICK,
+            "re-evaluation should be capped at MAX_RE_EVAL_PER_TICK"
+        );
+        // All 150 flows are still in the tracker (none expired).
+        assert_eq!(tracker.len(), 150);
     }
 }
