@@ -63,20 +63,28 @@ Flow creation now logs at INFO level: `flow N created: src → dst (proto=X, loc
 ```
 synapsed-helper (root)                   synapse-agent (unprivileged)
 ┌──────────────────────────────┐        ┌────────────────────────────────────┐
-│ 1. Open /dev/bpf*            │        │ 1. Receive fd via SCM_RIGHTS      │
-│ 2. Set buffer (BIOCSBLEN)    │        │ 2. Query BIOCGBLEN                │
-│ 3. Bind interface (BIOCSETIF) │        │ 3. Raw read() from fd             │
-│ 4. Immediate mode            │──fd───▶│ 4. Parse BpfHdr + IPv4/IPv6       │
-│ 5. Set filter (BIOCSETF)     │        │ 5. Resolve local_port + PID       │
-│ 6. Flush + load pf anchor    │        │ 6. Feed to FlowTracker            │
-│ 7. Enable pf (pfctl -e)      │        │ 7. Dispatch enrichment (async)    │
-│ 8. SCM_RIGHTS fd handoff     │        │ 8. Attach results to flows        │
-│ 9. Cache-push thread (5s)    │──IPC──▶│ 9. Send Block/Unblock commands    │
-│    → PortPidCache            │◀───────│                                   │
-│ 10. Enforcement loop         │        └────────────────────────────────────┘
-│    Block → apply_block()     │
-│    Unblock → remove_block()  │
-│    KillState → kill_state()  │
+│ Startup (once):              │        │ 1. Receive fd via SCM_RIGHTS      │
+│  1. Open /dev/bpf*           │        │ 2. Query BIOCGBLEN                │
+│  2. Set buffer (BIOCSBLEN)   │        │ 3. Raw read() from fd             │
+│  3. Bind interface (BIOCSETIF)│──fd───▶│ 4. Parse BpfHdr + IPv4/IPv6       │
+│  4. Immediate mode           │        │ 5. Resolve local_port + PID       │
+│  5. Set filter (BIOCSETF)    │        │ 6. Feed to FlowTracker            │
+│  6. Flush + load pf anchor   │        │ 7. Dispatch enrichment (async)    │
+│  7. Enable pf (pfctl -e)     │        │ 8. Attach results to flows        │
+│                              │        │ 9. Send Block/Unblock commands    │
+│ Per-connection loop:         │──IPC──▶│                                   │
+│  8. accept() + getpeereid()  │◀───────│                                   │
+│  9. SCM_RIGHTS fd handoff    │        └────────────────────────────────────┘
+│ 10. Cache-push thread (5s)   │
+│     → PortPidCache           │
+│     cancelled on disconnect  │
+│ 11. Enforcement loop         │
+│     Block → apply_block()    │
+│     Unblock → remove_block() │
+│     KillState → kill_state() │
+│ 12. Agent disconnects →      │
+│     cancel cache thread →    │
+│     return to accept()       │
 └──────────────────────────────┘
 ```
 

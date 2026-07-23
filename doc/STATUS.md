@@ -8,7 +8,7 @@
 |---|---|---|---|
 | Common types | `crates/common/src/lib.rs` | 114 | `EnforcementCommand`, `PacketInfo`, `EnforcementBackend` trait, `EnrichmentRequest`, `EnrichmentResult`, `EnrichmentKind`, IPC constants (`PF_ANCHOR_NAME`, `PF_TABLE_NAME`, `IPC_SOCKET_PATH`), re-exports `Detector`, `run_detector_with_timeout`, `DecisionConfig`, `Verdict`, `FlowFeatures` |
 | Shared types | `crates/common/src/types.rs` | 456 | `ValidatedBlock`, `BlockId`, `DesiredFirewallState`, `EnforcementReceipt`, `ReconciliationReport`, `PortPidCache` (HashMap-based), `IpcMessage` enum, enrichment types, `DetectorId` (enum), `Severity` (enum), `Evidence` (`description` + `detail`), `DetectorStatus`, `DetectorFinding`, `Detector` trait (returns single finding), `run_detector_with_timeout()` with `catch_unwind` (panic → `Errored`), `FlowRecord`, `DecisionConfig` (`ttl_by_severity: HashMap<Severity, Duration>`), `Verdict`, `FlowFeatures` (`from_flow()` constructor) |
-| Helper daemon | `crates/platform-macos/src/helper/main.rs` | 385 | BPF raw ioctls, SCM_RIGHTS fd handoff, pf anchor init, enforcement loop, cache-push thread (5s interval). Socket permissions 0660. |
+| Helper daemon | `crates/platform-macos/src/helper/main.rs` | 482 | BPF raw ioctls, SCM_RIGHTS fd handoff, pf anchor init, reconnect loop (accept→enforce→accept), per-connection cache-push thread with `AtomicBool` cancellation. Socket 0666 with `getpeereid()` peer-credential auth. |
 | Enforcement backend | `crates/platform-macos/src/helper/enforce.rs` | 196 | `MacOsEnforcementBackend` — only pfctl executor, idempotent apply_block with AtomicBool TTL cancellation, kill_state, stub reconcile |
 | Process lookup | `crates/platform-macos/src/process_lookup.rs` | 668 | `libproc` crate (v0.14) typed structs for all FFI. **Port→PID cache** (`build_port_pid_cache`): per-process fd scan. **Port reading** via `read_port_be()` — raw BE bytes at verified offsets (268/264), bypasses c_int native-endian corruption on LE ARM. |
 | Agent binary | `crates/agent/src/main.rs` | 762 | BPF reads, IPv4+IPv6 parsing, enrichment pool integration, stream split for IPC reader thread, `detect_local_ip()` via getifaddrs (5s background refresh, benchmarked at 9.065 us/call), `determine_local_port()` with `is_local(ip)` direction check, flow tracker integration, detector framework wired on flow expiry, decision engine wired (log-only verdicts), active-flow re-evaluation |
@@ -80,6 +80,10 @@
 - **GeoIP enrichment** (`enrichment/mod.rs`): Returns `success: false`.
 - **Reputation enrichment** (`enrichment/mod.rs`): Returns `success: false`.
 
+## Known limitations (security-relevant)
+
+_(None — helper reconnect loop eliminates the one-shot accept bug. Agent crashes no longer take down the helper.)_
+
 ## Known shortcomings (working but fragile)
 
 1. **Hardcoded port offsets (268/264)** — `process_lookup.rs` reads `insi_lport`/`insi_fport` at fixed byte offsets verified by tests against lsof ground truth. Fragile if Apple changes `SocketFDInfo` layout. Will revisit with dynamic offset computation (pointer arithmetic on original struct, not stack copies — see bug #3 below).
@@ -91,6 +95,16 @@
 4. **Decision engine has no uncertainty/findings_summary** — `Verdict::Block` and `Verdict::Alert` lack an `uncertainty` field and per-finding evidence summary. Fix: add fields for dashboard audit trail.
 
 5. **All config is hardcoded** — block/alert thresholds, TTLs, detector budgets are constants in `DecisionConfig`. No TOML/YAML config file loading. Fix: config system with secure defaults.
+
+## Crash history
+
+| Date | Error | Duration before crash | Backtrace | Reproduced? | Root cause |
+|---|---|---|---|---|---|
+| 2026-07-23 | `Os { code: 13, kind: PermissionDenied }` | ~18s | No | No — not reproduced across 60s run (30s+60s) or 10-minute run (73,500+ packets) | Unexplained, not reproduced |
+
+**Investigation performed:** Agent code audited for file I/O outside BPF/IPC — zero matches. Grep for `File::open`, `fs::write`, `database`, `GeoIP` — all field-name false positives. Agent has zero enforcement calls (log-only verdicts). `RUST_BACKTRACE=full` set for all subsequent runs. No backtrace captured because the crash did not reproduce.
+
+**Status:** One unexplained EACCES crash observed at ~18s during a single run on 2026-07-23. Not reproduced across a subsequent 10-minute, 73,500-packet run with zero errors. Root cause unknown — treat as a low-probability, unresolved risk, not a fixed bug. Will remain in this ledger as an open item until either: (a) root cause is identified, or (b) sufficient run-time accumulates without recurrence to justify closing.
 
 ## Not built
 
@@ -114,5 +128,7 @@
 | 7 | `From<flow::FlowRecord>` impl, eliminated `.clone().into()` boilerplate | `agent/flow/mod.rs` | Verified |
 | 8 | O(log n) eviction via `BinaryHeap` (replaces linear scan) | `agent/flow/mod.rs` | Verified |
 | 9 | Batched re-evaluation scan every 10th tick (~1s) | `agent/flow/mod.rs` | Verified |
+
+| 10 | Helper reconnect loop (accept→enforce→accept) with per-connection cache-push cancellation via `Arc<AtomicBool>` | `platform-macos/helper/main.rs` | Verified |
 
 All 47 tests pass. clippy clean. fmt clean.

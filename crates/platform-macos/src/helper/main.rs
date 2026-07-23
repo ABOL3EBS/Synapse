@@ -15,6 +15,8 @@ use std::fs;
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -26,6 +28,56 @@ use synapse_common::{
 use synapse_platform_macos::protocol;
 
 use enforce::MacOsEnforcementBackend;
+
+// ---------------------------------------------------------------------------
+// Peer credential authentication
+// ---------------------------------------------------------------------------
+
+/// Get the effective UID of the peer connected on a Unix domain socket.
+/// Uses getpeereid() — available on macOS/BSD, not Linux.
+/// Returns None if the call fails (non-Unix socket, kernel limitation).
+fn get_peer_uid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    extern "C" {
+        fn getpeereid(
+            fd: std::os::raw::c_int,
+            euid: *mut libc::uid_t,
+            egid: *mut libc::gid_t,
+        ) -> std::os::raw::c_int;
+    }
+    let fd = stream.as_raw_fd();
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    let ret = unsafe { getpeereid(fd, &mut uid, &mut gid) };
+    if ret == 0 {
+        Some(uid)
+    } else {
+        None
+    }
+}
+
+/// Determine the expected UID for the agent process.
+///
+/// Priority:
+///   1. SYNAPSE_AGENT_UID — set by launchd via plist EnvironmentVariables.
+///      This is the production path: the plist declares which user runs the agent.
+///   2. SUDO_UID — set by sudo during dev/testing (`sudo cargo run --bin synapsed-helper`).
+///   3. Fallback: current process UID (root) — only accepts connections from root.
+fn expected_agent_uid() -> u32 {
+    // Production path: launchd plist sets SYNAPSE_AGENT_UID.
+    if let Ok(uid_str) = std::env::var("SYNAPSE_AGENT_UID") {
+        if let Ok(uid) = uid_str.parse::<u32>() {
+            return uid;
+        }
+    }
+    // Dev/testing path: sudo sets SUDO_UID.
+    if let Ok(uid_str) = std::env::var("SUDO_UID") {
+        if let Ok(uid) = uid_str.parse::<u32>() {
+            return uid;
+        }
+    }
+    // Fallback: only accept root — safe default when no env var is set.
+    unsafe { libc::getuid() }
+}
 
 // ---------------------------------------------------------------------------
 // BPF filter for IP traffic (both IPv4 and IPv6)
@@ -272,17 +324,19 @@ fn main() -> io::Result<()> {
     info!("synapsed-helper starting (pid={})", std::process::id());
 
     // 1. Open and configure BPF device (raw, no pcap).
+    //    The fd is opened once and kept alive for the lifetime of the helper so
+    //    it can be handed to each new agent connection via SCM_RIGHTS.
     let interface = std::env::var("SYNAPSE_IFACE").unwrap_or_else(|_| "en0".to_string());
     info!("opening BPF on interface: {interface}");
 
     let bpf_fd = open_bpf_device(&interface)?;
+    let bpf_raw_fd = bpf_fd.as_raw_fd();
     info!("BPF device configured and ready");
 
-    // 2. Initialise pf anchor.
+    // 2. Initialise pf anchor (idempotent — safe across reconnection cycles).
     ensure_anchor()?;
 
     // 3. Enable pf (reference counted — safe to call multiple times).
-    //    Without this, no rules are evaluated and no states are created.
     let enable = std::process::Command::new("pfctl").args(["-e"]).output()?;
     if !enable.status.success() {
         let stderr = String::from_utf8_lossy(&enable.stderr);
@@ -291,95 +345,138 @@ fn main() -> io::Result<()> {
         info!("pf enabled");
     }
 
-    // 4. Create IPC socket and wait for agent.
+    // 4. Create IPC socket.
     let _ = std::fs::remove_file(IPC_SOCKET_PATH);
     let listener = std::os::unix::net::UnixListener::bind(IPC_SOCKET_PATH)?;
-    // chmod 0660 — owner (root) + group rw only. No world access.
-    // Agent must be in the socket's group (typically wheel on macOS) to connect.
-    std::fs::set_permissions(IPC_SOCKET_PATH, std::fs::Permissions::from_mode(0o660))?;
-    info!("listening on {IPC_SOCKET_PATH} (mode 0660)");
+    // 0666 — world-accessible so the agent can physically connect.
+    // Real access control is peer-credential authentication via getpeereid().
+    std::fs::set_permissions(IPC_SOCKET_PATH, std::fs::Permissions::from_mode(0o666))?;
+    info!("listening on {IPC_SOCKET_PATH} (mode 0666, peer-credential auth active)");
 
-    info!("waiting for synapse-agent to connect...");
-    let (stream, _addr) = listener.accept()?;
-    info!("synapse-agent connected");
+    // Resolve expected agent UID once — does not change across connections.
+    let expected_uid = expected_agent_uid();
 
-    // 5. Send BPF fd via SCM_RIGHTS (before stream split — uses original handle).
-    let raw_fd = bpf_fd.as_raw_fd();
-    protocol::send_fd(&stream, raw_fd)?;
-    // Drop OwnedFd — closes helper's copy. Agent now solely holds the fd.
-    drop(bpf_fd);
-    info!("sent BPF fd to agent via SCM_RIGHTS (helper copy closed)");
-
-    // 6. Split stream for concurrent read/write.
-    //    read_half: enforcement loop (recv commands from agent).
-    //    write_half: cache-push thread (send PortPidCache to agent).
-    //    try_clone() duplicates the underlying fd so each half has independent
-    //    file-descriptor state — concurrent read/write cannot corrupt framing.
-    let mut read_half = stream.try_clone()?;
-    // Only one thread may write on this half. If a future feature needs to write
-    // from elsewhere (e.g. sending acks/receipts back), route it through this
-    // same thread/channel — do not spawn a second writer on this stream half,
-    // or the length-prefix framing race this design was built to avoid comes back.
-    let write_half = stream;
-
-    // 7. Spawn cache-push thread: builds port→PID cache every 5s and sends
-    //    it to the agent via the write half of the IPC socket.
-    let cache_interval = Duration::from_secs(5);
-    thread::Builder::new()
-        .name("port-pid-cache".to_string())
-        .spawn(move || {
-            info!("cache-push thread started (interval={cache_interval:?})");
-            let mut writer = write_half;
-            loop {
-                let cache = synapse_platform_macos::process_lookup::build_port_pid_cache();
-                let msg = IpcMessage::PortPidCache(cache);
-                if let Err(e) = protocol::send_message(&mut writer, &msg) {
-                    error!("cache-push: send failed: {e}");
-                    break;
-                }
-                thread::sleep(cache_interval);
-            }
-            info!("cache-push thread exiting");
-        })
-        .expect("failed to spawn cache-push thread");
-
-    // 8. Enforcement loop (reads from read_half — never touches write_half).
-    info!("entering enforcement loop...");
+    // Enforcement backend created once — persists across connections, holding
+    // active_blocks and TTL cancellation handles so unblock-timers fire
+    // correctly even if the agent crashes and reconnects.
     let mut backend = MacOsEnforcementBackend::new();
 
+    // 5. Accept loop — wait for an agent, run the enforcement loop, and return
+    //    here when the agent disconnects so the next connection can be accepted.
+    //    Everything inside is per-connection state that must not leak across loops.
+    info!("waiting for synapse-agent to connect...");
     loop {
-        match protocol::recv_message::<EnforcementCommand>(&mut read_half) {
-            Ok(cmd) => {
-                info!("received command: {cmd:?}");
-                let result = match &cmd {
-                    EnforcementCommand::Block { ip, ttl } => {
-                        let block = ValidatedBlock { ip: *ip, ttl: *ttl };
-                        backend.apply_block(block).map(|r| r.message)
-                    }
-                    EnforcementCommand::Unblock { ip } => {
-                        let block_id = BlockId::from(*ip);
-                        backend.remove_block(block_id).map(|r| r.message)
-                    }
-                    EnforcementCommand::KillState { src, dst, proto } => {
-                        backend.kill_state(*src, *dst, *proto).map(|r| r.message)
-                    }
-                };
-                if let Err(e) = result {
-                    error!("enforcement failed for {cmd:?}: {e}");
-                }
+        // --- Accept and authenticate -----------------------------------------
+        let (stream, _addr) = listener.accept()?;
+        info!("incoming connection");
+
+        match get_peer_uid(&stream) {
+            Some(peer_uid) if peer_uid == expected_uid => {
+                info!("synapse-agent connected (peer uid={peer_uid}, authenticated)");
             }
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                info!("agent disconnected");
-                break;
+            Some(peer_uid) => {
+                warn!(
+                    "rejecting connection: peer uid={peer_uid}, expected uid={expected_uid} \
+                     (wrong user)"
+                );
+                // Drop the stream — closes the connection — then loop to accept()
+                // the next one. Returning an error would kill the helper entirely.
+                continue;
             }
-            Err(e) => {
-                error!("IPC error: {e}");
-                break;
+            None => {
+                warn!(
+                    "could not verify peer credentials (getpeereid failed) — \
+                     allowing connection for backward compatibility"
+                );
+                info!("synapse-agent connected (unauthenticated)");
             }
         }
-    }
 
-    info!("synapsed-helper shutting down");
-    let _ = std::fs::remove_file(IPC_SOCKET_PATH);
-    Ok(())
+        // --- Handoff BPF fd -------------------------------------------------
+        protocol::send_fd(&stream, bpf_raw_fd)?;
+        // bpf_fd (OwnedFd) is NOT dropped here — kept alive so we can re-send
+        // it to the next agent if the current one disconnects.  The agent's
+        // received copy (via SCM_RIGHTS) is independent once the kernel dup's it.
+
+        // --- Stream split ----------------------------------------------------
+        let mut read_half = stream.try_clone()?;
+        let write_half = stream;
+
+        // --- Cache-push thread (per-connection) ------------------------------
+        // Cancelled via AtomicBool when the agent disconnects so we don't block
+        // for 5 seconds on join() before returning to accept().
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_flag = cancel.clone();
+        let cache_handle = thread::Builder::new()
+            .name("port-pid-cache".to_string())
+            .spawn(move || {
+                let mut writer = write_half;
+                loop {
+                    if cancel_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let cache = synapse_platform_macos::process_lookup::build_port_pid_cache();
+                    let msg = IpcMessage::PortPidCache(cache);
+                    if let Err(e) = protocol::send_message(&mut writer, &msg) {
+                        error!("cache-push: send failed: {e}");
+                        break;
+                    }
+                    // Sleep in 1 s increments so cancellation is noticed within 1 s
+                    // instead of blocking for the full 5 s interval.
+                    for _ in 0..5 {
+                        if cancel_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        thread::sleep(Duration::from_secs(1));
+                    }
+                }
+            })
+            .expect("failed to spawn cache-push thread");
+
+        // --- Enforcement loop (read half — blocks until agent disconnects) ----
+        info!("enforcement loop active");
+        loop {
+            match protocol::recv_message::<EnforcementCommand>(&mut read_half) {
+                Ok(cmd) => {
+                    info!("received command: {cmd:?}");
+                    let result = match &cmd {
+                        EnforcementCommand::Block { ip, ttl } => {
+                            let block = ValidatedBlock { ip: *ip, ttl: *ttl };
+                            backend.apply_block(block).map(|r| r.message)
+                        }
+                        EnforcementCommand::Unblock { ip } => {
+                            let block_id = BlockId::from(*ip);
+                            backend.remove_block(block_id).map(|r| r.message)
+                        }
+                        EnforcementCommand::KillState { src, dst, proto } => {
+                            backend.kill_state(*src, *dst, *proto).map(|r| r.message)
+                        }
+                    };
+                    if let Err(e) = result {
+                        error!("enforcement failed for {cmd:?}: {e}");
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    info!("agent disconnected (clean EOF)");
+                    break;
+                }
+                Err(e) => {
+                    error!("IPC error: {e}");
+                    break;
+                }
+            }
+        }
+
+        // --- Per-connection teardown ------------------------------------------
+        // Signal cache-push thread to stop. It will observe the flag on its next
+        // iteration (within 1 s) and exit; the write will also fail once the
+        // stream is dropped.
+        cancel.store(true, Ordering::Relaxed);
+        // read_half is dropped here — closes the fd. write_half (moved into the
+        // cache thread) is dropped when the thread exits, which happens promptly
+        // because the write will fail after the fd closes.
+        drop(read_half);
+        let _ = cache_handle.join();
+        info!("connection torn down, awaiting next agent...");
+    }
 }

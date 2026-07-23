@@ -4,8 +4,8 @@ Only code that calls `pfctl`. All via `Command::new("pfctl").args([...])` — ne
 
 ## Code location
 
-- `crates/platform-macos/src/helper/enforce.rs` (180 lines) — `MacOsEnforcementBackend`
-- `crates/platform-macos/src/helper/main.rs` — `ensure_anchor()` (line 198)
+- `crates/platform-macos/src/helper/enforce.rs` (196 lines) — `MacOsEnforcementBackend`
+- `crates/platform-macos/src/helper/main.rs` (482 lines) — `ensure_anchor()`, reconnect loop
 
 ## EnforcementBackend trait (common/src/lib.rs)
 
@@ -68,3 +68,4 @@ Both directions blocked. `block in` still needed independently — stops remote 
 - Flush before reload (`-F all` before `-f -`) clears stale rules from previous runs
 - `apply_block()` TTL auto-unblock spawns one OS thread per block — no cap in v1
 - Anchor rule text is static (changes only via code deploy + helper restart). Table contents are dynamic via `block_ip()`/`unblock_ip()`.
+- Helper is a persistent daemon with accept→enforce→accept loop. Agent crashes do not kill the helper. Per-connection cache-push thread is cancelled via `Arc<AtomicBool>` on disconnect.
