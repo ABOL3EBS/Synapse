@@ -313,9 +313,15 @@ fn ensure_anchor() -> io::Result<()> {
 // Main
 // ---------------------------------------------------------------------------
 
-fn main() -> io::Result<()> {
+fn main() {
     env_logger::init();
+    if let Err(e) = run() {
+        log::error!("helper exited with fatal error: {e:?} ({e})");
+        std::process::exit(1);
+    }
+}
 
+fn run() -> io::Result<()> {
     let euid = unsafe { libc::geteuid() };
     if euid != 0 {
         error!("synapsed-helper must run as root (euid={euid})");
