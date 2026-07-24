@@ -5,7 +5,7 @@ Zero-logic crate. Everything here is types, traits, and constants — no impleme
 ## Code location
 
 - `crates/common/src/lib.rs` (114 lines) — `EnforcementCommand`, `PacketInfo`, `EnforcementBackend` trait, `IPC_MAGIC`/`IPC_VERSION` constants, re-exports all public types from `types.rs`
-- `crates/common/src/types.rs` (456 lines) — all shared types
+- `crates/common/src/types.rs` (454 lines) — all shared types
 
 ## EnforcementCommand (wire format)
 

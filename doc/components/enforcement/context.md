@@ -5,7 +5,7 @@ Only code that calls `pfctl`. All via `Command::new("pfctl").args([...])` — ne
 ## Code location
 
 - `crates/platform-macos/src/helper/enforce.rs` (196 lines) — `MacOsEnforcementBackend`
-- `crates/platform-macos/src/helper/main.rs` (482 lines) — `ensure_anchor()`, reconnect loop
+- `crates/platform-macos/src/helper/main.rs` (488 lines) — `ensure_anchor()`, reconnect loop
 
 ## EnforcementBackend trait (common/src/lib.rs)
 

@@ -160,8 +160,6 @@ pub struct PortPidCache {
 pub enum DetectorId {
     /// Rule-based detection engine.
     RuleEngine,
-    /// ONNX model inference (future).
-    OnnxModel,
     /// Reputation feed lookup (future).
     ReputationEngine,
     /// Catch-all for future detectors.

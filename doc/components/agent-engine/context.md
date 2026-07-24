@@ -4,11 +4,11 @@ Unprivileged capture loop. Receives BPF fd from helper, reads raw packets, parse
 
 ## Code location
 
-`crates/agent/src/main.rs` (819 lines) — standalone binary crate
-`crates/agent/src/flow/mod.rs` (898 lines) — in-memory session window
+`crates/agent/src/main.rs` (838 lines) — standalone binary crate
+`crates/agent/src/flow/mod.rs` (975 lines) — in-memory session window
 `crates/agent/src/enrichment/mod.rs` (495 lines) — 4-thread enrichment worker pool
-`crates/agent/src/detectors/mod.rs` (343 lines) — detector framework, RuleDetector, timeout enforcement
-`crates/agent/src/decision/mod.rs` (397 lines) — DecisionEngine, weighted scoring, Verdict, active-flow re-evaluation
+`crates/agent/src/detectors/mod.rs` (798 lines) — detector framework, RuleDetector, timeout enforcement, circuit breaker
+`crates/agent/src/decision/mod.rs` (420 lines) — DecisionEngine, weighted scoring, Verdict, active-flow re-evaluation
 
 ## Startup sequence
 
@@ -110,8 +110,8 @@ loop {
 - `run_detector_with_timeout(detector: Arc<dyn Detector>, flow: &FlowRecord, budget: Duration)` — runs on separate thread, `recv_timeout()` enforces budget
 - `RuleDetector`: placeholder v1 rules (dns_blocklist, suspicious_port, high_packet_count)
 - `run_detectors(detectors: &[Arc<dyn Detector>], flow: &FlowRecord, timeout: Duration) -> Vec<DetectorFinding>` — runs all with timeout, returns one finding per detector
-- **No catch_unwind yet** — panics silently detach (known limitation)
-- **No circuit breaker** — failing detectors retried every interval (known limitation)
+- `catch_unwind` wraps `evaluate()` — panics produce `Errored` finding instead of crashing
+- `CircuitState` enum (Closed/Open/HalfOpen) with 30s cooldown and recovery — `run_detectors()` takes `&mut HashMap<DetectorId, CircuitState>`
 
 ## Decision engine (`decision/mod.rs`)
 
@@ -146,5 +146,5 @@ loop {
 - Process attribution is genuinely flow-specific (different processes on same port)
 - PID lookup uses `determine_local_port()` with `is_local(ip)` check — correct for both inbound and outbound
 - `determine_local_port()` extracted as testable function — 4 tests exercise real code path with system-detected local IP
-- Re-evaluation uses HashMap iteration (non-deterministic, starvation risk — fix: timing wheel)
+- Re-evaluation candidates collected every 10th tick (~1s), not every tick — fixes starvation risk from non-deterministic HashMap iteration
 - Decision engine is log-only — no enforcement calls yet

@@ -9,9 +9,9 @@
 
 **Reactive session-level IPS for macOS. No cloud. No kernel extensions. No Apple Developer account.**
 
-Synapse captures network traffic via BPF, detects threats through a pluggable detector framework (rules, ONNX models, reputation feeds), and enforces decisions through the native `pf` firewall. All inference runs locally — nothing leaves the machine.
+Synapse captures network traffic via BPF, detects threats through a pluggable detector framework (rules, behavioral analysis, reputation feeds), and enforces decisions through the native `pf` firewall. All detection runs locally — deterministic Rust logic, no ML in the hot path. AI assists in the UI layer only (event summarization, KPI explanations, recommendations).
 
-The process model splits privileged work (BPF device open, `pf` state) into a minimal helper daemon running as root, while all untrusted parsing, detection, and decision logic runs unprivileged in the agent. A bug in enrichment, ML inference, or storage is not a root exploit.
+The process model splits privileged work (BPF device open, `pf` state) into a minimal helper daemon running as root, while all untrusted parsing, detection, and decision logic runs unprivileged in the agent. A bug in enrichment, detection, or storage is not a root exploit.
 
 ## Architecture
 
@@ -40,22 +40,22 @@ The process model splits privileged work (BPF device open, `pf` state) into a mi
 |---|---|---|
 | BPF capture (raw ioctls, no pcap) | Done | — |
 | SCM_RIGHTS fd-passing + bincode IPC | Done | 112 |
-| Helper daemon (persistent, reconnect loop) | Done | 482 |
+| Helper daemon (persistent, reconnect loop) | Done | 488 |
 | Peer-credential auth (`getpeereid`) | Done | — |
 | pf anchor (flush, reload, enable) | Done | — |
 | Typed enforcement (Block/Unblock/KillState) | Done | 196 |
 | `EnforcementBackend` trait | Done | — |
 | Dedup + TTL auto-unblock (`AtomicBool`) | Done | — |
 | KillState (real state termination) | Verified | — |
-| Agent capture loop (BPF reads, IPv4+IPv6) | Done | 762 |
+| Agent capture loop (BPF reads, IPv4+IPv6) | Done | 838 |
 | Flow tracker (session window, eviction) | Done | 975 |
 | Enrichment pool (DNS, process attribution) | Done | 495 |
-| Detector framework (trait + timeout) | Done | 343 |
-| Decision engine (weighted scoring) | Done | 397 |
-| Shared types (common crate) | Done | 570 |
+| Detector framework (trait + timeout + circuit breaker) | Done | 798 |
+| Decision engine (weighted scoring) | Done | 420 |
+| Shared types (common crate) | Done | 568 |
 | Port→PID cache (libproc FFI) | Done | 668 |
 
-**Total: ~5,385 lines across 11 files. 47 tests. clippy clean. fmt clean.**
+**Total: ~5,558 lines across 11 files. 47 tests. clippy clean. fmt clean.**
 
 ### Verified end-to-end
 
@@ -115,9 +115,8 @@ crates/
 
 doc/
 ├── STATUS.md                      Ground-truth ledger (source of truth)
-├── report.md                      Full architecture, bug history, testing methodology
 ├── Synapse-IPS-Architecture.md    Design blueprint + rejected alternatives
-└── intern-presentation-prompt.md  Replit presentation content for onboarding
+└── components/*/context.md        Per-component agentic context
 ```
 
 ## Coding conventions
