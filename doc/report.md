@@ -813,3 +813,64 @@ Every step was verified with real terminal output:
 | Design review: local_port independence | ✅ `test_local_port_independent_of_canonical_ordering` — correct port |
 | Design review: enrichment dedup | ✅ `test_enrichment_dispatched_per_flow_not_per_ip` — per-flow (documented) |
 | Design review: flow-count bound | ✅ `test_tick_fires_on_wall_clock_not_packet_count` — wall-clock expiry |
+
+---
+
+## 2026-07-25
+
+---
+
+### What was done today
+
+**1. Helper crash discovered during reconnect verification testing.**
+
+The helper reconnect loop (built 07-24) was being verified with a 3-cycle test: start agent, let it run 5s, kill it, repeat. The helper survived cycles 1 and 2 but crashed during the cycle 2→3 transition. No crash report, no core dump, no macOS crash logs, no log output at all — the helper simply vanished. The terminal session where the helper ran was gone, so stdout/stderr output was lost.
+
+**2. Root cause investigation: three silent `?` propagation sites.**
+
+Code review of `crates/platform-macos/src/helper/main.rs` found three `?` operators in the reconnect loop that propagate errors from `accept()`, `send_fd()`, and `try_clone()` up through `main()`, which terminates the process on any `Err`. None of these sites have logging — a failure at any of them kills the helper silently:
+
+- `accept()` (~line 370) — socket accept fails
+- `send_fd()` (~line 396) — BPF fd handoff to agent fails
+- `try_clone()` (~line 402) — stream duplication for the cache-push thread fails
+
+Any of these could be the crash site. Without logging, there was no way to know which one fired or why.
+
+**3. Diagnostic wrapper added — purely additive, does not fix anything.**
+
+`main()` body extracted into `run() -> io::Result<()>`. New `main()` calls `run()` and, if it returns `Err`, logs both `log::error!("helper exited with fatal error: {e:?} ({e})")` before calling `std::process::exit(1)`.
+
+This is deliberately not a fix. The three `?` sites are left unchanged — any of them can still terminate the helper on error. The wrapper makes the failure visible if it recurs, but does not prevent or recover from it. Generic "catch everything and continue" hardening was intentionally avoided — it would mask the actual failure mode without evidence of what the failure is.
+
+**4. Re-verification: 6 reconnect cycles, zero crashes.**
+
+Helper restarted with `RUST_LOG=info stdbuf -e0 sudo -E ./target/debug/synapsed-helper 2>/tmp/helper.log` (direct stderr redirect, no `tee` — the `tee` pipe breaks when the shell exits).
+
+Ran 3 cycles: helper survived all. Ran 3 more cycles (same helper instance, no restart): helper survived all again. Full log captured showing all 6 connect/disconnect/reconnect sequences:
+
+```
+Cycle 1: incoming connection → authenticated → enforcement loop active → agent disconnected → connection torn down
+Cycle 2: incoming connection → authenticated → enforcement loop active → agent disconnected → connection torn down
+Cycle 3: incoming connection → authenticated → enforcement loop active → agent disconnected → connection torn down
+Cycle 4: incoming connection → authenticated → enforcement loop active → agent disconnected → connection torn down
+Cycle 5: incoming connection → authenticated → enforcement loop active → agent disconnected → connection torn down
+Cycle 6: incoming connection → authenticated → enforcement loop active → agent disconnected → connection torn down
+```
+
+No errors caught by the wrapper in any cycle. Root cause of the original crash remains unconfirmed — either (a) the failure was timing-dependent and didn't trigger in these runs, or (b) something about the wrapper environment incidentally avoided it. Treated as "not reproduced," not "fixed."
+
+Port→PID cache numbers from the re-verification runs: 50–56 entries, 505–525 PIDs, 6966–7087 fds, 3.2–3.4ms build time.
+
+**5. Presentation claims checked and found wrong/unverified.**
+
+Five claims in `doc/intern-presentation-prompt.md` were checked against real code and tests, and all five were wrong or unverified:
+
+| Claim in presentation | Actual | Fix |
+|---|---|---|
+| "Zero unsafe in agent" | 14 unsafe blocks, all FFI (getifaddrs, ioctl, poll, read, getnameinfo, CStr::from_ptr) | Corrected to state 14 unsafe blocks |
+| TTL table: Critical=24h, High=1h, Medium=15m, Low=5m | Critical=1h, High=15m, Medium=5m, Low=1m (matches `DecisionConfig` defaults) | Corrected to match code |
+| "Detection runs at ~10-20μs per flow. Total pipeline: sub-millisecond per packet." | Never benchmarked. Only detector-only latency measured (8-60μs from logs). | Changed to "detector latency measured at 8-60μs. Pipeline latency not yet benchmarked." |
+| Port→PID cache: ~420 PIDs, ~6500 fds | ~505–525 PIDs, ~6960–7087 fds (observed across live test runs) | Corrected to observed range |
+| "3 cycles survived, fds 11→13→12" | 6 cycles across 2 runs, zero crashes, real fd counts logged (12→12→11) | Corrected to reflect actual verification |
+
+The "Zero unsafe" and TTL errors were factual mistakes — the presentation was written from memory, not verified against code. The PID/fd count was fabricated (a single number presented without measurement). The performance numbers were unmeasured estimates presented as facts. The 3-cycle claim was from an earlier test run that was later invalidated.

@@ -82,7 +82,9 @@
 
 ## Known limitations (security-relevant)
 
-_(None — helper reconnect loop eliminates the one-shot accept bug. Agent crashes no longer take down the helper.)_
+1. **Three `?` crash sites in helper reconnect loop** (`main.rs` ~lines 370, 396, 402) — `accept()`, `send_fd()`, `try_clone()` failures propagate via `?` and terminate the helper. Diagnostic wrapper (2026-07-24) logs the error before exit, but does not prevent or recover from the failure. Deliberately left as-is pending real error evidence — generic "catch everything and continue" hardening would mask the actual failure mode.
+
+2. **Helper reconnect crash — root cause unconfirmed.** Helper crashed once during 3-cycle verification (2026-07-23, observed in cycle 2→3 transition). Diagnostic wrapper added (2026-07-24) to log fatal errors. Not reproduced across 6 reconnect cycles post-wrapper (two clean 3-cycle runs). Root cause remains unknown — may be low-probability timing-dependent condition that simply didn't trigger in subsequent runs.
 
 ## Known shortcomings (working but fragile)
 
@@ -101,10 +103,13 @@ _(None — helper reconnect loop eliminates the one-shot accept bug. Agent crash
 | Date | Error | Duration before crash | Backtrace | Reproduced? | Root cause |
 |---|---|---|---|---|---|
 | 2026-07-23 | `Os { code: 13, kind: PermissionDenied }` | ~18s | No | No — not reproduced across 60s run (30s+60s) or 10-minute run (73,500+ packets) | Unexplained, not reproduced |
+| 2026-07-23 | Helper crash during 3-cycle reconnect test | Cycle 2→3 transition | No | No — not reproduced across 6 reconnect cycles post-diagnostic-wrapper (two clean 3-cycle runs) | Unconfirmed. Diagnostic wrapper logs error but does not prevent it. Root cause unknown. |
 
-**Investigation performed:** Agent code audited for file I/O outside BPF/IPC — zero matches. Grep for `File::open`, `fs::write`, `database`, `GeoIP` — all field-name false positives. Agent has zero enforcement calls (log-only verdicts). `RUST_BACKTRACE=full` set for all subsequent runs. No backtrace captured because the crash did not reproduce.
+**Investigation performed (EACCES crash):** Agent code audited for file I/O outside BPF/IPC — zero matches. Grep for `File::open`, `fs::write`, `database`, `GeoIP` — all field-name false positives. Agent has zero enforcement calls (log-only verdicts). `RUST_BACKTRACE=full` set for all subsequent runs. No backtrace captured because the crash did not reproduce.
 
-**Status:** One unexplained EACCES crash observed at ~18s during a single run on 2026-07-23. Not reproduced across a subsequent 10-minute, 73,500-packet run with zero errors. Root cause unknown — treat as a low-probability, unresolved risk, not a fixed bug. Will remain in this ledger as an open item until either: (a) root cause is identified, or (b) sufficient run-time accumulates without recurrence to justify closing.
+**Investigation performed (helper reconnect crash):** Diagnostic wrapper added to `main()` — extracts `run() -> io::Result<()>`, logs `log::error!` with `{e:?}` and `{e}` on failure before `process::exit(1)`. The 3 `?` sites in the reconnect loop (`accept`, `send_fd`, `try_clone`) are left unchanged — any one could be the failure point. Wrapper did not catch the failure in any of the 6 subsequent reconnect cycles, meaning either (a) root cause was timing-dependent and didn't trigger, or (b) something about the wrapper environment incidentally avoided it.
+
+**Status:** Two unexplained crash events. EACCES crash: one occurrence, not reproduced. Helper reconnect crash: one occurrence, not reproduced across 6 cycles post-wrapper. Root causes unknown for both. Treat as low-probability, unresolved risks, not fixed bugs. Will remain in this ledger as open items until either: (a) root cause is identified, or (b) sufficient run-time accumulates without recurrence to justify closing.
 
 ## Not built
 

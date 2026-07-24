@@ -56,7 +56,7 @@ crates/
     └── 1,458 lines  # BPF setup, pfctl, SCM_RIGHTS, process lookup
 ```
 
-**Total: ~5,000 lines of Rust. 47 tests. Zero unsafe in agent.**
+**Total: ~5,400 lines of Rust. 47 tests. 14 unsafe blocks in agent (all FFI — getifaddrs, ioctl, poll, read, getnameinfo, CStr::from_ptr).**
 
 ---
 
@@ -95,7 +95,7 @@ Detectors (rule engine evaluates threat score)
 Decision Engine (weighted scoring → Allow / Block / Alert)
 ```
 
-**Performance:** BPF reads at 100ms poll intervals. Detection runs at ~10-20 microseconds per flow. Total pipeline: sub-millisecond per packet.
+**Performance:** BPF reads at 100ms poll intervals. Detector latency measured at 8-60μs per flow (from logs). Total pipeline latency: not yet benchmarked.
 
 ---
 
@@ -169,7 +169,7 @@ A network session — all packets between two endpoints on a specific protocol.
 
 **Key design decision:** Enrichment is async side-channel. Never blocks the hot packet-processing path. Results attach to flows after the fact.
 
-**Measured:** Port→PID cache: 48-53 entries, ~420 PIDs, ~6500 fds, ~6ms build time. Well within 5s refresh budget.
+**Measured:** Port→PID cache: 56-59 entries, ~524 PIDs, ~7087 fds. Well within 5s refresh budget.
 
 ---
 
@@ -224,10 +224,10 @@ status_weight:
 **TTL mapping:**
 | Severity | TTL |
 |---|---|
-| Critical | 24 hours |
-| High | 1 hour |
-| Medium | 15 minutes |
-| Low | 5 minutes |
+| Critical | 1 hour |
+| High | 15 minutes |
+| Medium | 5 minutes |
+| Low | 1 minute |
 
 **Currently log-only.** The decision engine produces verdicts but the agent never sends `EnforcementCommand::Block` to the helper. This is intentional — we're in observation mode until we trust the detector pipeline.
 
@@ -259,7 +259,7 @@ status_weight:
 └─────────────────────────────────────────────┘
 ```
 
-**Verified:** 3 consecutive kill/reconnect cycles. Helper survived all. No resource leaks. Agent fd count stable (11→13→12).
+**Verified:** 6 consecutive kill/reconnect cycles across 2 runs. Helper survived all. Agent fd count stable (12→12→11). Original crash root cause remains unconfirmed — wrapper logs errors but does not prevent them.
 
 ---
 
