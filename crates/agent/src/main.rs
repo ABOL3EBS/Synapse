@@ -21,9 +21,12 @@ use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Instant;
 
 use log::{debug, error, info, warn};
-use synapse_common::{EnrichmentKind, EnrichmentRequest, IpcMessage, PacketInfo, IPC_SOCKET_PATH};
+use synapse_common::{
+    EnforcementCommand, EnrichmentKind, EnrichmentRequest, IpcMessage, PacketInfo, IPC_SOCKET_PATH,
+};
 use synapse_platform_macos::protocol;
 
 /// BPF word alignment — packets are padded to this boundary between entries.
@@ -262,7 +265,7 @@ fn main() -> io::Result<()> {
     // from elsewhere (e.g. sending acks/receipts back), route it through this
     // same thread/channel — do not spawn a second writer on this stream half,
     // or the length-prefix framing race this design was built to avoid comes back.
-    let mut _write_half = stream.try_clone()?;
+    let mut write_half = stream.try_clone()?;
     let read_half = stream;
 
     // 4. Shared port→PID cache — updated by reader thread, read by main loop.
@@ -372,9 +375,21 @@ fn main() -> io::Result<()> {
     );
 
     // Decision engine — weighted scoring, threshold comparison, TTL from severity.
-    // Log-only mode: verdicts are logged, no enforcement commands sent.
     let decision_engine = decision::DecisionEngine::new(synapse_common::DecisionConfig::default());
-    info!("decision engine initialized (log-only mode — no enforcement)");
+    info!("decision engine initialized");
+
+    // Enforcement cooldown — keyed by destination IP. Prevents sending a fresh
+    // EnforcementCommand::Block on every re-evaluation tick (~1s) for the same IP.
+    // Value is the Instant when the cooldown expires (sent_at + ttl).
+    // Expired entries are lazily cleaned during tick processing.
+    let mut block_cooldown: HashMap<IpAddr, Instant> = HashMap::new();
+
+    // Per-detector circuit breaker — tracks consecutive failures (Errored or
+    // TimedOut). After 5 consecutive failures, the circuit opens (detector
+    // skipped for 30s cooldown), then probes via HalfOpen. Counter resets
+    // on any Completed finding.
+    let mut circuit_breaker: HashMap<synapse_common::DetectorId, detectors::CircuitState> =
+        HashMap::new();
 
     // Capture loop — uses poll() with 100ms timeout so tick() fires even
     // on quiet networks. A blocking read() would pin memory forever.
@@ -409,25 +424,60 @@ fn main() -> io::Result<()> {
                 re_evaluate.len(),
                 tracker.len()
             );
+
+            // Lazy cleanup of expired cooldown entries.
+            let now = Instant::now();
+            block_cooldown.retain(|_ip, expires_at| {
+                if now >= *expires_at {
+                    debug!("cooldown expired for {_ip}");
+                    false
+                } else {
+                    true
+                }
+            });
+
             // Run detectors + decision engine on expired flows.
             for &flow_id in &expired {
                 if let Some(flow_ref) = tracker.get(flow_id) {
                     let common_flow: synapse_common::FlowRecord = flow_ref.clone().into();
-                    let findings =
-                        detectors::run_detectors(&detectors, &common_flow, detector_timeout);
-                    // Feed findings to decision engine — verdict is logged only.
+                    let findings = detectors::run_detectors(
+                        &detectors,
+                        &common_flow,
+                        detector_timeout,
+                        &mut circuit_breaker,
+                    );
                     let features = synapse_common::FlowFeatures::from_flow(
                         &common_flow,
                         flow_ref.first_seen.elapsed(),
                     );
                     let verdict = decision_engine.evaluate(&features, &findings);
-                    match &verdict {
+                    match verdict {
                         synapse_common::Verdict::Allow => {}
-                        synapse_common::Verdict::Alert { reason } => {
-                            info!("ALERT flow={} {}", flow_id, reason);
+                        synapse_common::Verdict::Alert { ref reason } => {
+                            info!(
+                                "ALERT flow={} dst={} {}",
+                                flow_id, common_flow.dst_ip, reason
+                            );
                         }
-                        synapse_common::Verdict::Block { ttl, reason } => {
-                            info!("BLOCK flow={} ttl={:?} {}", flow_id, ttl, reason);
+                        synapse_common::Verdict::Block { ttl, ref reason } => {
+                            let dst_ip = common_flow.dst_ip;
+                            let dominated = block_cooldown
+                                .get(&dst_ip)
+                                .is_some_and(|&expires| Instant::now() < expires);
+                            if dominated {
+                                debug!("BLOCK skip flow={} {dst_ip} (cooldown active)", flow_id,);
+                            } else {
+                                info!("BLOCK flow={} dst={dst_ip} ttl={ttl:?} {reason}", flow_id,);
+                                let cmd = EnforcementCommand::Block { ip: dst_ip, ttl };
+                                if let Err(e) = protocol::send_message(&mut write_half, &cmd) {
+                                    error!(
+                                        "enforcement send failed for {dst_ip}: {e} — continuing"
+                                    );
+                                } else {
+                                    info!("enforcement command sent: Block {dst_ip} ttl={ttl:?}");
+                                    block_cooldown.insert(dst_ip, Instant::now() + ttl);
+                                }
+                            }
                         }
                     }
                 }
@@ -438,21 +488,47 @@ fn main() -> io::Result<()> {
             for &flow_id in &re_evaluate {
                 if let Some(flow_ref) = tracker.get(flow_id) {
                     let common_flow: synapse_common::FlowRecord = flow_ref.clone().into();
-                    let findings =
-                        detectors::run_detectors(&detectors, &common_flow, detector_timeout);
-                    // Feed findings to decision engine — verdict is logged only.
+                    let findings = detectors::run_detectors(
+                        &detectors,
+                        &common_flow,
+                        detector_timeout,
+                        &mut circuit_breaker,
+                    );
                     let features = synapse_common::FlowFeatures::from_flow(
                         &common_flow,
                         flow_ref.first_seen.elapsed(),
                     );
                     let verdict = decision_engine.evaluate(&features, &findings);
-                    match &verdict {
+                    match verdict {
                         synapse_common::Verdict::Allow => {}
-                        synapse_common::Verdict::Alert { reason } => {
-                            info!("RE-ALERT flow={} {}", flow_id, reason);
+                        synapse_common::Verdict::Alert { ref reason } => {
+                            info!(
+                                "RE-ALERT flow={} dst={} {}",
+                                flow_id, common_flow.dst_ip, reason
+                            );
                         }
-                        synapse_common::Verdict::Block { ttl, reason } => {
-                            info!("RE-BLOCK flow={} ttl={:?} {}", flow_id, ttl, reason);
+                        synapse_common::Verdict::Block { ttl, ref reason } => {
+                            let dst_ip = common_flow.dst_ip;
+                            let dominated = block_cooldown
+                                .get(&dst_ip)
+                                .is_some_and(|&expires| Instant::now() < expires);
+                            if dominated {
+                                debug!("BLOCK skip flow={} {dst_ip} (cooldown active)", flow_id,);
+                            } else {
+                                info!(
+                                    "RE-BLOCK flow={} dst={dst_ip} ttl={ttl:?} {reason}",
+                                    flow_id,
+                                );
+                                let cmd = EnforcementCommand::Block { ip: dst_ip, ttl };
+                                if let Err(e) = protocol::send_message(&mut write_half, &cmd) {
+                                    error!(
+                                        "enforcement send failed for {dst_ip}: {e} — continuing"
+                                    );
+                                } else {
+                                    info!("enforcement command sent: Block {dst_ip} ttl={ttl:?}");
+                                    block_cooldown.insert(dst_ip, Instant::now() + ttl);
+                                }
+                            }
                         }
                     }
                     tracker.mark_evaluated(flow_id);

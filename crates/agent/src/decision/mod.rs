@@ -7,6 +7,29 @@
 // "Weighted scoring merges all detector findings into a single verdict,
 // weighting down or ignoring findings with a TimedOut/Errored status rather
 // than treating a missing result as a silent zero." — §4
+//
+// TODO (decision engine reliability gap):
+// DetectorFinding currently conflates four distinct states:
+//   1. No threat found (Completed, score=0)
+//   2. Detector unavailable — timed out or circuit-broken (TimedOut, score=0)
+//   3. Detector error (Errored, score=0)
+//   4. Detector skipped by circuit breaker (synthetic TimedOut, score=0)
+//
+// The engine treats all four as zero contribution to total_score. A degraded
+// detection pipeline (multiple detectors circuit-broken) produces normal-looking
+// verdicts with reduced visibility. When the dashboard exists, introduce
+// DetectorHealth metadata:
+//
+//   DetectorHealth {
+//       detector_id: DetectorId,
+//       status: Available | Timeout | CircuitOpen | Error,
+//       last_failure: Option<Instant>,
+//       confidence_penalty: f32,  // reduces verdict confidence
+//   }
+//
+// The DecisionEngine should incorporate detection coverage into verdict
+// confidence — e.g., if 2/4 detectors are unavailable, the Allow verdict's
+// confidence should be halved.
 
 use synapse_common::{
     DecisionConfig, DetectorFinding, DetectorStatus, FlowFeatures, Severity, Verdict,
