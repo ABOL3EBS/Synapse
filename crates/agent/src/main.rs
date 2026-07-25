@@ -487,24 +487,38 @@ fn main() -> io::Result<()> {
                                 .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)));
                             let remote =
                                 determine_remote_ip(common_flow.a_ip, common_flow.b_ip, local_ip);
-                            let dominated = block_cooldown
-                                .get(&remote)
-                                .is_some_and(|&expires| Instant::now() < expires);
-                            if dominated {
-                                debug!("BLOCK skip flow={} {remote} (cooldown active)", flow_id,);
-                            } else {
-                                info!(
-                                    "BLOCK flow={} remote={remote} ttl={ttl:?} {reason}",
+                            // Belt-and-suspenders: never block the local IP, even if
+                            // determine_remote_ip() returns it (fallback path).
+                            if remote == local_ip {
+                                warn!(
+                                    "BLOCK skip flow={} — remote resolved to local IP {remote} (fallback)",
                                     flow_id,
                                 );
-                                let cmd = EnforcementCommand::Block { ip: remote, ttl };
-                                if let Err(e) = protocol::send_message(&mut write_half, &cmd) {
-                                    error!(
-                                        "enforcement send failed for {remote}: {e} — continuing"
+                            } else {
+                                let dominated = block_cooldown
+                                    .get(&remote)
+                                    .is_some_and(|&expires| Instant::now() < expires);
+                                if dominated {
+                                    debug!(
+                                        "BLOCK skip flow={} {remote} (cooldown active)",
+                                        flow_id,
                                     );
                                 } else {
-                                    info!("enforcement command sent: Block {remote} ttl={ttl:?}");
-                                    block_cooldown.insert(remote, Instant::now() + ttl);
+                                    info!(
+                                        "BLOCK flow={} remote={remote} ttl={ttl:?} {reason}",
+                                        flow_id,
+                                    );
+                                    let cmd = EnforcementCommand::Block { ip: remote, ttl };
+                                    if let Err(e) = protocol::send_message(&mut write_half, &cmd) {
+                                        error!(
+                                            "enforcement send failed for {remote}: {e} — continuing"
+                                        );
+                                    } else {
+                                        info!(
+                                            "enforcement command sent: Block {remote} ttl={ttl:?}"
+                                        );
+                                        block_cooldown.insert(remote, Instant::now() + ttl);
+                                    }
                                 }
                             }
                         }
@@ -548,24 +562,37 @@ fn main() -> io::Result<()> {
                                 .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)));
                             let remote =
                                 determine_remote_ip(common_flow.a_ip, common_flow.b_ip, local_ip);
-                            let dominated = block_cooldown
-                                .get(&remote)
-                                .is_some_and(|&expires| Instant::now() < expires);
-                            if dominated {
-                                debug!("BLOCK skip flow={} {remote} (cooldown active)", flow_id,);
-                            } else {
-                                info!(
-                                    "RE-BLOCK flow={} remote={remote} ttl={ttl:?} {reason}",
+                            // Belt-and-suspenders: never block the local IP.
+                            if remote == local_ip {
+                                warn!(
+                                    "RE-BLOCK skip flow={} — remote resolved to local IP {remote} (fallback)",
                                     flow_id,
                                 );
-                                let cmd = EnforcementCommand::Block { ip: remote, ttl };
-                                if let Err(e) = protocol::send_message(&mut write_half, &cmd) {
-                                    error!(
-                                        "enforcement send failed for {remote}: {e} — continuing"
+                            } else {
+                                let dominated = block_cooldown
+                                    .get(&remote)
+                                    .is_some_and(|&expires| Instant::now() < expires);
+                                if dominated {
+                                    debug!(
+                                        "BLOCK skip flow={} {remote} (cooldown active)",
+                                        flow_id,
                                     );
                                 } else {
-                                    info!("enforcement command sent: Block {remote} ttl={ttl:?}");
-                                    block_cooldown.insert(remote, Instant::now() + ttl);
+                                    info!(
+                                        "RE-BLOCK flow={} remote={remote} ttl={ttl:?} {reason}",
+                                        flow_id,
+                                    );
+                                    let cmd = EnforcementCommand::Block { ip: remote, ttl };
+                                    if let Err(e) = protocol::send_message(&mut write_half, &cmd) {
+                                        error!(
+                                            "enforcement send failed for {remote}: {e} — continuing"
+                                        );
+                                    } else {
+                                        info!(
+                                            "enforcement command sent: Block {remote} ttl={ttl:?}"
+                                        );
+                                        block_cooldown.insert(remote, Instant::now() + ttl);
+                                    }
                                 }
                             }
                         }
