@@ -37,6 +37,13 @@ pub struct RuleDetector {
 }
 
 impl RuleDetector {
+    /// Check if a hostname has `target` as a standalone label (dot/hyphen delimited),
+    /// not as a substring inside a longer label. E.g. "c2" inside "ec2" or
+    /// "malware" inside "malwarebytes" must NOT match.
+    fn has_label(name: &str, target: &str) -> bool {
+        name.split(['.', '-']).any(|part| part == target)
+    }
+
     pub fn new() -> Self {
         Self {
             rules: vec![
@@ -45,12 +52,17 @@ impl RuleDetector {
                     score: 0.8,
                     severity: Severity::High,
                     evaluate: |flow| {
-                        // Placeholder: flag flows with dns_name containing "malware" or "phish"
+                        // Placeholder: flag flows whose dns_name has known-malicious
+                        // strings as standalone labels (dot/hyphen delimited).
+                        // Must use label-aware matching — "c2" inside "ec2",
+                        // "malware" inside "malwarebytes", "phish" inside "phishing"
+                        // are all false positives.
                         // Real v1 would load from a blocklist file.
                         flow.dns_name.as_ref().is_some_and(|name| {
-                            name.contains("malware")
-                                || name.contains("phish")
-                                || name.contains("c2")
+                            let lower = name.to_ascii_lowercase();
+                            Self::has_label(&lower, "malware")
+                                || Self::has_label(&lower, "phish")
+                                || Self::has_label(&lower, "c2")
                         })
                     },
                 },
@@ -61,10 +73,11 @@ impl RuleDetector {
                     evaluate: |flow| {
                         // Placeholder: flag flows to known-suspicious ports.
                         // Real v1 would load from a threat-intel feed.
-                        matches!(
-                            flow.dst_port,
-                            4444 | 5555 | 6666 | 7777 | 8888 | 9999 | 31337
-                        )
+                        matches!(flow.a_port, 4444 | 5555 | 6666 | 7777 | 8888 | 9999 | 31337)
+                            || matches!(
+                                flow.b_port,
+                                4444 | 5555 | 6666 | 7777 | 8888 | 9999 | 31337
+                            )
                     },
                 },
                 Rule {
@@ -405,10 +418,10 @@ mod tests {
     fn make_test_flow() -> FlowRecord {
         FlowRecord {
             flow_id: 1,
-            src_ip: IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1)),
-            dst_ip: IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
-            src_port: 50000,
-            dst_port: 443,
+            a_ip: IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
+            b_ip: IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1)),
+            a_port: 443,
+            b_port: 50000,
             protocol: 6,
             local_port: 50000,
             pid: Some(42),
@@ -475,11 +488,79 @@ mod tests {
         assert!(!finding.evidence.is_empty());
     }
 
+    /// Regression: ec2 hostnames contain "c2" as a substring of "ec2" — must NOT match.
+    #[test]
+    fn test_rule_detector_dns_blocklist_ec2_no_false_positive() {
+        let detector = RuleDetector::new();
+        let mut flow = make_test_flow();
+        flow.dns_name = Some("ec2-52-73-240-202.compute-1.amazonaws.com".to_string());
+
+        let finding = detector.evaluate(&flow);
+        assert_eq!(
+            finding.score, 0.0,
+            "ec2 hostname must not trigger dns_blocklist"
+        );
+        assert!(finding.evidence.is_empty());
+    }
+
+    /// c2 as a standalone label (dot-delimited) SHOULD match.
+    #[test]
+    fn test_rule_detector_dns_blocklist_c2_label_matches() {
+        let detector = RuleDetector::new();
+        let mut flow = make_test_flow();
+        flow.dns_name = Some("evil-c2-server.example.com".to_string());
+
+        let finding = detector.evaluate(&flow);
+        assert!(finding.score > 0.0, "c2 as standalone label should match");
+    }
+
+    /// "malware" inside "malwarebytes" must NOT match (same substring-in-label bug as c2/ec2).
+    #[test]
+    fn test_rule_detector_dns_blocklist_malwarebytes_no_false_positive() {
+        let detector = RuleDetector::new();
+        let mut flow = make_test_flow();
+        flow.dns_name = Some("cdn.malwarebytes.com".to_string());
+
+        let finding = detector.evaluate(&flow);
+        assert_eq!(
+            finding.score, 0.0,
+            "malwarebytes hostname must not trigger dns_blocklist"
+        );
+    }
+
+    /// "phish" inside "phishing" must NOT match.
+    #[test]
+    fn test_rule_detector_dns_blocklist_phishing_no_false_positive() {
+        let detector = RuleDetector::new();
+        let mut flow = make_test_flow();
+        flow.dns_name = Some("phishing-detection.securityvendor.com".to_string());
+
+        let finding = detector.evaluate(&flow);
+        assert_eq!(
+            finding.score, 0.0,
+            "phishing hostname must not trigger dns_blocklist"
+        );
+    }
+
+    /// "malware" and "phish" as standalone labels SHOULD match.
+    #[test]
+    fn test_rule_detector_dns_blocklist_standalone_labels_match() {
+        let detector = RuleDetector::new();
+        let mut flow = make_test_flow();
+        flow.dns_name = Some("bad-phish-server.malware.internal".to_string());
+
+        let finding = detector.evaluate(&flow);
+        assert!(
+            finding.score > 0.0,
+            "standalone malware/phish labels should match"
+        );
+    }
+
     #[test]
     fn test_rule_detector_suspicious_port() {
         let detector = RuleDetector::new();
         let mut flow = make_test_flow();
-        flow.dst_port = 4444;
+        flow.a_port = 4444;
 
         let finding = detector.evaluate(&flow);
         assert_eq!(finding.status, DetectorStatus::Completed);

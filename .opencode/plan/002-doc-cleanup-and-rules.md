@@ -10,7 +10,6 @@ The documentation is well-written but bloated. 16 markdown files with massive re
 
 | File | Why |
 |---|---|
-| `VALIDATION_REPORT.md` | One-time artifact from 07-24. All info now in STATUS.md. Stale commit hash. |
 | `doc/report.md` (876 lines) | Day-by-day diary. Architecture details duplicate `Synapse-IPS-Architecture.md`. Bug history duplicates `STATUS.md`. Test results are just a list. Agent never needs this. |
 | `doc/intern-presentation-prompt.md` | Slide deck content. Stale (says enforcement wiring is TODO — it's done). Not agent context. |
 | `doc/components/anchor-fix/context.md` | Historical bug postmortem. Already in commit history. Not actionable for future agents. |

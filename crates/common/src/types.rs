@@ -259,13 +259,18 @@ pub trait Detector: Send + Sync {
 /// Reference to a flow record passed to detectors.
 /// Extracted from the flow tracker — contains everything a detector needs
 /// without giving it mutable access to the tracker itself.
+///
+/// **Field ordering is canonical, not directional.** `a_ip`/`a_port` are the
+/// numerically smaller endpoint; `b_ip`/`b_port` are the larger. This
+/// discards which side is local. Use `determine_remote_ip()` (agent) to
+/// resolve the actual remote endpoint before enforcement.
 #[derive(Debug, Clone)]
 pub struct FlowRecord {
     pub flow_id: u64,
-    pub src_ip: IpAddr,
-    pub dst_ip: IpAddr,
-    pub src_port: u16,
-    pub dst_port: u16,
+    pub a_ip: IpAddr,
+    pub b_ip: IpAddr,
+    pub a_port: u16,
+    pub b_port: u16,
     pub protocol: u8,
     pub local_port: u16,
     pub pid: Option<u32>,
@@ -339,7 +344,7 @@ impl FlowFeatures {
             duration_ms,
             packet_frequency,
             protocol: flow.protocol,
-            dst_port: flow.dst_port,
+            dst_port: flow.b_port,
             has_dns_name: flow.dns_name.is_some(),
             has_process_path: flow.process_path.is_some(),
             reputation_score: flow.reputation_score,

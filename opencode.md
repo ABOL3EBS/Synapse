@@ -127,6 +127,7 @@ crates/
 5. Enrichment never awaited inline on the hot path. Async side-channel only.
 6. PID attribution carries process-start-time alongside PID.
 7. Don't suggest: cross-platform, tokio, control-plane backend, or pre-creating platform crates. All rejected for v1 — see `doc/Synapse-IPS-Architecture.md` §1b.
+8. **FlowRecord fields `a_ip`/`b_ip` are canonical (smaller/larger), NOT directional (src/dst).** Two confirmed bugs from the same root cause: `src_ip`/`dst_ip` naming invited the assumption that `dst_ip` = "remote endpoint." It's not — it's the numerically larger IP. For enforcement, always use `determine_remote_ip(a_ip, b_ip, local_ip)` to resolve the actual remote endpoint. Never assume `a_ip` or `b_ip` means "remote" based on field name.
 
 ## Agent workflow
 

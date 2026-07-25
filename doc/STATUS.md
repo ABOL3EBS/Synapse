@@ -7,18 +7,18 @@
 | Component | File | Lines | Key details |
 |---|---|---|---|
 | Common types | `crates/common/src/lib.rs` | 114 | `EnforcementCommand`, `PacketInfo`, `EnforcementBackend` trait, `EnrichmentRequest`, `EnrichmentResult`, `EnrichmentKind`, IPC constants (`PF_ANCHOR_NAME`, `PF_TABLE_NAME`, `IPC_SOCKET_PATH`), re-exports `Detector`, `run_detector_with_timeout`, `DecisionConfig`, `Verdict`, `FlowFeatures` |
-| Shared types | `crates/common/src/types.rs` | 454 | `ValidatedBlock`, `BlockId`, `DesiredFirewallState`, `EnforcementReceipt`, `ReconciliationReport`, `PortPidCache` (HashMap-based), `IpcMessage` enum, enrichment types, `DetectorId` (enum), `Severity` (enum), `Evidence` (`description` + `detail`), `DetectorStatus`, `DetectorFinding`, `Detector` trait (returns single finding), `run_detector_with_timeout()` with `catch_unwind` (panic → `Errored`), `FlowRecord`, `DecisionConfig` (`ttl_by_severity: HashMap<Severity, Duration>`), `Verdict`, `FlowFeatures` (`from_flow()` constructor) |
+| Shared types | `crates/common/src/types.rs` | 459 | `ValidatedBlock`, `BlockId`, `DesiredFirewallState`, `EnforcementReceipt`, `ReconciliationReport`, `PortPidCache` (HashMap-based), `IpcMessage` enum, enrichment types, `DetectorId` (enum), `Severity` (enum), `Evidence` (`description` + `detail`), `DetectorStatus`, `DetectorFinding`, `Detector` trait (returns single finding), `run_detector_with_timeout()` with `catch_unwind` (panic → `Errored`), `FlowRecord` (canonical `a_ip`/`b_ip` ordering — NOT directional), `DecisionConfig` (`ttl_by_severity: HashMap<Severity, Duration>`), `Verdict`, `FlowFeatures` (`from_flow()` constructor) |
 | Helper daemon | `crates/platform-macos/src/helper/main.rs` | 488 | BPF raw ioctls, SCM_RIGHTS fd handoff, pf anchor init, reconnect loop (accept→enforce→accept), per-connection cache-push thread with `AtomicBool` cancellation. Socket 0666 with `getpeereid()` peer-credential auth. |
 | Enforcement backend | `crates/platform-macos/src/helper/enforce.rs` | 196 | `MacOsEnforcementBackend` — only pfctl executor, idempotent apply_block with AtomicBool TTL cancellation, kill_state, stub reconcile |
 | Process lookup | `crates/platform-macos/src/process_lookup.rs` | 668 | `libproc` crate (v0.14) typed structs for all FFI. **Port→PID cache** (`build_port_pid_cache`): per-process fd scan. **Port reading** via `read_port_be()` — raw BE bytes at verified offsets (268/264), bypasses c_int native-endian corruption on LE ARM. |
-| Agent binary | `crates/agent/src/main.rs` | 838 | BPF reads, IPv4+IPv6 parsing, enrichment pool integration, stream split for IPC reader thread, `detect_local_ip()` via getifaddrs (5s background refresh, benchmarked at 9.065 us/call), `determine_local_port()` with `is_local(ip)` direction check, flow tracker integration, detector framework wired on flow expiry, decision engine wired (log-only verdicts), active-flow re-evaluation |
-| Detector framework | `crates/agent/src/detectors/mod.rs` | 798 | `RuleDetector` (placeholder v1 rules: dns_blocklist, suspicious_port, high_packet_count), timeout enforcement via `run_detector_with_timeout()`, `catch_unwind` panic safety, `CircuitState` enum (Closed/Open/HalfOpen) with 30s cooldown |
-| Decision engine | `crates/agent/src/decision/mod.rs` | 420 | `DecisionEngine` with weighted scoring (score × confidence × status_weight), `Verdict` enum (Allow/Block/Alert), `FlowFeatures` extraction, `DecisionConfig` with block/alert thresholds + severity→TTL map. 11 unit tests. Wired into capture loop — log-only, zero enforcement calls. |
+| Agent binary | `crates/agent/src/main.rs` | 948 | BPF reads, IPv4+IPv6 parsing, enrichment pool integration, stream split for IPC reader thread, `detect_local_ip()` via getifaddrs (5s background refresh, benchmarked at 9.065 us/call), `determine_local_port()` with `is_local(ip)` direction check, `determine_remote_ip()` for enforcement target resolution, flow tracker integration, detector framework wired on flow expiry, decision engine wired (enforcement live via IPC), active-flow re-evaluation |
+| Detector framework | `crates/agent/src/detectors/mod.rs` | 879 | `RuleDetector` (placeholder v1 rules: dns_blocklist, suspicious_port, high_packet_count), timeout enforcement via `run_detector_with_timeout()`, `catch_unwind` panic safety, `CircuitState` enum (Closed/Open/HalfOpen) with 30s cooldown and recovery, `run_detectors()` takes `&mut HashMap<DetectorId, CircuitState>`. 6 tests. |
+| Decision engine | `crates/agent/src/decision/mod.rs` | 420 | `DecisionEngine` with weighted scoring (score × confidence × status_weight), `Verdict` enum (Allow/Block/Alert), `FlowFeatures` extraction, `DecisionConfig` with block/alert thresholds + severity→TTL map. 11 unit tests. Wired into capture loop — Block verdicts send `EnforcementCommand::Block` via IPC to helper |
 | Enrichment pool | `crates/agent/src/enrichment/mod.rs` | 495 | 4-thread worker pool (`std::thread` + `mpsc`), DNS reverse via `getnameinfo`, process attribution via libproc, GeoIP/Reputation stubs |
 | Flow tracker | `crates/agent/src/flow/mod.rs` | 975 | In-memory session window with ~100ms ticks via `poll()` timeout. Direction-agnostic canonicalization, MAX_FLOWS eviction with O(log n) `BinaryHeap`, local_port + PID stored per-flow, enrichment attachment, `last_evaluated` per-flow, `EVALUATION_INTERVAL_SECS` (1s), `MAX_RE_EVAL_PER_TICK` (100). `tick()` returns `(expired, due_for_re_evaluate)` tuple. Batched re-evaluation scan (every 10th tick). |
 | IPC protocol | `crates/platform-macos/src/protocol.rs` | 112 | `send_fd`/`recv_fd` (SCM_RIGHTS), `send_message`/`recv_message` (bincode, length-prefixed), stream split via `try_clone()` |
 
-**Total:** 5,558 lines across 11 files.
+**Total:** 5,770 lines across 11 files.
 
 **Verified end-to-end (2026-07-22):** Helper sends PortPidCache (49–51 entries, ~483 PIDs, ~6675 fds, 62–64 probe_ok, ~7–8ms root scan). Agent receives cache, looks up src_port on each packet, resolves to correct PID + executable path. Live test: Brave Browser connection to 142.251.142.74:443 resolved to pid=743 → `Brave Browser Helper`.
 
@@ -47,13 +47,16 @@
 ### Detector framework (§4b) — verified
 
 - `Detector` trait + `DetectorFinding` + `run_detector_with_timeout()` in `common/src/types.rs`
-- `RuleDetector` with placeholder v1 rules (dns_blocklist, suspicious_port, high_packet_count)
+- `RuleDetector` with placeholder v1 rules — ALL THREE produce false positives against legitimate traffic until real tuning/allowlisting:
+  - `dns_blocklist`: label-aware match on "malware"/"phish"/"c2". Fixed c2/ec2 false positive (2026-07-25). Still a placeholder — no real blocklist loaded.
+  - `suspicious_port`: hardcoded ports 4444/5555/6666/7777/8888/9999/31337. Will false-positive on dev servers, game servers, and any legitimate service on these ports. Needs configurable allowlist.
+  - `high_packet_count`: threshold >1000 packets/5s window. Will false-positive on video streaming, large downloads, and any high-bandwidth legitimate flow. Needs per-protocol tuning.
 - Timeout enforcement: `run_detector_with_timeout()` runs `evaluate()` on its own thread, uses `recv_timeout()` with configurable budget. Returns `TimedOut` if exceeded.
 - Panic safety: `evaluate()` wrapped in `catch_unwind` — panics produce `Errored` finding instead of crashing the thread.
-- Wired into capture loop on flow expiry AND active-flow re-evaluation — log only
-- **No circuit breaker** — consistently-failing detectors retried every interval (known limitation)
+- Wired into capture loop on flow expiry AND active-flow re-evaluation
+- **c2 false-positive fix (2026-07-25):** `dns_blocklist` rule's `name.contains("c2")` matched inside `ec2` hostnames (e.g. `ec2-52-73-240-202.compute-1.amazonaws.com`). Fixed: `has_label()` splits on `.`/`-` and checks for standalone label. Regression tests for ec2, malwarebytes, phishing.
 
-### Decision engine — verified (log-only)
+### Decision engine — verified (enforcement live)
 
 - `DecisionEngine` in `crates/agent/src/decision/mod.rs`
 - Weighted scoring: `score × confidence × status_weight`. TimedOut=0.1x, Errored=0.0x
@@ -61,10 +64,9 @@
 - TTL from most severe Completed finding, clamped [30s, 24h]
 - `Verdict` enum: `Allow`, `Block { ttl, reason }`, `Alert { reason }`
 - `FlowFeatures` extracted from FlowRecord
-- `DecisionConfig` with thresholds + severity→TTL map + min/max TTL clamps
+- `DecisionConfig` with thresholds + severity→TTL map + max TTL clamps
 - 11 unit tests pass
-- Wired into capture loop — verdicts logged with `BLOCK`/`ALERT`/`RE-BLOCK`/`RE-ALERT` prefixes
-- **Zero enforcement calls** — grep-confirmed
+- Wired into capture loop — Block verdicts send `EnforcementCommand::Block` via IPC to helper
 
 ### Active-flow re-evaluation — verified
 
@@ -106,8 +108,10 @@
 |---|---|---|---|---|---|
 | 2026-07-23 | `Os { code: 13, kind: PermissionDenied }` | ~18s | No | No — not reproduced across 60s run (30s+60s) or 10-minute run (73,500+ packets) | Unexplained, not reproduced |
 | 2026-07-23 | Helper crash during 3-cycle reconnect test | Cycle 2→3 transition | No | No — not reproduced across 6 reconnect cycles post-diagnostic-wrapper (two clean 3-cycle runs) | Unconfirmed. Diagnostic wrapper logs error but does not prevent it. Root cause unknown. |
+| 2026-07-25 | False-positive block of own machine (192.168.0.102) | N/A — not a crash | N/A | Yes — deterministic. `dns_blocklist` rule's `name.contains("c2")` matched inside `ec2` in AWS EC2 hostnames. Fixed: `has_label()` splits on `.`/`-` and checks for standalone label. Regression tests for ec2, malwarebytes, phishing. | Rule bug: substring match on `c2` matched within `ec2-...` hostnames. All AWS EC2 traffic false-positived. |
+| 2026-07-25 | Enforcement targets local IP instead of remote | N/A — not a crash | N/A | Yes — deterministic. `common_flow.dst_ip` reads `flow.key.b_ip` (the numerically larger IP). For flows where local IP > remote IP (e.g. 192.168.0.102 > 52.73.240.202), `b_ip` is the local machine. Fixed: `determine_remote_ip()` uses `is_local(ip)` to identify the remote endpoint. `FlowRecord.dst_ip` renamed to `b_ip` to prevent future confusion. 4 regression tests. Live verified: pfctl table shows remote IPs (172.65.90.23, 17.57.146.59), not 192.168.0.102. | Same class of bug as the original local_port issue — canonical key ordering loses direction info. |
 
-**Investigation performed (EACCES crash):** Agent code audited for file I/O outside BPF/IPC — zero matches. Grep for `File::open`, `fs::write`, `database`, `GeoIP` — all field-name false positives. Agent has zero enforcement calls (log-only verdicts). `RUST_BACKTRACE=full` set for all subsequent runs. No backtrace captured because the crash did not reproduce.
+**Investigation performed (EACCES crash):** Agent code audited for file I/O outside BPF/IPC — zero matches. Grep for `File::open`, `fs::write`, `database`, `GeoIP` — all field-name false positives. `RUST_BACKTRACE=full` set for all subsequent runs. No backtrace captured because the crash did not reproduce.
 
 **Investigation performed (helper reconnect crash):** Diagnostic wrapper added to `main()` — extracts `run() -> io::Result<()>`, logs `log::error!` with `{e:?}` and `{e}` on failure before `process::exit(1)`. The 3 `?` sites in the reconnect loop (`accept`, `send_fd`, `try_clone`) are left unchanged — any one could be the failure point. Wrapper did not catch the failure in any of the 6 subsequent reconnect cycles, meaning either (a) root cause was timing-dependent and didn't trigger, or (b) something about the wrapper environment incidentally avoided it.
 
@@ -138,4 +142,4 @@
 
 | 10 | Helper reconnect loop (accept→enforce→accept) with per-connection cache-push cancellation via `Arc<AtomicBool>` | `platform-macos/helper/main.rs` | Verified |
 
-All 47 tests pass. clippy clean. fmt clean.
+All 63 tests pass. clippy clean. fmt clean.

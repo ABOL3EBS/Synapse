@@ -189,6 +189,22 @@ fn determine_local_port(
     }
 }
 
+/// Determine which IP is the remote endpoint for enforcement.
+/// Mirrors the is_local() pattern from determine_local_port().
+/// Never assume a_ip or b_ip means "remote" — canonical ordering
+/// discards direction.
+fn determine_remote_ip(a_ip: IpAddr, b_ip: IpAddr, local_ip: IpAddr) -> IpAddr {
+    if a_ip == local_ip {
+        b_ip
+    } else if b_ip == local_ip {
+        a_ip
+    } else {
+        // Neither matches local — default to b_ip (the larger address,
+        // which is more likely to be external on a home network).
+        b_ip
+    }
+}
+
 /// Detect the local IP address from the network interface.
 /// Uses getifaddrs() to find IPv4 addresses on non-loopback interfaces.
 /// Returns the first non-loopback IPv4 address found.
@@ -454,28 +470,41 @@ fn main() -> io::Result<()> {
                     match verdict {
                         synapse_common::Verdict::Allow => {}
                         synapse_common::Verdict::Alert { ref reason } => {
-                            info!(
-                                "ALERT flow={} dst={} {}",
-                                flow_id, common_flow.dst_ip, reason
-                            );
+                            let local_ip = local_ip_cache
+                                .lock()
+                                .ok()
+                                .and_then(|g| *g)
+                                .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)));
+                            let remote =
+                                determine_remote_ip(common_flow.a_ip, common_flow.b_ip, local_ip);
+                            info!("ALERT flow={} remote={} {}", flow_id, remote, reason);
                         }
                         synapse_common::Verdict::Block { ttl, ref reason } => {
-                            let dst_ip = common_flow.dst_ip;
+                            let local_ip = local_ip_cache
+                                .lock()
+                                .ok()
+                                .and_then(|g| *g)
+                                .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)));
+                            let remote =
+                                determine_remote_ip(common_flow.a_ip, common_flow.b_ip, local_ip);
                             let dominated = block_cooldown
-                                .get(&dst_ip)
+                                .get(&remote)
                                 .is_some_and(|&expires| Instant::now() < expires);
                             if dominated {
-                                debug!("BLOCK skip flow={} {dst_ip} (cooldown active)", flow_id,);
+                                debug!("BLOCK skip flow={} {remote} (cooldown active)", flow_id,);
                             } else {
-                                info!("BLOCK flow={} dst={dst_ip} ttl={ttl:?} {reason}", flow_id,);
-                                let cmd = EnforcementCommand::Block { ip: dst_ip, ttl };
+                                info!(
+                                    "BLOCK flow={} remote={remote} ttl={ttl:?} {reason}",
+                                    flow_id,
+                                );
+                                let cmd = EnforcementCommand::Block { ip: remote, ttl };
                                 if let Err(e) = protocol::send_message(&mut write_half, &cmd) {
                                     error!(
-                                        "enforcement send failed for {dst_ip}: {e} — continuing"
+                                        "enforcement send failed for {remote}: {e} — continuing"
                                     );
                                 } else {
-                                    info!("enforcement command sent: Block {dst_ip} ttl={ttl:?}");
-                                    block_cooldown.insert(dst_ip, Instant::now() + ttl);
+                                    info!("enforcement command sent: Block {remote} ttl={ttl:?}");
+                                    block_cooldown.insert(remote, Instant::now() + ttl);
                                 }
                             }
                         }
@@ -502,31 +531,41 @@ fn main() -> io::Result<()> {
                     match verdict {
                         synapse_common::Verdict::Allow => {}
                         synapse_common::Verdict::Alert { ref reason } => {
-                            info!(
-                                "RE-ALERT flow={} dst={} {}",
-                                flow_id, common_flow.dst_ip, reason
-                            );
+                            let local_ip = local_ip_cache
+                                .lock()
+                                .ok()
+                                .and_then(|g| *g)
+                                .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)));
+                            let remote =
+                                determine_remote_ip(common_flow.a_ip, common_flow.b_ip, local_ip);
+                            info!("RE-ALERT flow={} remote={} {}", flow_id, remote, reason);
                         }
                         synapse_common::Verdict::Block { ttl, ref reason } => {
-                            let dst_ip = common_flow.dst_ip;
+                            let local_ip = local_ip_cache
+                                .lock()
+                                .ok()
+                                .and_then(|g| *g)
+                                .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)));
+                            let remote =
+                                determine_remote_ip(common_flow.a_ip, common_flow.b_ip, local_ip);
                             let dominated = block_cooldown
-                                .get(&dst_ip)
+                                .get(&remote)
                                 .is_some_and(|&expires| Instant::now() < expires);
                             if dominated {
-                                debug!("BLOCK skip flow={} {dst_ip} (cooldown active)", flow_id,);
+                                debug!("BLOCK skip flow={} {remote} (cooldown active)", flow_id,);
                             } else {
                                 info!(
-                                    "RE-BLOCK flow={} dst={dst_ip} ttl={ttl:?} {reason}",
+                                    "RE-BLOCK flow={} remote={remote} ttl={ttl:?} {reason}",
                                     flow_id,
                                 );
-                                let cmd = EnforcementCommand::Block { ip: dst_ip, ttl };
+                                let cmd = EnforcementCommand::Block { ip: remote, ttl };
                                 if let Err(e) = protocol::send_message(&mut write_half, &cmd) {
                                     error!(
-                                        "enforcement send failed for {dst_ip}: {e} — continuing"
+                                        "enforcement send failed for {remote}: {e} — continuing"
                                     );
                                 } else {
-                                    info!("enforcement command sent: Block {dst_ip} ttl={ttl:?}");
-                                    block_cooldown.insert(dst_ip, Instant::now() + ttl);
+                                    info!("enforcement command sent: Block {remote} ttl={ttl:?}");
+                                    block_cooldown.insert(remote, Instant::now() + ttl);
                                 }
                             }
                         }
@@ -833,6 +872,77 @@ mod tests {
         assert!(
             !ip.is_loopback(),
             "local IP must not be loopback (127.x.x.x)"
+        );
+    }
+
+    /// Regression test: local IP numerically larger than remote IP.
+    /// Exactly the scenario that broke enforcement (192.168.0.102 > 52.73.240.202).
+    /// Before fix: determine_remote_ip() would return b_ip (the local IP).
+    /// After fix: it returns a_ip (the remote IP) because a_ip == local_ip is false
+    /// and b_ip == local_ip is true → returns a_ip.
+    #[test]
+    fn test_determine_remote_ip_local_larger_than_remote() {
+        let local_ip = detect_local_ip()
+            .expect("detect_local_ip() failed — cannot run this test without a network interface");
+
+        // Simulate the exact broken scenario: local 192.168.0.102 > remote 52.73.240.202
+        // Canonical key: a_ip=52.73.240.202, b_ip=192.168.0.102 (larger is b)
+        // determine_remote_ip must return 52.73.240.202 (the remote), not local_ip.
+        let remote = determine_remote_ip(
+            IpAddr::V4(Ipv4Addr::new(52, 73, 240, 202)),
+            local_ip,
+            local_ip,
+        );
+        assert_eq!(
+            remote,
+            IpAddr::V4(Ipv4Addr::new(52, 73, 240, 202)),
+            "must return remote IP (52.73.240.202), not local IP ({local_ip})"
+        );
+    }
+
+    /// Regression test: local IP numerically smaller than remote IP.
+    /// Normal case (e.g. local 192.168.0.102 < remote 8.8.8.8).
+    /// Canonical key: a_ip=8.8.8.8, b_ip=192.168.0.102 — b_ip is local.
+    /// determine_remote_ip must return a_ip (the remote).
+    #[test]
+    fn test_determine_remote_ip_local_smaller_than_remote() {
+        let local_ip = detect_local_ip()
+            .expect("detect_local_ip() failed — cannot run this test without a network interface");
+
+        let remote = determine_remote_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), local_ip, local_ip);
+        assert_eq!(
+            remote,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            "must return remote IP (8.8.8.8), not local IP ({local_ip})"
+        );
+    }
+
+    /// Test determine_remote_ip() when a_ip is local — returns b_ip.
+    #[test]
+    fn test_determine_remote_ip_a_ip_is_local() {
+        let local_ip = detect_local_ip()
+            .expect("detect_local_ip() failed — cannot run this test without a network interface");
+
+        let remote =
+            determine_remote_ip(local_ip, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), local_ip);
+        assert_eq!(remote, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)));
+    }
+
+    /// Test determine_remote_ip() when neither IP matches local (fallback to b_ip).
+    #[test]
+    fn test_determine_remote_ip_neither_matches_fallback() {
+        let local_ip = detect_local_ip()
+            .expect("detect_local_ip() failed — cannot run this test without a network interface");
+
+        let remote = determine_remote_ip(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            local_ip,
+        );
+        assert_eq!(
+            remote,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            "fallback should return b_ip (the larger address)"
         );
     }
 }

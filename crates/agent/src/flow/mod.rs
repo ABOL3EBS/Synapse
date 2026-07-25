@@ -160,10 +160,10 @@ impl From<FlowRecord> for synapse_common::FlowRecord {
     fn from(flow: FlowRecord) -> Self {
         Self {
             flow_id: flow.flow_id,
-            src_ip: flow.key.a_ip,
-            dst_ip: flow.key.b_ip,
-            src_port: flow.key.a_port,
-            dst_port: flow.key.b_port,
+            a_ip: flow.key.a_ip,
+            b_ip: flow.key.b_ip,
+            a_port: flow.key.a_port,
+            b_port: flow.key.b_port,
             protocol: flow.key.protocol,
             local_port: flow.local_port,
             pid: flow.pid,
