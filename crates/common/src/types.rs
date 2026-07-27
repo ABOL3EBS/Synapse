@@ -290,6 +290,7 @@ pub struct FlowRecord {
     pub process_path: Option<String>,
     pub process_start_time: Option<f64>,
     pub country_code: Option<String>,
+    pub asn: Option<u32>,
     pub reputation_score: Option<f32>,
     pub flow_age: Duration,
 }

@@ -321,8 +321,8 @@ synapse/
 │   │       ├── detectors/        # 343 lines — Detector trait + RuleDetector impl,
 │   │       │                     #   each wrapped with a per-detector timeout that
 │   │       │                     #   produces a DetectorFinding (§4b)
-│   │       ├── enrichment/       # 495 lines — async worker pool (DNS, process attribution,
-│   │       │                     #   GeoIP/Reputation stubs). Dispatched on flow creation,
+│   │       ├── enrichment/       # 643 lines — async worker pool (DNS, process attribution,
+│   │       │                     #   GeoIP via maxminddb 0.30, reputation stub). Dispatched on flow creation,
 │   │       │                     #   attaches to the flow whenever it completes; never
 │   │       │                     #   awaited inline on the hot path.
 │   │       ├── flow/             # 898 lines — in-memory session tracking window,
@@ -371,7 +371,7 @@ Before UI: get a minimal pipeline that can **capture one flow via BPF (fd opened
 | 2 | SCM_RIGHTS fd-passing | ✅ Done |
 | 3 | Typed IPC (Block/Unblock/KillState + PortPidCache) | ✅ Done |
 | 4 | pf enforcement end-to-end (apply_block, remove_block, kill_state) | ✅ Done |
-| 5 | Enrichment pipeline (DNS, process attribution, GeoIP/Reputation stubs) | ✅ Done |
+| 5 | Enrichment pipeline (DNS, process attribution, GeoIP via maxminddb 0.30, reputation stub) | ✅ Done |
 | 6 | Port→PID cache (libproc FFI, per-process fd scan, 5s refresh) | ✅ Done |
 | 7 | Flow tracker (direction-agnostic canonicalization, ~100ms ticks, MAX_FLOWS) | ✅ Done |
 | 8 | Detector framework (Detector trait, timeout enforcement, RuleDetector) | ✅ Done |

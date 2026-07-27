@@ -237,6 +237,7 @@ mod tests {
             process_path: Some("/usr/bin/curl".to_string()),
             process_start_time: Some(1700000000.0),
             country_code: None,
+            asn: None,
             reputation_score: reputation,
             flow_age: std::time::Duration::from_secs(5),
         }

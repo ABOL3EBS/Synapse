@@ -4,22 +4,130 @@
 // the hot path (§4). Dispatched on flow creation, results attach to the
 // flow record whenever they complete.
 
+pub mod reputation_store;
+
 use std::net::IpAddr;
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use log::{debug, error, info};
+use maxminddb::Reader;
 use synapse_common::{EnrichmentKind, EnrichmentRequest, EnrichmentResult};
 
-/// Number of worker threads in the enrichment pool.
-/// v1: fixed at 4. Could become configurable later.
-const WORKER_COUNT: usize = 4;
+pub use reputation_store::ReputationStore;
 
 /// Default timeout for a single enrichment lookup (e.g., DNS).
 /// Currently unused — reserved for future per-lookup timeouts.
 #[allow(dead_code)]
 const LOOKUP_TIMEOUT_MS: u64 = 2000;
+
+// ---------------------------------------------------------------------------
+// GeoIP database wrapper
+// ---------------------------------------------------------------------------
+
+/// Thread-safe wrapper around a MaxMind GeoLite2-City database.
+/// Loaded once at startup, shared across enrichment worker threads via Arc.
+/// Provides country code and ASN lookups for public IPs.
+pub struct GeoIpDb {
+    reader: Arc<Reader<Vec<u8>>>,
+}
+
+impl GeoIpDb {
+    /// Open a MaxMind database file. Returns an error if the file doesn't
+    /// exist or is corrupted — caller decides how to handle (typically log
+    /// and continue without GeoIP).
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, String> {
+        let path = path.as_ref();
+        let reader =
+            Reader::open_readfile(path).map_err(|e| format!("failed to open {:?}: {}", path, e))?;
+
+        let metadata = reader.metadata();
+        info!(
+            "geoip database loaded: {:?} (v{}, {:?})",
+            path, metadata.database_type, metadata.build_epoch,
+        );
+
+        Ok(Self {
+            reader: Arc::new(reader),
+        })
+    }
+
+    /// Look up country code and ASN for an IP address.
+    /// Returns (country_code, asn). Private/RFC1918 IPs return (None, None).
+    /// If the IP is not found in the database, returns (None, None).
+    pub fn lookup(&self, ip: IpAddr) -> (Option<String>, Option<u32>) {
+        if !is_public_ip(ip) {
+            return (None, None);
+        }
+
+        let result = match self.reader.lookup(ip) {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("geoip lookup failed for {}: {}", ip, e);
+                return (None, None);
+            }
+        };
+
+        // Try decoding as City record for country code.
+        // GeoLite2-City includes country iso_code.
+        let country_code = match result.decode::<maxminddb::geoip2::City>() {
+            Ok(Some(city)) => city.country.iso_code.map(|s| s.to_string()),
+            Ok(None) => None,
+            Err(e) => {
+                debug!("geoip city decode failed for {}: {}", ip, e);
+                None
+            }
+        };
+
+        // Try decoding as ASN (same database may include ASN data).
+        let asn = match result.decode::<maxminddb::geoip2::Asn>() {
+            Ok(Some(asn_data)) => asn_data.autonomous_system_number,
+            Ok(None) => None,
+            Err(_) => None, // City DB may not include ASN — silently skip
+        };
+
+        (country_code, asn)
+    }
+
+    /// Look up ASN separately from an ASN database (if available).
+    /// GeoLite2-City doesn't include ASN — call this with a separate
+    /// GeoLite2-ASN.mmdb reader if one is loaded.
+    #[allow(dead_code)]
+    pub fn lookup_asn(&self, ip: IpAddr) -> Option<u32> {
+        if !is_public_ip(ip) {
+            return None;
+        }
+
+        match self.reader.lookup(ip) {
+            Ok(result) => match result.decode::<maxminddb::geoip2::Asn>() {
+                Ok(Some(asn_data)) => asn_data.autonomous_system_number,
+                _ => None,
+            },
+            Err(_) => None,
+        }
+    }
+}
+
+/// Check if an IP is a public (non-RFC1918, non-loopback) address.
+/// Used by GeoIpDb to skip private IPs and by enrichment workers.
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                || (v4.octets()[0] == 100
+                    && v4.octets()[1] >= 64
+                    && v4.octets()[1] <= 127) // 100.64.0.0/10 CGNAT
+                || (v4.octets()[0] == 169 && v4.octets()[1] == 254)) // 169.254.0.0/16
+        }
+        IpAddr::V6(v6) => !(v6.is_loopback() || v6.is_unspecified() || v6.is_unique_local()),
+    }
+}
 
 /// The enrichment worker pool. Owns the dispatch sender and result receiver.
 /// Callers dispatch requests via `dispatch()` and collect results via `try_recv()`.
@@ -31,10 +139,14 @@ pub struct EnrichmentPool {
 }
 
 impl EnrichmentPool {
-    /// Create a new enrichment pool with WORKER_COUNT background threads.
+    /// Create a new enrichment pool with `worker_count` background threads.
     /// Each thread pulls requests from a shared receiver and sends results
     /// back through per-thread result senders that all feed into one receiver.
-    pub fn new() -> Self {
+    pub fn new(
+        geoip_db: Option<GeoIpDb>,
+        reputation: Option<Arc<ReputationStore>>,
+        worker_count: usize,
+    ) -> Self {
         let (req_tx, req_rx) = mpsc::channel::<EnrichmentRequest>();
         let (res_tx, res_rx) = mpsc::channel::<EnrichmentResult>();
 
@@ -42,14 +154,19 @@ impl EnrichmentPool {
         // Lock contention is minimal — workers hold the lock only while calling recv().
         let shared_rx = Arc::new(Mutex::new(req_rx));
 
-        for worker_id in 0..WORKER_COUNT {
+        // Share GeoIP database across workers via Arc clone.
+        let geoip = geoip_db.map(Arc::new);
+
+        for worker_id in 0..worker_count {
             let req_rx = shared_rx.clone();
             let res_tx = res_tx.clone();
+            let geoip = geoip.clone();
+            let reputation = reputation.clone();
 
             thread::Builder::new()
                 .name(format!("enrichment-{worker_id}"))
                 .spawn(move || {
-                    Self::worker_loop(worker_id, req_rx, res_tx);
+                    Self::worker_loop(worker_id, req_rx, res_tx, geoip, reputation);
                 })
                 .expect("failed to spawn enrichment worker thread");
         }
@@ -57,7 +174,7 @@ impl EnrichmentPool {
         // Drop our copy of res_tx so the receiver closes when all workers exit.
         drop(res_tx);
 
-        info!("enrichment pool started: {WORKER_COUNT} workers");
+        info!("enrichment pool started: {worker_count} workers");
 
         Self {
             tx: req_tx,
@@ -99,6 +216,8 @@ impl EnrichmentPool {
         worker_id: usize,
         rx: Arc<Mutex<Receiver<EnrichmentRequest>>>,
         tx: Sender<EnrichmentResult>,
+        geoip: Option<Arc<GeoIpDb>>,
+        reputation: Option<Arc<ReputationStore>>,
     ) {
         debug!("enrichment worker {worker_id} started");
 
@@ -132,7 +251,8 @@ impl EnrichmentPool {
             );
 
             for kind in &request.kinds {
-                let result = Self::run_enrichment(*kind, &request);
+                let result =
+                    Self::run_enrichment(*kind, &request, geoip.as_deref(), reputation.as_deref());
                 if tx.send(result).is_err() {
                     error!("worker {worker_id}: result receiver dropped, shutting down");
                     return;
@@ -145,12 +265,17 @@ impl EnrichmentPool {
     // Enrichment dispatch
     // -----------------------------------------------------------------------
 
-    fn run_enrichment(kind: EnrichmentKind, request: &EnrichmentRequest) -> EnrichmentResult {
+    fn run_enrichment(
+        kind: EnrichmentKind,
+        request: &EnrichmentRequest,
+        geoip: Option<&GeoIpDb>,
+        reputation: Option<&ReputationStore>,
+    ) -> EnrichmentResult {
         match kind {
             EnrichmentKind::DnsReverse => Self::enrich_dns_reverse(request),
             EnrichmentKind::ProcessAttribution => Self::enrich_process_attribution(request),
-            EnrichmentKind::GeoIp => Self::enrich_geoip_stub(request),
-            EnrichmentKind::Reputation => Self::enrich_reputation_stub(request),
+            EnrichmentKind::GeoIp => Self::enrich_geoip(request, geoip),
+            EnrichmentKind::Reputation => Self::enrich_reputation(request, reputation),
         }
     }
 
@@ -319,44 +444,148 @@ impl EnrichmentPool {
     }
 
     // -----------------------------------------------------------------------
-    // GeoIP stub (v1)
+    // GeoIP lookup
     // -----------------------------------------------------------------------
 
-    fn enrich_geoip_stub(request: &EnrichmentRequest) -> EnrichmentResult {
+    fn enrich_geoip(request: &EnrichmentRequest, geoip: Option<&GeoIpDb>) -> EnrichmentResult {
         let target_ip = Self::pick_enrichable_ip(request.src_ip, request.dst_ip);
-        debug!("geoip stub: {target_ip} → unknown (v1 stub)");
+
+        let geoip_db = match geoip {
+            Some(db) => db,
+            None => {
+                return EnrichmentResult {
+                    flow_id: request.flow_id,
+                    kind: EnrichmentKind::GeoIp,
+                    success: false,
+                    dns_name: None,
+                    process_path: None,
+                    process_start_time: None,
+                    country_code: None,
+                    asn: None,
+                    reputation_score: None,
+                    error: Some("geoip database not loaded".into()),
+                };
+            }
+        };
+
+        // Skip private/RFC1918 IPs — no meaningful geo data.
+        if !is_public_ip(target_ip) {
+            return EnrichmentResult {
+                flow_id: request.flow_id,
+                kind: EnrichmentKind::GeoIp,
+                success: true,
+                dns_name: None,
+                process_path: None,
+                process_start_time: None,
+                country_code: None,
+                asn: None,
+                reputation_score: None,
+                error: None,
+            };
+        }
+
+        // Look up country + ASN via the GeoIpDb wrapper.
+        let (country_code, asn) = geoip_db.lookup(target_ip);
+
+        let success = country_code.is_some() || asn.is_some();
+        if success {
+            debug!(
+                "geoip: {} → country={:?} asn={:?}",
+                target_ip, country_code, asn
+            );
+        } else {
+            debug!("geoip: {} → no data found", target_ip);
+        }
+
         EnrichmentResult {
             flow_id: request.flow_id,
             kind: EnrichmentKind::GeoIp,
-            success: false,
+            success,
             dns_name: None,
             process_path: None,
             process_start_time: None,
-            country_code: None,
-            asn: None,
+            country_code,
+            asn,
             reputation_score: None,
-            error: Some("geoip not implemented in v1".into()),
+            error: None,
         }
     }
 
     // -----------------------------------------------------------------------
-    // Reputation stub (v1)
+    // Reputation lookup
     // -----------------------------------------------------------------------
 
-    fn enrich_reputation_stub(request: &EnrichmentRequest) -> EnrichmentResult {
+    fn enrich_reputation(
+        request: &EnrichmentRequest,
+        store: Option<&ReputationStore>,
+    ) -> EnrichmentResult {
         let target_ip = Self::pick_enrichable_ip(request.src_ip, request.dst_ip);
-        debug!("reputation stub: {target_ip} → unknown (v1 stub)");
-        EnrichmentResult {
-            flow_id: request.flow_id,
-            kind: EnrichmentKind::Reputation,
-            success: false,
-            dns_name: None,
-            process_path: None,
-            process_start_time: None,
-            country_code: None,
-            asn: None,
-            reputation_score: None,
-            error: Some("reputation lookup not implemented in v1".into()),
+
+        let store = match store {
+            Some(s) => s,
+            None => {
+                return EnrichmentResult {
+                    flow_id: request.flow_id,
+                    kind: EnrichmentKind::Reputation,
+                    success: false,
+                    dns_name: None,
+                    process_path: None,
+                    process_start_time: None,
+                    country_code: None,
+                    asn: None,
+                    reputation_score: None,
+                    error: Some("reputation store not loaded".into()),
+                };
+            }
+        };
+
+        // Skip private/RFC1918 IPs — no meaningful reputation data.
+        if !is_public_ip(target_ip) {
+            return EnrichmentResult {
+                flow_id: request.flow_id,
+                kind: EnrichmentKind::Reputation,
+                success: true,
+                dns_name: None,
+                process_path: None,
+                process_start_time: None,
+                country_code: None,
+                asn: None,
+                reputation_score: None,
+                error: None,
+            };
+        }
+
+        match store.lookup(target_ip) {
+            Some(score) => {
+                debug!("reputation: {} → {score:.2}", target_ip);
+                EnrichmentResult {
+                    flow_id: request.flow_id,
+                    kind: EnrichmentKind::Reputation,
+                    success: true,
+                    dns_name: None,
+                    process_path: None,
+                    process_start_time: None,
+                    country_code: None,
+                    asn: None,
+                    reputation_score: Some(score),
+                    error: None,
+                }
+            }
+            None => {
+                debug!("reputation: {} → unknown", target_ip);
+                EnrichmentResult {
+                    flow_id: request.flow_id,
+                    kind: EnrichmentKind::Reputation,
+                    success: true,
+                    dns_name: None,
+                    process_path: None,
+                    process_start_time: None,
+                    country_code: None,
+                    asn: None,
+                    reputation_score: None,
+                    error: None,
+                }
+            }
         }
     }
 
@@ -369,26 +598,10 @@ impl EnrichmentPool {
     /// lookups like DNS or GeoIP.
     fn pick_enrichable_ip(src: IpAddr, dst: IpAddr) -> IpAddr {
         // Prefer non-RFC1918 IPs (more likely to have DNS/reputation data).
-        if Self::is_public_ip(dst) {
+        if is_public_ip(dst) {
             dst
         } else {
             src
-        }
-    }
-
-    /// Check if an IP is a public (non-RFC1918, non-loopback) address.
-    fn is_public_ip(ip: IpAddr) -> bool {
-        match ip {
-            IpAddr::V4(v4) => {
-                !(v4.is_loopback()
-                    || v4.is_private()
-                    || v4.is_link_local()
-                    || v4.is_broadcast()
-                    || v4.is_unspecified()
-                    || v4.octets()[0] == 100 && v4.octets()[1] >= 64 && v4.octets()[1] <= 127 // 100.64.0.0/10 CGNAT
-                    || v4.octets()[0] == 169 && v4.octets()[1] == 254) // 169.254.0.0/16 link-local
-            }
-            IpAddr::V6(v6) => !(v6.is_loopback() || v6.is_unspecified() || v6.is_unique_local()),
         }
     }
 }
@@ -407,7 +620,7 @@ mod tests {
 
     #[test]
     fn test_enrichment_pool_dispatch_and_collect() {
-        let pool = EnrichmentPool::new();
+        let pool = EnrichmentPool::new(None, None, 4);
 
         // Dispatch a DNS reverse lookup for 8.8.8.8 (Google DNS — should resolve)
         let request = EnrichmentRequest {
@@ -476,20 +689,20 @@ mod tests {
 
     #[test]
     fn test_is_public_ip() {
-        assert!(!EnrichmentPool::is_public_ip(IpAddr::V4(
-            std::net::Ipv4Addr::new(127, 0, 0, 1)
-        )));
-        assert!(!EnrichmentPool::is_public_ip(IpAddr::V4(
-            std::net::Ipv4Addr::new(192, 168, 1, 1)
-        )));
-        assert!(!EnrichmentPool::is_public_ip(IpAddr::V4(
-            std::net::Ipv4Addr::new(10, 0, 0, 1)
-        )));
-        assert!(EnrichmentPool::is_public_ip(IpAddr::V4(
-            std::net::Ipv4Addr::new(8, 8, 8, 8)
-        )));
-        assert!(EnrichmentPool::is_public_ip(IpAddr::V4(
-            std::net::Ipv4Addr::new(1, 1, 1, 1)
-        )));
+        assert!(!is_public_ip(IpAddr::V4(std::net::Ipv4Addr::new(
+            127, 0, 0, 1
+        ))));
+        assert!(!is_public_ip(IpAddr::V4(std::net::Ipv4Addr::new(
+            192, 168, 1, 1
+        ))));
+        assert!(!is_public_ip(IpAddr::V4(std::net::Ipv4Addr::new(
+            10, 0, 0, 1
+        ))));
+        assert!(is_public_ip(IpAddr::V4(std::net::Ipv4Addr::new(
+            8, 8, 8, 8
+        ))));
+        assert!(is_public_ip(IpAddr::V4(std::net::Ipv4Addr::new(
+            1, 1, 1, 1
+        ))));
     }
 }
