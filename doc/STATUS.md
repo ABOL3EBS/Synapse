@@ -12,7 +12,7 @@
 | Enforcement backend | `crates/platform-macos/src/helper/enforce.rs` | 196 | `MacOsEnforcementBackend` — only pfctl executor, idempotent apply_block with AtomicBool TTL cancellation, kill_state, stub reconcile |
 | Process lookup | `crates/platform-macos/src/process_lookup.rs` | 668 | `libproc` crate (v0.14) typed structs for all FFI. **Port→PID cache** (`build_port_pid_cache`): per-process fd scan. **Port reading** via `read_port_be()` — raw BE bytes at verified offsets (268/264), bypasses c_int native-endian corruption on LE ARM. |
 | Agent binary | `crates/agent/src/main.rs` | 334 | Startup + orchestration only. Loads `AgentConfig` (TOML), passes config to all components. BPF fd receive, IPC reader thread, local IP detection, GeoIP/feeds loading via config paths, CaptureEngine creation, capture loop delegation. 5 production detectors registered. Tests for BPF wordalign, packet parsing. |
-| Capture engine | `crates/agent/src/capture.rs` | 966 | `CaptureEngine` struct: BPF read buffer, packet parsing (IPv4+IPv6 with `payload_length` parsing), flow tracker integration, enrichment dispatch, verdict handling via `handle_verdict()`, active-flow re-evaluation. Direction helpers (`determine_local_port`, `determine_remote_ip`, `detect_local_ip`). BpfHdr struct. Configurable `poll_timeout_ms` and `CircuitBreakerConfig`. 18 tests. |
+| Capture engine | `crates/agent/src/capture.rs` | 966 | `CaptureEngine` struct: BPF read buffer, packet parsing (IPv4+IPv6 with `payload_length` parsing), flow tracker integration, enrichment dispatch, verdict handling via `handle_verdict()`, active-flow re-evaluation. Direction helpers (`determine_local_port`, `determine_remote_ip`, `detect_local_ip`). BpfHdr struct. Configurable `poll_timeout_ms` and `CircuitBreakerConfig`. 20 tests. |
 | Config | `crates/agent/src/config.rs` | 511 | TOML config (`toml = "0.8"`) with `#[serde(default)]` on all structs. `AgentConfig::load()` reads from `SYNAPSE_CONFIG` env or `~/.synapse/synapse.toml`. Missing/malformed → all defaults. Env var overrides for GEOIP_DB_PATH, FEEDS_DIR, SYNAPSE_DB_PATH. Conversion methods: `decision_config()`, `flow_config()`, `circuit_breaker_config()`, `detector_timeout()`, `poll_timeout_ms()`, `geoip_db_path()`, `feeds_dir()`, `storage_db_path()`. 7 tests. |
 | Detector framework | `crates/agent/src/detectors/mod.rs` | 659 | Circuit breaker (`CircuitState` enum: Closed/Open/HalfOpen, configurable cooldown via `CircuitBreakerConfig`), `run_detectors()`, `run_detector_with_timeout()` with `catch_unwind` panic safety. 5 production detector sub-modules. 7 infrastructure tests (circuit breaker + timeout). |
 | DNS Analyzer | `crates/agent/src/detectors/dns_analyzer.rs` | 523 | `DetectorId::DnsAnalyzer` v1.0.0. 7 sub-detectors: entropy, length, longest label, label count, IP literal, blocklist, suspicious TLDs. CDN suffix short-circuit (cloudfront.net, akadns.net, 1e100.net, azure.com). Allowlist short-circuit. Normalized score [0,1]. 11 unit tests. |
@@ -54,10 +54,13 @@
 ### Detector framework (§4b) — verified
 
 - `Detector` trait + `DetectorFinding` + `run_detector_with_timeout()` in `common/src/types.rs`
-- `RuleDetector` with placeholder v1 rules — ALL THREE produce false positives against legitimate traffic until real tuning/allowlisting:
-  - `dns_blocklist`: label-aware match on "malware"/"phish"/"c2". Fixed c2/ec2 false positive (2026-07-25). Still a placeholder — no real blocklist loaded.
-  - `suspicious_port`: hardcoded ports 4444/5555/6666/7777/8888/9999/31337. Will false-positive on dev servers, game servers, and any legitimate service on these ports. Needs configurable allowlist.
-  - `high_packet_count`: threshold >1000 packets/5s window. Will false-positive on video streaming, large downloads, and any high-bandwidth legitimate flow. Needs per-protocol tuning.
+- **5 production detectors** (all implement `Detector` trait, return `DetectorFinding`):
+  - `DnsAnalyzer`: entropy, length, longest label, label count, IP literal, blocklist, suspicious TLDs. CDN suffix short-circuit.
+  - `ProcessCorrelator`: contextual behavioral scoring (temp dir execution, shell network activity, uncommon binary location, unresolved process).
+  - `FlowBehavior`: packet rate, bytes/packet, bulk transfer, scan pattern, burst, protocol/port mismatch.
+  - `IpReputation`: blocklist/allowlist/RFC1918 awareness + enrichment reputation score.
+  - `DnsTunnelDetector`: subdomain entropy, longest label, query frequency, payload size (DNS flows only).
+- **RuleDetector** (placeholder v1): `dns_blocklist`, `suspicious_port`, `high_packet_count` — ALL THREE produce false positives until real tuning. Kept for backward compat.
 - Timeout enforcement: `run_detector_with_timeout()` runs `evaluate()` on its own thread, uses `recv_timeout()` with configurable budget. Returns `TimedOut` if exceeded.
 - Panic safety: `evaluate()` wrapped in `catch_unwind` — panics produce `Errored` finding instead of crashing the thread.
 - Wired into capture loop on flow expiry AND active-flow re-evaluation
@@ -78,7 +81,7 @@
 ### Active-flow re-evaluation — verified
 
 - `FlowRecord.last_evaluated: Instant` field
-- `EVALUATION_INTERVAL_SECS = 1`, `MAX_RE_EVAL_PER_TICK = 100`
+- Configurable via `FlowConfig`: `evaluation_interval_secs = 1`, `max_re_eval_per_tick = 100`
 - `tick()` returns `(expired: Vec<u64>, due_for_re_evaluate: Vec<u64>)` — tuple
 - `mark_evaluated(flow_id)` bumps `last_evaluated` regardless of finding status
 - **Batched scan** — re-evaluation candidates collected every 10th tick (~1s), not every tick. Fixes starvation risk from non-deterministic HashMap iteration.
@@ -86,7 +89,7 @@
 ## Stub (known incomplete — not done)
 
 - **`reconcile()`** (`enforce.rs`): Returns `Ok(ReconciliationReport::default())`.
-- **Reputation enrichment** (`enrichment/mod.rs`): Returns `success: false`.
+- **Reputation enrichment** (`enrichment/mod.rs`): `ReputationStore` loads blocklist/CIDR/CSV feeds but `lookup()` returns `None` for IPs not in any feed. No live reputation scoring yet.
 
 ## Known limitations (security-relevant)
 
@@ -100,7 +103,7 @@
 
 2. **Per-flow DNS/GeoIP/Reputation dispatch** — enrichment is dispatched per-flow, not per-destination-IP. This means redundant lookups for flows to the same IP. Fix: global `HashMap<IpAddr, EnrichmentState>` cache. Only process attribution is genuinely flow-specific.
 
-3. ~~No circuit breaker for failing detectors~~ ✅ — `CircuitState` enum (Closed/Open/HalfOpen) with 30s cooldown and recovery. `run_detectors()` takes `&mut HashMap<DetectorId, CircuitState>`. 6 tests.
+3. ~~No circuit breaker for failing detectors~~ ✅ — `CircuitState` enum (Closed/Open/HalfOpen) with configurable cooldown via `CircuitBreakerConfig`. `run_detectors()` takes `&CircuitBreakerConfig`. 7 tests.
 
 4. **Decision engine has no uncertainty/findings_summary** — `Verdict::Block` and `Verdict::Alert` lack an `uncertainty` field and per-finding evidence summary. Fix: add fields for dashboard audit trail.
 
@@ -146,4 +149,4 @@
 
 | 10 | Helper reconnect loop (accept→enforce→accept) with per-connection cache-push cancellation via `Arc<AtomicBool>` | `platform-macos/helper/main.rs` | Verified |
 
-All 105 tests pass. clippy clean. fmt clean.
+All 125 tests pass. clippy clean. fmt clean.
