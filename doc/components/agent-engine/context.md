@@ -4,10 +4,11 @@ Unprivileged capture loop. Receives BPF fd from helper, reads raw packets, parse
 
 ## Code location
 
-`crates/agent/src/main.rs` (838 lines) — standalone binary crate
+`crates/agent/src/main.rs` (279 lines) — standalone binary crate, startup + orchestration only
+`crates/agent/src/capture.rs` (915 lines) — `CaptureEngine` struct: BPF reads, packet parsing, capture loop, verdict handling
 `crates/agent/src/flow/mod.rs` (975 lines) — in-memory session window
 `crates/agent/src/enrichment/mod.rs` (495 lines) — 4-thread enrichment worker pool
-`crates/agent/src/detectors/mod.rs` (798 lines) — detector framework, RuleDetector, timeout enforcement, circuit breaker
+`crates/agent/src/detectors/mod.rs` (879 lines) — detector framework, RuleDetector, timeout enforcement, circuit breaker
 `crates/agent/src/decision/mod.rs` (420 lines) — DecisionEngine, weighted scoring, Verdict, active-flow re-evaluation
 
 ## Startup sequence

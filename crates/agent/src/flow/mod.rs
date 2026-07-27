@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use log::{debug, warn};
 
-use crate::PacketInfo;
+use synapse_common::PacketInfo;
 
 // ---------------------------------------------------------------------------
 // Constants
