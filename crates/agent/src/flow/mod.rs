@@ -23,28 +23,30 @@ use log::{debug, warn};
 use synapse_common::PacketInfo;
 
 // ---------------------------------------------------------------------------
-// Constants
+// FlowConfig — runtime configuration for the flow tracker
 // ---------------------------------------------------------------------------
 
-/// Maximum number of flows tracked simultaneously.
-/// Defensive bound against hostile traffic growing tables faster than
-/// time-based expiry reclaims them. Evict oldest on overflow.
-const MAX_FLOWS: usize = 100_000;
+/// Configuration for the flow tracker. Loaded from TOML config or defaults.
+#[derive(Debug, Clone)]
+pub struct FlowConfig {
+    pub max_flows: usize,
+    pub expiry_secs: u64,
+    pub evaluation_interval_secs: u64,
+    pub max_re_eval_per_tick: usize,
+    pub batch_interval_ticks: u64,
+}
 
-/// Default flow expiry duration. Flows with no packets for this long
-/// are reclaimed on tick().
-const FLOW_EXPIRY_SECS: u64 = 5;
-
-/// Re-evaluation interval for active flows. Flows with packets arriving
-/// continuously are re-evaluated by detectors at this cadence, not just
-/// at expiry. Keeps active C2 connections under detection without waiting
-/// for idle timeout.
-const EVALUATION_INTERVAL_SECS: u64 = 1;
-
-/// Maximum number of active flows to re-evaluate per tick.
-/// Bounds tick duration when many flows align on the same re-evaluation
-/// boundary (e.g. startup burst). Overflow is evaluated in subsequent ticks.
-const MAX_RE_EVAL_PER_TICK: usize = 100;
+impl Default for FlowConfig {
+    fn default() -> Self {
+        Self {
+            max_flows: 100_000,
+            expiry_secs: 5,
+            evaluation_interval_secs: 1,
+            max_re_eval_per_tick: 100,
+            batch_interval_ticks: 10,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // FlowKey — direction-agnostic canonical 5-tuple
@@ -149,6 +151,8 @@ pub struct FlowRecord {
     pub process_start_time: Option<f64>,
     /// ISO 3166-1 alpha-2 country code (stub in v1).
     pub country_code: Option<String>,
+    /// Autonomous system number (if GeoIp succeeded; stub in v1).
+    pub asn: Option<u32>,
     /// Reputation score 0.0–1.0 (stub in v1).
     pub reputation_score: Option<f32>,
     /// When detectors were last run on this flow.
@@ -173,6 +177,7 @@ impl From<FlowRecord> for synapse_common::FlowRecord {
             process_path: flow.process_path,
             process_start_time: flow.process_start_time,
             country_code: flow.country_code,
+            asn: flow.asn,
             reputation_score: flow.reputation_score,
             flow_age: flow.first_seen.elapsed(),
         }
@@ -194,20 +199,23 @@ pub struct FlowTracker {
     /// Stale entries (flows already removed by expiry) are lazily skipped.
     eviction_heap: BinaryHeap<Reverse<(Instant, u64)>>,
     /// Monotonic counter — incremented on every tick(), used to batch
-    /// the re-evaluation scan to once per second (every 10 ticks at 100ms).
+    /// the re-evaluation scan (every batch_interval_ticks ticks).
     tick_count: u64,
     /// Next flow ID (monotonically increasing).
     next_id: u64,
+    /// Runtime configuration.
+    config: FlowConfig,
 }
 
 impl FlowTracker {
-    pub fn new() -> Self {
+    pub fn new(config: FlowConfig) -> Self {
         Self {
             index: HashMap::new(),
             flows: HashMap::new(),
             eviction_heap: BinaryHeap::new(),
             tick_count: 0,
             next_id: 1,
+            config,
         }
     }
 
@@ -227,7 +235,7 @@ impl FlowTracker {
         }
 
         // New flow — evict oldest if at capacity.
-        if self.flows.len() >= MAX_FLOWS {
+        if self.flows.len() >= self.config.max_flows {
             self.evict_oldest();
         }
 
@@ -248,6 +256,7 @@ impl FlowTracker {
             process_path: None,
             process_start_time: None,
             country_code: None,
+            asn: None,
             reputation_score: None,
             last_evaluated: now,
         };
@@ -263,14 +272,14 @@ impl FlowTracker {
         FlowUpdate::NewFlow(flow_id)
     }
 
-    /// Expire flows older than FLOW_EXPIRY_SECS and find active flows due for
+    /// Expire flows older than config.expiry_secs and find active flows due for
     /// re-evaluation. Returns (expired, due_for_re_evaluate).
     ///
-    /// - **expired**: flows past FLOW_EXPIRY_SECS (5s idle) — caller should
-    ///   evaluate and remove from tracker.
-    /// - **due_for_re_evaluate**: active flows where now - last_evaluated > 1s —
-    ///   caller should re-run detectors and call mark_evaluated(). Capped at
-    ///   MAX_RE_EVAL_PER_TICK to bound tick duration.
+    /// - **expired**: flows past expiry_secs idle — caller should evaluate
+    ///   and remove from tracker.
+    /// - **due_for_re_evaluate**: active flows where now - last_evaluated >
+    ///   evaluation_interval_secs — caller should re-run detectors and call
+    ///   mark_evaluated(). Capped at max_re_eval_per_tick.
     ///
     /// Must be called on every capture-loop iteration (via poll() timeout),
     /// not only when a packet arrives — a quiet-but-stale network must not
@@ -280,7 +289,7 @@ impl FlowTracker {
         let mut expired = Vec::new();
 
         self.flows.retain(|&flow_id, flow| {
-            if now.duration_since(flow.last_seen).as_secs() >= FLOW_EXPIRY_SECS {
+            if now.duration_since(flow.last_seen).as_secs() >= self.config.expiry_secs {
                 expired.push(flow_id);
                 false
             } else {
@@ -299,12 +308,17 @@ impl FlowTracker {
         // Scan runs once per second (every 10 ticks at 100ms poll timeout),
         // not every tick — bounds per-tick cost to O(expiry) only.
         self.tick_count += 1;
-        let due_for_re_evaluate = if self.tick_count.is_multiple_of(10) {
+        let due_for_re_evaluate = if self
+            .tick_count
+            .is_multiple_of(self.config.batch_interval_ticks)
+        {
             let mut due = Vec::new();
             for (&flow_id, flow) in &self.flows {
-                if now.duration_since(flow.last_evaluated).as_secs() >= EVALUATION_INTERVAL_SECS {
+                if now.duration_since(flow.last_evaluated).as_secs()
+                    >= self.config.evaluation_interval_secs
+                {
                     due.push(flow_id);
-                    if due.len() >= MAX_RE_EVAL_PER_TICK {
+                    if due.len() >= self.config.max_re_eval_per_tick {
                         break;
                     }
                 }
@@ -340,7 +354,7 @@ impl FlowTracker {
                 self.index.remove(&flow.key);
                 warn!(
                     "flow tracker at capacity ({}), evicting oldest flow {} (key={:?}, age={:?})",
-                    MAX_FLOWS,
+                    self.config.max_flows,
                     flow_id,
                     flow.key,
                     first_seen.elapsed(),
@@ -351,6 +365,7 @@ impl FlowTracker {
     }
 
     /// Attach an enrichment result to a flow.
+    #[allow(clippy::too_many_arguments)]
     pub fn attach_enrichment(
         &mut self,
         flow_id: u64,
@@ -358,6 +373,7 @@ impl FlowTracker {
         process_path: Option<String>,
         process_start_time: Option<f64>,
         country_code: Option<String>,
+        asn: Option<u32>,
         reputation_score: Option<f32>,
     ) {
         if let Some(flow) = self.flows.get_mut(&flow_id) {
@@ -372,6 +388,9 @@ impl FlowTracker {
             }
             if country_code.is_some() {
                 flow.country_code = country_code;
+            }
+            if asn.is_some() {
+                flow.asn = asn;
             }
             if reputation_score.is_some() {
                 flow.reputation_score = reputation_score;
@@ -412,6 +431,11 @@ impl FlowTracker {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    // Test-local defaults matching FlowConfig::default().
+    const FLOW_EXPIRY_SECS: u64 = 5;
+    const EVALUATION_INTERVAL_SECS: u64 = 1;
+    const MAX_RE_EVAL_PER_TICK: usize = 100;
 
     fn make_packet(
         src_ip: IpAddr,
@@ -508,7 +532,7 @@ mod tests {
 
     #[test]
     fn test_update_returns_new_vs_existing() {
-        let mut tracker = FlowTracker::new();
+        let mut tracker = FlowTracker::new(FlowConfig::default());
         let pkt = make_packet(
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             5000,
@@ -532,7 +556,7 @@ mod tests {
 
     #[test]
     fn test_forward_and_response_update_same_flow() {
-        let mut tracker = FlowTracker::new();
+        let mut tracker = FlowTracker::new(FlowConfig::default());
         let fwd = make_packet(
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             5000,
@@ -565,10 +589,14 @@ mod tests {
 
     #[test]
     fn test_max_flows_evicts_oldest() {
-        let mut tracker = FlowTracker::new();
+        let cfg = FlowConfig {
+            max_flows: 100,
+            ..FlowConfig::default()
+        };
+        let mut tracker = FlowTracker::new(cfg);
 
         // Fill to capacity. Use both IP and port to generate unique 5-tuples.
-        for i in 0..MAX_FLOWS {
+        for i in 0..100 {
             let src_port = 1024 + (i % 60000) as u16;
             let octet3 = ((i / 60000) & 0xFF) as u8;
             let octet2 = ((i / 60000 / 256) & 0xFF) as u8;
@@ -581,7 +609,7 @@ mod tests {
             );
             tracker.update(&pkt, src_port, None);
         }
-        assert_eq!(tracker.len(), MAX_FLOWS);
+        assert_eq!(tracker.len(), 100);
 
         // One more — should evict oldest.
         let overflow = make_packet(
@@ -593,13 +621,13 @@ mod tests {
         );
         tracker.update(&overflow, 60000, None);
 
-        // Should still be at MAX_FLOWS (evicted one, added one).
-        assert_eq!(tracker.len(), MAX_FLOWS);
+        // Should still be at 100 (evicted one, added one).
+        assert_eq!(tracker.len(), 100);
     }
 
     #[test]
     fn test_tick_expires_old_flows() {
-        let mut tracker = FlowTracker::new();
+        let mut tracker = FlowTracker::new(FlowConfig::default());
         let pkt = make_packet(
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             5000,
@@ -632,7 +660,7 @@ mod tests {
 
     #[test]
     fn test_attach_enrichment() {
-        let mut tracker = FlowTracker::new();
+        let mut tracker = FlowTracker::new(FlowConfig::default());
         let pkt = make_packet(
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             5000,
@@ -650,6 +678,7 @@ mod tests {
             Some("example.com".to_string()),
             Some("/usr/bin/curl".to_string()),
             Some(1234567890.0),
+            None,
             None,
             None,
         );
@@ -714,7 +743,7 @@ mod tests {
     /// canonical key's a_port (443). Process attribution must look up 50000.
     #[test]
     fn test_local_port_independent_of_canonical_ordering() {
-        let mut tracker = FlowTracker::new();
+        let mut tracker = FlowTracker::new(FlowConfig::default());
         // Forward: local 192.168.1.100:50000 → remote 8.8.8.8:443
         let pkt = make_packet(
             IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)),
@@ -753,7 +782,7 @@ mod tests {
     /// This is a known v1 inefficiency (documented). This test proves it.
     #[test]
     fn test_enrichment_dispatched_per_flow_not_per_ip() {
-        let mut tracker = FlowTracker::new();
+        let mut tracker = FlowTracker::new(FlowConfig::default());
         // Two flows to the same IP but different source ports.
         let pkt1 = make_packet(
             IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
@@ -791,7 +820,7 @@ mod tests {
     /// This test proves tick() expires flows based on real time elapsed.
     #[test]
     fn test_tick_fires_on_wall_clock_not_packet_count() {
-        let mut tracker = FlowTracker::new();
+        let mut tracker = FlowTracker::new(FlowConfig::default());
         // Create a flow.
         let pkt = make_packet(
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
@@ -832,7 +861,7 @@ mod tests {
     /// times to hit the scan boundary.
     #[test]
     fn test_tick_returns_re_evaluate_for_stale_last_evaluated() {
-        let mut tracker = FlowTracker::new();
+        let mut tracker = FlowTracker::new(FlowConfig::default());
         let pkt = make_packet(
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             5000,
@@ -881,7 +910,7 @@ mod tests {
     /// After marking, the flow should NOT appear in re-evaluate on next scan tick.
     #[test]
     fn test_mark_evaluated_prevents_immediate_re_evaluate() {
-        let mut tracker = FlowTracker::new();
+        let mut tracker = FlowTracker::new(FlowConfig::default());
         let pkt = make_packet(
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             5000,
@@ -935,7 +964,7 @@ mod tests {
     /// verify only MAX_RE_EVAL_PER_TICK are returned on a scan tick.
     #[test]
     fn test_re_evaluate_capped_at_max_re_eval_per_tick() {
-        let mut tracker = FlowTracker::new();
+        let mut tracker = FlowTracker::new(FlowConfig::default());
         // Create 150 flows (more than MAX_RE_EVAL_PER_TICK=100).
         for i in 0..150u16 {
             let pkt = make_packet(

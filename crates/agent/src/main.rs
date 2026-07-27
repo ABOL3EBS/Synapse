@@ -10,6 +10,7 @@
 // delegates to CaptureEngine.
 
 mod capture;
+mod config;
 mod decision;
 mod detectors;
 mod enrichment;
@@ -112,6 +113,10 @@ fn main() -> io::Result<()> {
     let buf_len = buf_len as usize;
     info!("BPF buffer length from kernel: {buf_len} bytes");
 
+    // Load configuration (TOML, or defaults).
+    let cfg = config::AgentConfig::load();
+    info!("configuration loaded (paths: {})", cfg.summary());
+
     // Detect local IP from network interface — used for port→PID direction.
     let local_ip_cache: Arc<Mutex<Option<IpAddr>>> =
         Arc::new(Mutex::new(capture::detect_local_ip().inspect(|&ip| {
@@ -119,10 +124,11 @@ fn main() -> io::Result<()> {
         })));
     {
         let cache = local_ip_cache.clone();
+        let refresh_secs = cfg.local_ip_refresh_secs();
         std::thread::Builder::new()
             .name("local-ip-refresh".into())
             .spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_secs(5));
+                std::thread::sleep(std::time::Duration::from_secs(refresh_secs));
                 let new_ip = capture::detect_local_ip();
                 if let Ok(mut guard) = cache.lock() {
                     if *guard != new_ip {
@@ -139,8 +145,47 @@ fn main() -> io::Result<()> {
 
     // Build capture engine — all state lives here.
     let read_buf = vec![0u8; buf_len];
-    let tracker = flow::FlowTracker::new();
-    let enrich_pool = enrichment::EnrichmentPool::new();
+    let tracker = flow::FlowTracker::new(cfg.flow_config());
+
+    // Load GeoIP database (optional — graceful degradation if missing).
+    let geoip_db = match cfg.geoip_db_path() {
+        Some(geoip_path) => match enrichment::GeoIpDb::open(&geoip_path) {
+            Ok(db) => {
+                info!("loaded GeoIP database: {}", geoip_path.display());
+                Some(db)
+            }
+            Err(e) => {
+                info!(
+                    "GeoIP database not found ({e}). \
+                     GeoIP enrichment disabled."
+                );
+                None
+            }
+        },
+        None => {
+            info!("no GeoIP database path configured — GeoIP enrichment disabled");
+            None
+        }
+    };
+
+    // Load reputation feeds (optional — graceful degradation if missing).
+    let feeds_dir = cfg.feeds_dir();
+    let reputation = {
+        let store = enrichment::ReputationStore::load_from_dir(&feeds_dir);
+        if store.is_empty() {
+            info!(
+                "no reputation feeds found at {}. \
+                 Reputation enrichment will return no data.",
+                feeds_dir.display()
+            );
+            None
+        } else {
+            Some(std::sync::Arc::new(store))
+        }
+    };
+
+    let enrich_pool =
+        enrichment::EnrichmentPool::new(geoip_db, reputation, cfg.enrichment.worker_count);
     let detectors: Vec<Arc<dyn synapse_common::Detector>> = vec![
         Arc::new(detectors::dns_analyzer::DnsAnalyzer::new()),
         Arc::new(detectors::process_correlator::ProcessCorrelator),
@@ -148,13 +193,16 @@ fn main() -> io::Result<()> {
         Arc::new(detectors::ip_reputation::IpReputation::new()),
         Arc::new(detectors::dns_tunnel::DnsTunnelDetector),
     ];
-    let detector_timeout = std::time::Duration::from_millis(100);
+    let detector_timeout = cfg.detector_timeout();
+    let cb_config = cfg.circuit_breaker_config();
     info!(
-        "registered {} detector(s) with {}ms timeout",
+        "registered {} detector(s) with {}ms timeout, circuit breaker (failures={}, cooldown={}s)",
         detectors.len(),
-        detector_timeout.as_millis()
+        detector_timeout.as_millis(),
+        cb_config.max_failures,
+        cb_config.cooldown.as_secs(),
     );
-    let decision_engine = decision::DecisionEngine::new(synapse_common::DecisionConfig::default());
+    let decision_engine = decision::DecisionEngine::new(cfg.decision_config());
     info!("decision engine initialized");
 
     let mut engine = capture::CaptureEngine::new(
@@ -168,6 +216,8 @@ fn main() -> io::Result<()> {
         detectors,
         detector_timeout,
         write_half,
+        cb_config,
+        cfg.poll_timeout_ms(),
     );
 
     info!("capture started — watching for packets on BPF fd");

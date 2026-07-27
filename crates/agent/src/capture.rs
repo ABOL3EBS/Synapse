@@ -267,9 +267,11 @@ pub struct CaptureEngine {
     detectors: Vec<Arc<dyn synapse_common::Detector>>,
     detector_timeout: std::time::Duration,
     circuit_breaker: HashMap<synapse_common::DetectorId, detectors::CircuitState>,
+    cb_config: detectors::CircuitBreakerConfig,
     block_cooldown: HashMap<IpAddr, Instant>,
     write_half: UnixStream,
     pkt_count: u64,
+    poll_timeout_ms: i32,
 }
 
 impl CaptureEngine {
@@ -285,6 +287,8 @@ impl CaptureEngine {
         detectors: Vec<Arc<dyn synapse_common::Detector>>,
         detector_timeout: std::time::Duration,
         write_half: UnixStream,
+        cb_config: detectors::CircuitBreakerConfig,
+        poll_timeout_ms: i32,
     ) -> Self {
         Self {
             bpf_fd,
@@ -297,9 +301,11 @@ impl CaptureEngine {
             detectors,
             detector_timeout,
             circuit_breaker: HashMap::new(),
+            cb_config,
             block_cooldown: HashMap::new(),
             write_half,
             pkt_count: 0,
+            poll_timeout_ms,
         }
     }
 
@@ -319,7 +325,7 @@ impl CaptureEngine {
             events: libc::POLLIN,
             revents: 0,
         };
-        let poll_ret = unsafe { libc::poll(&mut pollfd, 1, 100) };
+        let poll_ret = unsafe { libc::poll(&mut pollfd, 1, self.poll_timeout_ms) };
 
         if poll_ret < 0 {
             let err = io::Error::last_os_error();
@@ -378,6 +384,7 @@ impl CaptureEngine {
                     &common_flow,
                     self.detector_timeout,
                     &mut self.circuit_breaker,
+                    &self.cb_config,
                 );
                 let features = synapse_common::FlowFeatures::from_flow(&common_flow);
                 let verdict = self.decision_engine.evaluate(&features, &findings);
@@ -405,6 +412,7 @@ impl CaptureEngine {
                     &common_flow,
                     self.detector_timeout,
                     &mut self.circuit_breaker,
+                    &self.cb_config,
                 );
                 let features = synapse_common::FlowFeatures::from_flow(&common_flow);
                 let verdict = self.decision_engine.evaluate(&features, &findings);
@@ -606,6 +614,7 @@ impl CaptureEngine {
                             None,
                             None,
                             None,
+                            None,
                         );
                     }
                     synapse_common::EnrichmentKind::ProcessAttribution => {
@@ -621,6 +630,7 @@ impl CaptureEngine {
                             result.process_start_time,
                             None,
                             None,
+                            None,
                         );
                     }
                     synapse_common::EnrichmentKind::GeoIp => {
@@ -630,12 +640,14 @@ impl CaptureEngine {
                             None,
                             None,
                             result.country_code,
+                            result.asn,
                             None,
                         );
                     }
                     synapse_common::EnrichmentKind::Reputation => {
                         self.tracker.attach_enrichment(
                             result.flow_id,
+                            None,
                             None,
                             None,
                             None,

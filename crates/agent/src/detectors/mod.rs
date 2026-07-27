@@ -22,11 +22,23 @@ use log::{debug, info};
 // Circuit Breaker — per-detector failure tracking with recovery
 // ---------------------------------------------------------------------------
 
-/// Number of consecutive failures before the circuit opens.
-const MAX_FAILURES: u32 = 5;
+/// Configuration for the circuit breaker. Loaded from TOML config or defaults.
+#[derive(Debug, Clone)]
+pub struct CircuitBreakerConfig {
+    /// Number of consecutive failures before the circuit opens.
+    pub max_failures: u32,
+    /// How long the circuit stays open before attempting recovery.
+    pub cooldown: Duration,
+}
 
-/// How long the circuit stays open before attempting recovery.
-const COOLDOWN: Duration = Duration::from_secs(30);
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            max_failures: 5,
+            cooldown: Duration::from_secs(30),
+        }
+    }
+}
 
 /// Per-detector circuit breaker state. Tracks failures, enables recovery via
 /// half-open probe, records failure metadata for debugging.
@@ -44,10 +56,10 @@ pub enum CircuitState {
 }
 
 impl CircuitState {
-    fn is_open(&self, now: Instant) -> bool {
+    fn is_open(&self, now: Instant, cooldown: Duration) -> bool {
         match self {
             CircuitState::Closed { .. } => false,
-            CircuitState::Open { opened_at, .. } => now.duration_since(*opened_at) < COOLDOWN,
+            CircuitState::Open { opened_at, .. } => now.duration_since(*opened_at) < cooldown,
             CircuitState::HalfOpen => false,
         }
     }
@@ -82,6 +94,7 @@ pub fn run_detectors(
     flow: &FlowRecord,
     timeout: Duration,
     circuit_breaker: &mut HashMap<DetectorId, CircuitState>,
+    cb_config: &CircuitBreakerConfig,
 ) -> Vec<DetectorFinding> {
     let now = Instant::now();
 
@@ -93,7 +106,7 @@ pub fn run_detectors(
             // State check — decide whether to run or skip.
             let should_skip = match circuit_breaker.get(&id) {
                 Some(CircuitState::Closed { .. }) => false,
-                Some(state) if state.is_open(now) => true,
+                Some(state) if state.is_open(now, cb_config.cooldown) => true,
                 Some(CircuitState::Open { .. }) => {
                     // Cooldown expired — transition to HalfOpen, allow probe.
                     debug!("detector {:?} cooldown expired → HalfOpen", id);
@@ -144,7 +157,7 @@ pub fn run_detectors(
                         }
                         Some(CircuitState::Closed { failures }) => {
                             let new_failures = failures + 1;
-                            if new_failures >= MAX_FAILURES {
+                            if new_failures >= cb_config.max_failures {
                                 // Trip → Open.
                                 debug!(
                                     "detector {:?} circuit open ({} consecutive failures)",
@@ -301,6 +314,7 @@ mod tests {
             process_path: Some("/usr/bin/curl".to_string()),
             process_start_time: Some(1700000000.0),
             country_code: None,
+            asn: None,
             reputation_score: None,
             flow_age: std::time::Duration::from_secs(5),
         }
@@ -359,7 +373,13 @@ mod tests {
         let timeout = Duration::from_millis(50);
         let mut cb = HashMap::new();
 
-        let findings = run_detectors(&detectors, &flow, timeout, &mut cb);
+        let findings = run_detectors(
+            &detectors,
+            &flow,
+            timeout,
+            &mut cb,
+            &CircuitBreakerConfig::default(),
+        );
 
         assert_eq!(findings.len(), 2);
         assert_eq!(findings[0].status, DetectorStatus::Completed);
@@ -375,7 +395,7 @@ mod tests {
     // Circuit breaker state machine tests
     // -----------------------------------------------------------------------
 
-    /// Opens after MAX_FAILURES consecutive failures.
+    /// Opens after max_failures consecutive failures.
     #[test]
     fn test_circuit_opens_after_threshold() {
         let detectors: Vec<Arc<dyn Detector>> = vec![Arc::new(SlowDetector {
@@ -384,10 +404,11 @@ mod tests {
         let flow = make_test_flow();
         let timeout = Duration::from_millis(50);
         let mut cb = HashMap::new();
+        let cb_config = CircuitBreakerConfig::default();
 
-        // Fail MAX_FAILURES times.
-        for _ in 0..MAX_FAILURES {
-            let findings = run_detectors(&detectors, &flow, timeout, &mut cb);
+        // Fail max_failures times.
+        for _ in 0..cb_config.max_failures {
+            let findings = run_detectors(&detectors, &flow, timeout, &mut cb, &cb_config);
             assert_eq!(findings[0].status, DetectorStatus::TimedOut);
         }
         // Should be Open now.
@@ -406,15 +427,16 @@ mod tests {
         let flow = make_test_flow();
         let timeout = Duration::from_millis(50);
         let mut cb = HashMap::new();
+        let cb_config = CircuitBreakerConfig::default();
 
         // Trip the circuit.
-        for _ in 0..MAX_FAILURES {
-            run_detectors(&detectors, &flow, timeout, &mut cb);
+        for _ in 0..cb_config.max_failures {
+            run_detectors(&detectors, &flow, timeout, &mut cb, &cb_config);
         }
 
         // Should skip — returns instantly with zero latency.
         let start = Instant::now();
-        let findings = run_detectors(&detectors, &flow, timeout, &mut cb);
+        let findings = run_detectors(&detectors, &flow, timeout, &mut cb, &cb_config);
         let elapsed = start.elapsed();
 
         assert_eq!(findings[0].status, DetectorStatus::TimedOut);
@@ -434,10 +456,11 @@ mod tests {
         let flow = make_test_flow();
         let timeout = Duration::from_millis(50);
         let mut cb = HashMap::new();
+        let cb_config = CircuitBreakerConfig::default();
 
         // Trip the circuit.
-        for _ in 0..MAX_FAILURES {
-            run_detectors(&detectors, &flow, timeout, &mut cb);
+        for _ in 0..cb_config.max_failures {
+            run_detectors(&detectors, &flow, timeout, &mut cb, &cb_config);
         }
         assert!(matches!(
             cb.get(&DetectorId::Custom(999)),
@@ -449,11 +472,11 @@ mod tests {
             ref mut opened_at, ..
         }) = cb.get_mut(&DetectorId::Custom(999))
         {
-            *opened_at = Instant::now() - COOLDOWN - Duration::from_secs(1);
+            *opened_at = Instant::now() - cb_config.cooldown - Duration::from_secs(1);
         }
 
         // Next run should transition to HalfOpen and allow execution.
-        let findings = run_detectors(&detectors, &flow, timeout, &mut cb);
+        let findings = run_detectors(&detectors, &flow, timeout, &mut cb, &cb_config);
         // SlowDetector will timeout again → should transition back to Open.
         assert_eq!(findings[0].status, DetectorStatus::TimedOut);
         // Should be Open again (probe failed).
@@ -473,10 +496,11 @@ mod tests {
         let flow = make_test_flow();
         let timeout = Duration::from_millis(200);
         let mut cb = HashMap::new();
+        let cb_config = CircuitBreakerConfig::default();
 
         // Trip the circuit (5 failures).
-        for _ in 0..MAX_FAILURES {
-            run_detectors(&detectors, &flow, timeout, &mut cb);
+        for _ in 0..cb_config.max_failures {
+            run_detectors(&detectors, &flow, timeout, &mut cb, &cb_config);
         }
         assert!(matches!(
             cb.get(&DetectorId::Custom(997)),
@@ -488,14 +512,14 @@ mod tests {
             ref mut opened_at, ..
         }) = cb.get_mut(&DetectorId::Custom(997))
         {
-            *opened_at = Instant::now() - COOLDOWN - Duration::from_secs(1);
+            *opened_at = Instant::now() - cb_config.cooldown - Duration::from_secs(1);
         }
 
         // Now make the detector succeed.
         should_fail.store(false, std::sync::atomic::Ordering::Relaxed);
 
         // Half-open probe should succeed → circuit closes.
-        let findings = run_detectors(&detectors, &flow, timeout, &mut cb);
+        let findings = run_detectors(&detectors, &flow, timeout, &mut cb, &cb_config);
         assert_eq!(findings[0].status, DetectorStatus::Completed);
         // Circuit should be cleared (Closed state removed = no entry).
         assert!(
@@ -513,10 +537,11 @@ mod tests {
         let flow = make_test_flow();
         let timeout = Duration::from_millis(50);
         let mut cb = HashMap::new();
+        let cb_config = CircuitBreakerConfig::default();
 
         // Trip the circuit.
-        for _ in 0..MAX_FAILURES {
-            run_detectors(&detectors, &flow, timeout, &mut cb);
+        for _ in 0..cb_config.max_failures {
+            run_detectors(&detectors, &flow, timeout, &mut cb, &cb_config);
         }
 
         // Expire the cooldown.
@@ -524,11 +549,11 @@ mod tests {
             ref mut opened_at, ..
         }) = cb.get_mut(&DetectorId::Custom(999))
         {
-            *opened_at = Instant::now() - COOLDOWN - Duration::from_secs(1);
+            *opened_at = Instant::now() - cb_config.cooldown - Duration::from_secs(1);
         }
 
         // Probe attempt — SlowDetector will timeout again.
-        let findings = run_detectors(&detectors, &flow, timeout, &mut cb);
+        let findings = run_detectors(&detectors, &flow, timeout, &mut cb, &cb_config);
         assert_eq!(findings[0].status, DetectorStatus::TimedOut);
 
         // Should be back to Open with a fresh timer.
@@ -556,10 +581,11 @@ mod tests {
         let flow = make_test_flow();
         let timeout = Duration::from_millis(50);
         let mut cb = HashMap::new();
+        let cb_config = CircuitBreakerConfig::default();
 
         // Run until SlowDetector trips (5 timeouts).
-        for _ in 0..MAX_FAILURES {
-            run_detectors(&detectors, &flow, timeout, &mut cb);
+        for _ in 0..cb_config.max_failures {
+            run_detectors(&detectors, &flow, timeout, &mut cb, &cb_config);
         }
 
         // SlowDetector should be Open.
@@ -568,7 +594,7 @@ mod tests {
             Some(CircuitState::Open { .. })
         ));
 
-        // ErrorDetector also tripped — 5 errors = MAX_FAILURES → Open.
+        // ErrorDetector also tripped — 5 errors = max_failures → Open.
         assert!(matches!(
             cb.get(&DetectorId::Custom(998)),
             Some(CircuitState::Open { .. })
@@ -579,12 +605,12 @@ mod tests {
             ref mut opened_at, ..
         }) = cb.get_mut(&DetectorId::Custom(999))
         {
-            *opened_at = Instant::now() - COOLDOWN - Duration::from_secs(1);
+            *opened_at = Instant::now() - cb_config.cooldown - Duration::from_secs(1);
         }
 
         // Run again — SlowDetector gets a probe (will timeout → back to Open),
         // ErrorDetector trips to Open.
-        run_detectors(&detectors, &flow, timeout, &mut cb);
+        run_detectors(&detectors, &flow, timeout, &mut cb, &cb_config);
 
         // Both should be Open now.
         assert!(matches!(
@@ -606,10 +632,11 @@ mod tests {
         let flow = make_test_flow();
         let timeout = Duration::from_millis(50);
         let mut cb = HashMap::new();
+        let cb_config = CircuitBreakerConfig::default();
 
         // Fail 3 times (below threshold).
         for _ in 0..3 {
-            run_detectors(&detectors, &flow, timeout, &mut cb);
+            run_detectors(&detectors, &flow, timeout, &mut cb, &cb_config);
         }
         assert!(matches!(
             cb.get(&DetectorId::Custom(999)),
@@ -618,7 +645,7 @@ mod tests {
 
         // Now use a detector that completes instantly.
         let fast: Vec<Arc<dyn Detector>> = vec![Arc::new(dns_analyzer::DnsAnalyzer::new())];
-        let findings = run_detectors(&fast, &flow, timeout, &mut cb);
+        let findings = run_detectors(&fast, &flow, timeout, &mut cb, &cb_config);
         assert_eq!(findings[0].status, DetectorStatus::Completed);
 
         // DnsAnalyzer should have no entry (clean reset — no failures).
