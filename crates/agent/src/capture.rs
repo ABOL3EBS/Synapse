@@ -152,13 +152,21 @@ fn parse_ipv6(frame: &[u8]) -> Option<PacketInfo> {
         }
         _ => (0, 0),
     };
+    // IPv6 payload_length is at bytes 4-5 of the IPv6 header (offset 18-19 in frame).
+    let payload_len = u16::from_be_bytes([frame[ip + 4], frame[ip + 5]]);
+    let total_len = if payload_len > 0 {
+        payload_len
+    } else {
+        // Jumbo payload or extension header — approximate from captured frame length.
+        (frame.len() - 14) as u16
+    };
     Some(PacketInfo {
         src_ip,
         dst_ip,
         src_port: sp,
         dst_port: dp,
         protocol: nh,
-        length: 0,
+        length: total_len,
     })
 }
 
@@ -371,10 +379,7 @@ impl CaptureEngine {
                     self.detector_timeout,
                     &mut self.circuit_breaker,
                 );
-                let features = synapse_common::FlowFeatures::from_flow(
-                    &common_flow,
-                    flow_ref.first_seen.elapsed(),
-                );
+                let features = synapse_common::FlowFeatures::from_flow(&common_flow);
                 let verdict = self.decision_engine.evaluate(&features, &findings);
                 self.handle_verdict(flow_id, verdict, local_ip);
             }
@@ -401,10 +406,7 @@ impl CaptureEngine {
                     self.detector_timeout,
                     &mut self.circuit_breaker,
                 );
-                let features = synapse_common::FlowFeatures::from_flow(
-                    &common_flow,
-                    flow_ref.first_seen.elapsed(),
-                );
+                let features = synapse_common::FlowFeatures::from_flow(&common_flow);
                 let verdict = self.decision_engine.evaluate(&features, &findings);
                 self.handle_verdict(flow_id, verdict, local_ip);
                 self.tracker.mark_evaluated(flow_id);
@@ -911,5 +913,42 @@ mod tests {
         frame[12] = 0x86;
         frame[13] = 0xDD;
         assert!(parse_ip_frame(&frame).is_none());
+    }
+
+    #[test]
+    fn test_parse_ipv6_payload_length() {
+        // 14 eth + 40 ipv6 header + 6 minimal TCP header = 60 bytes total.
+        // IPv6 payload_length (bytes 4-5 of IPv6 header = frame[18..20]) = 6.
+        let mut frame = vec![0u8; 60];
+        frame[12] = 0x86;
+        frame[13] = 0xDD; // EtherType = IPv6
+        frame[14] = 0x60; // version=6
+        frame[20] = 0x06; // Next header = TCP
+                          // payload_length = 6 (TCP header+data after the 40-byte IPv6 header)
+        frame[18] = 0x00;
+        frame[19] = 0x06;
+
+        let pkt = parse_ip_frame(&frame).unwrap();
+        assert_eq!(
+            pkt.length, 6,
+            "IPv6 payload_length must be parsed, not zero"
+        );
+    }
+
+    #[test]
+    fn test_parse_ipv6_payload_length_zero_fallback() {
+        // When payload_length is 0 (jumbo), should fall back to frame length minus Ethernet header.
+        let mut frame = vec![0u8; 120];
+        frame[12] = 0x86;
+        frame[13] = 0xDD; // EtherType = IPv6
+        frame[14] = 0x60; // version=6
+        frame[20] = 0x06; // Next header = TCP
+                          // payload_length stays 0x0000 (jumbo case)
+
+        let pkt = parse_ip_frame(&frame).unwrap();
+        assert_eq!(
+            pkt.length, 106,
+            "Zero payload_length should fall back to frame_len - 14"
+        );
     }
 }

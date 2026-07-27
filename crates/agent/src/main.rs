@@ -141,8 +141,13 @@ fn main() -> io::Result<()> {
     let read_buf = vec![0u8; buf_len];
     let tracker = flow::FlowTracker::new();
     let enrich_pool = enrichment::EnrichmentPool::new();
-    let detectors: Vec<Arc<dyn synapse_common::Detector>> =
-        vec![Arc::new(detectors::RuleDetector::new())];
+    let detectors: Vec<Arc<dyn synapse_common::Detector>> = vec![
+        Arc::new(detectors::dns_analyzer::DnsAnalyzer::new()),
+        Arc::new(detectors::process_correlator::ProcessCorrelator),
+        Arc::new(detectors::flow_behavior::FlowBehavior),
+        Arc::new(detectors::ip_reputation::IpReputation::new()),
+        Arc::new(detectors::dns_tunnel::DnsTunnelDetector),
+    ];
     let detector_timeout = std::time::Duration::from_millis(100);
     info!(
         "registered {} detector(s) with {}ms timeout",

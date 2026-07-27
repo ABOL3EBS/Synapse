@@ -162,6 +162,16 @@ pub enum DetectorId {
     RuleEngine,
     /// Reputation feed lookup (future).
     ReputationEngine,
+    /// DNS hostname behavioral analysis — entropy, length, structure, blocklists.
+    DnsAnalyzer,
+    /// Process-to-network behavioral correlation — context-aware, not rigid mappings.
+    ProcessCorrelator,
+    /// Per-flow traffic behavior analysis — packet rate, byte patterns, timing.
+    FlowBehavior,
+    /// IP reputation lookup — blocklist, allowlist, RFC1918 awareness.
+    IpReputation,
+    /// DNS tunnel detection — high-entropy subdomains, label anomalies.
+    DnsTunnelDetector,
     /// Catch-all for future detectors.
     Custom(u16),
 }
@@ -264,7 +274,7 @@ pub trait Detector: Send + Sync {
 /// numerically smaller endpoint; `b_ip`/`b_port` are the larger. This
 /// discards which side is local. Use `determine_remote_ip()` (agent) to
 /// resolve the actual remote endpoint before enforcement.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlowRecord {
     pub flow_id: u64,
     pub a_ip: IpAddr,
@@ -278,8 +288,10 @@ pub struct FlowRecord {
     pub byte_count: u64,
     pub dns_name: Option<String>,
     pub process_path: Option<String>,
+    pub process_start_time: Option<f64>,
     pub country_code: Option<String>,
     pub reputation_score: Option<f32>,
+    pub flow_age: Duration,
 }
 
 // ---------------------------------------------------------------------------
@@ -327,14 +339,25 @@ pub struct FlowFeatures {
 }
 
 impl FlowFeatures {
-    /// Extract features from a FlowRecord and flow start time.
-    pub fn from_flow(flow: &FlowRecord, flow_age: Duration) -> Self {
-        let duration_ms = flow_age.as_millis() as u64;
-        let duration_sec = flow_age.as_secs_f64();
+    /// Extract features from a FlowRecord.
+    pub fn from_flow(flow: &FlowRecord) -> Self {
+        let duration_ms = flow.flow_age.as_millis() as u64;
+        let duration_sec = flow.flow_age.as_secs_f64();
         let packet_frequency = if duration_sec > 0.0 {
             flow.packet_count as f64 / duration_sec
         } else {
             0.0
+        };
+
+        // Compute remote port: the port that isn't local_port.
+        let remote_port = if flow.a_port == flow.local_port {
+            flow.b_port
+        } else if flow.b_port == flow.local_port {
+            flow.a_port
+        } else {
+            // local_port doesn't match either canonical port (ICMP or non-TCP/UDP).
+            // Fall back to b_port (existing behavior).
+            flow.b_port
         };
 
         Self {
@@ -344,7 +367,7 @@ impl FlowFeatures {
             duration_ms,
             packet_frequency,
             protocol: flow.protocol,
-            dst_port: flow.b_port,
+            dst_port: remote_port,
             has_dns_name: flow.dns_name.is_some(),
             has_process_path: flow.process_path.is_some(),
             reputation_score: flow.reputation_score,

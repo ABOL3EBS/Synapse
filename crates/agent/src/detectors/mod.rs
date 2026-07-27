@@ -1,153 +1,22 @@
 // crates/agent/src/detectors/mod.rs
 //
 // Detector framework (§4b). Every detector implements the Detector trait
-// from synapse-common. The RuleDetector is the first real implementation —
-// a simple rule engine for v1 placeholder rules.
-//
-// PLACEHOLDER RULES — these are test/demo rules for v1, NOT production
-// detection logic. They exist to prove the framework and timeout mechanism
-// work. Real detection rules will be loaded from configuration.
+// from synapse-common. Production detectors are in separate sub-modules:
+// dns_analyzer, process_correlator, flow_behavior, ip_reputation, dns_tunnel.
+
+pub mod dns_analyzer;
+pub mod dns_tunnel;
+pub mod flow_behavior;
+pub mod ip_reputation;
+pub mod process_correlator;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use synapse_common::{
-    Detector, DetectorFinding, DetectorId, DetectorStatus, Evidence, FlowRecord, Severity,
-};
+use synapse_common::{Detector, DetectorFinding, DetectorId, DetectorStatus, FlowRecord};
 
 use log::{debug, info};
-
-// ---------------------------------------------------------------------------
-// RuleDetector — simple rule engine for v1
-// ---------------------------------------------------------------------------
-
-/// A single detection rule.
-struct Rule {
-    name: &'static str,
-    score: f32,
-    severity: Severity,
-    evaluate: fn(&FlowRecord) -> bool,
-}
-
-/// Simple rule-based detector. Scores a flow against a set of hardcoded rules.
-/// For v1 — placeholder rules to prove the framework works.
-pub struct RuleDetector {
-    rules: Vec<Rule>,
-}
-
-impl RuleDetector {
-    /// Check if a hostname has `target` as a standalone label (dot/hyphen delimited),
-    /// not as a substring inside a longer label. E.g. "c2" inside "ec2" or
-    /// "malware" inside "malwarebytes" must NOT match.
-    fn has_label(name: &str, target: &str) -> bool {
-        name.split(['.', '-']).any(|part| part == target)
-    }
-
-    pub fn new() -> Self {
-        Self {
-            rules: vec![
-                Rule {
-                    name: "dns_blocklist",
-                    score: 0.8,
-                    severity: Severity::High,
-                    evaluate: |flow| {
-                        // Placeholder: flag flows whose dns_name has known-malicious
-                        // strings as standalone labels (dot/hyphen delimited).
-                        // Must use label-aware matching — "c2" inside "ec2",
-                        // "malware" inside "malwarebytes", "phish" inside "phishing"
-                        // are all false positives.
-                        // Real v1 would load from a blocklist file.
-                        flow.dns_name.as_ref().is_some_and(|name| {
-                            let lower = name.to_ascii_lowercase();
-                            Self::has_label(&lower, "malware")
-                                || Self::has_label(&lower, "phish")
-                                || Self::has_label(&lower, "c2")
-                        })
-                    },
-                },
-                Rule {
-                    name: "suspicious_port",
-                    score: 0.5,
-                    severity: Severity::Medium,
-                    evaluate: |flow| {
-                        // Placeholder: flag flows to known-suspicious ports.
-                        // Real v1 would load from a threat-intel feed.
-                        matches!(flow.a_port, 4444 | 5555 | 6666 | 7777 | 8888 | 9999 | 31337)
-                            || matches!(
-                                flow.b_port,
-                                4444 | 5555 | 6666 | 7777 | 8888 | 9999 | 31337
-                            )
-                    },
-                },
-                Rule {
-                    name: "high_packet_count",
-                    score: 0.3,
-                    severity: Severity::Low,
-                    evaluate: |flow| {
-                        // Placeholder: flag flows with unusually high packet count
-                        // in a 5-second window (>1000 packets).
-                        flow.packet_count > 1000
-                    },
-                },
-            ],
-        }
-    }
-}
-
-impl Detector for RuleDetector {
-    fn id(&self) -> DetectorId {
-        DetectorId::RuleEngine
-    }
-
-    fn version(&self) -> &str {
-        "0.1.0"
-    }
-
-    fn evaluate(&self, flow: &FlowRecord) -> DetectorFinding {
-        let start = std::time::Instant::now();
-        let mut matched_rules = Vec::new();
-        let mut total_score = 0.0_f32;
-        let mut max_severity = Severity::Low;
-
-        for rule in &self.rules {
-            if (rule.evaluate)(flow) {
-                matched_rules.push(rule.name);
-                total_score += rule.score;
-                if rule.severity > max_severity {
-                    max_severity = rule.severity;
-                }
-            }
-        }
-
-        // Clamp score to [0.0, 1.0].
-        let score = total_score.min(1.0);
-        let confidence = if matched_rules.is_empty() {
-            0.0
-        } else {
-            0.8 // Placeholder confidence for matched rules.
-        };
-
-        let latency_us = start.elapsed().as_micros() as u64;
-
-        DetectorFinding {
-            detector_id: DetectorId::RuleEngine,
-            detector_version: self.version().to_string(),
-            score,
-            confidence,
-            severity: max_severity,
-            evidence: matched_rules
-                .into_iter()
-                .map(|name| Evidence {
-                    description: format!("rule '{}' matched", name),
-                    detail: None,
-                })
-                .collect(),
-            latency_us,
-            status: DetectorStatus::Completed,
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Circuit Breaker — per-detector failure tracking with recovery
@@ -333,6 +202,7 @@ mod tests {
     use super::*;
     use std::net::IpAddr;
     use std::thread;
+    use synapse_common::{Evidence, Severity};
 
     /// A deliberately slow detector that sleeps for longer than its budget.
     struct SlowDetector {
@@ -429,8 +299,10 @@ mod tests {
             byte_count: 5000,
             dns_name: None,
             process_path: Some("/usr/bin/curl".to_string()),
+            process_start_time: Some(1700000000.0),
             country_code: None,
             reputation_score: None,
+            flow_age: std::time::Duration::from_secs(5),
         }
     }
 
@@ -472,132 +344,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // RuleDetector unit tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_rule_detector_dns_blocklist() {
-        let detector = RuleDetector::new();
-        let mut flow = make_test_flow();
-        flow.dns_name = Some("evil-malware.example.com".to_string());
-
-        let finding = detector.evaluate(&flow);
-        assert_eq!(finding.status, DetectorStatus::Completed);
-        assert!(finding.score > 0.0);
-        assert_eq!(finding.severity, Severity::High);
-        assert!(!finding.evidence.is_empty());
-    }
-
-    /// Regression: ec2 hostnames contain "c2" as a substring of "ec2" — must NOT match.
-    #[test]
-    fn test_rule_detector_dns_blocklist_ec2_no_false_positive() {
-        let detector = RuleDetector::new();
-        let mut flow = make_test_flow();
-        flow.dns_name = Some("ec2-52-73-240-202.compute-1.amazonaws.com".to_string());
-
-        let finding = detector.evaluate(&flow);
-        assert_eq!(
-            finding.score, 0.0,
-            "ec2 hostname must not trigger dns_blocklist"
-        );
-        assert!(finding.evidence.is_empty());
-    }
-
-    /// c2 as a standalone label (dot-delimited) SHOULD match.
-    #[test]
-    fn test_rule_detector_dns_blocklist_c2_label_matches() {
-        let detector = RuleDetector::new();
-        let mut flow = make_test_flow();
-        flow.dns_name = Some("evil-c2-server.example.com".to_string());
-
-        let finding = detector.evaluate(&flow);
-        assert!(finding.score > 0.0, "c2 as standalone label should match");
-    }
-
-    /// "malware" inside "malwarebytes" must NOT match (same substring-in-label bug as c2/ec2).
-    #[test]
-    fn test_rule_detector_dns_blocklist_malwarebytes_no_false_positive() {
-        let detector = RuleDetector::new();
-        let mut flow = make_test_flow();
-        flow.dns_name = Some("cdn.malwarebytes.com".to_string());
-
-        let finding = detector.evaluate(&flow);
-        assert_eq!(
-            finding.score, 0.0,
-            "malwarebytes hostname must not trigger dns_blocklist"
-        );
-    }
-
-    /// "phish" inside "phishing" must NOT match.
-    #[test]
-    fn test_rule_detector_dns_blocklist_phishing_no_false_positive() {
-        let detector = RuleDetector::new();
-        let mut flow = make_test_flow();
-        flow.dns_name = Some("phishing-detection.securityvendor.com".to_string());
-
-        let finding = detector.evaluate(&flow);
-        assert_eq!(
-            finding.score, 0.0,
-            "phishing hostname must not trigger dns_blocklist"
-        );
-    }
-
-    /// "malware" and "phish" as standalone labels SHOULD match.
-    #[test]
-    fn test_rule_detector_dns_blocklist_standalone_labels_match() {
-        let detector = RuleDetector::new();
-        let mut flow = make_test_flow();
-        flow.dns_name = Some("bad-phish-server.malware.internal".to_string());
-
-        let finding = detector.evaluate(&flow);
-        assert!(
-            finding.score > 0.0,
-            "standalone malware/phish labels should match"
-        );
-    }
-
-    #[test]
-    fn test_rule_detector_suspicious_port() {
-        let detector = RuleDetector::new();
-        let mut flow = make_test_flow();
-        flow.a_port = 4444;
-
-        let finding = detector.evaluate(&flow);
-        assert_eq!(finding.status, DetectorStatus::Completed);
-        assert!(finding.score > 0.0);
-        assert_eq!(finding.severity, Severity::Medium);
-    }
-
-    #[test]
-    fn test_rule_detector_high_packet_count() {
-        let detector = RuleDetector::new();
-        let mut flow = make_test_flow();
-        flow.packet_count = 2000;
-
-        let finding = detector.evaluate(&flow);
-        assert_eq!(finding.status, DetectorStatus::Completed);
-        assert!(finding.score > 0.0);
-    }
-
-    #[test]
-    fn test_rule_detector_clean_flow() {
-        let detector = RuleDetector::new();
-        let flow = make_test_flow();
-
-        let finding = detector.evaluate(&flow);
-        assert_eq!(finding.status, DetectorStatus::Completed);
-        assert_eq!(finding.score, 0.0);
-        assert!(finding.evidence.is_empty());
-    }
-
-    // -----------------------------------------------------------------------
     // run_detectors integration
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_run_detectors_with_timeout() {
         let detectors: Vec<Arc<dyn Detector>> = vec![
-            Arc::new(RuleDetector::new()),
+            Arc::new(dns_analyzer::DnsAnalyzer::new()),
             Arc::new(SlowDetector {
                 sleep_duration: Duration::from_millis(500),
             }),
@@ -864,12 +617,12 @@ mod tests {
         ));
 
         // Now use a detector that completes instantly.
-        let fast: Vec<Arc<dyn Detector>> = vec![Arc::new(RuleDetector::new())];
+        let fast: Vec<Arc<dyn Detector>> = vec![Arc::new(dns_analyzer::DnsAnalyzer::new())];
         let findings = run_detectors(&fast, &flow, timeout, &mut cb);
         assert_eq!(findings[0].status, DetectorStatus::Completed);
 
-        // RuleEngine should have no entry (clean reset).
-        assert!(!cb.contains_key(&DetectorId::RuleEngine));
+        // DnsAnalyzer should have no entry (clean reset — no failures).
+        assert!(!cb.contains_key(&DetectorId::DnsAnalyzer));
         // SlowDetector's state should be untouched.
         assert!(matches!(
             cb.get(&DetectorId::Custom(999)),

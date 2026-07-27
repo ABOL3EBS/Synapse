@@ -171,8 +171,10 @@ impl From<FlowRecord> for synapse_common::FlowRecord {
             byte_count: flow.byte_count,
             dns_name: flow.dns_name,
             process_path: flow.process_path,
+            process_start_time: flow.process_start_time,
             country_code: flow.country_code,
             reputation_score: flow.reputation_score,
+            flow_age: flow.first_seen.elapsed(),
         }
     }
 }
