@@ -143,6 +143,7 @@ impl AgentConfig {
         DecisionConfig {
             block_threshold: self.decision.block_threshold,
             alert_threshold: self.decision.alert_threshold,
+            min_detectors_for_block: self.decision.min_detectors_for_block,
             ttl_by_severity,
             min_ttl: Duration::from_secs(self.decision.min_ttl_secs),
             max_ttl: Duration::from_secs(self.decision.max_ttl_secs),
@@ -346,6 +347,7 @@ impl Default for CircuitBreakerSection {
 pub struct DecisionSection {
     pub block_threshold: f32,
     pub alert_threshold: f32,
+    pub min_detectors_for_block: usize,
     pub timed_out_weight: f32,
     pub errored_weight: f32,
     pub min_ttl_secs: u64,
@@ -356,8 +358,9 @@ pub struct DecisionSection {
 impl Default for DecisionSection {
     fn default() -> Self {
         Self {
-            block_threshold: 0.5,
-            alert_threshold: 0.2,
+            block_threshold: 0.7,
+            alert_threshold: 0.3,
+            min_detectors_for_block: 2,
             timed_out_weight: 0.1,
             errored_weight: 0.0,
             min_ttl_secs: 30,
@@ -422,8 +425,9 @@ mod tests {
         assert_eq!(config.enrichment.worker_count, 4);
         assert_eq!(config.circuit_breaker.max_failures, 5);
         assert_eq!(config.circuit_breaker.cooldown_secs, 30);
-        assert_eq!(config.decision.block_threshold, 0.5);
-        assert_eq!(config.decision.alert_threshold, 0.2);
+        assert_eq!(config.decision.block_threshold, 0.7);
+        assert_eq!(config.decision.alert_threshold, 0.3);
+        assert_eq!(config.decision.min_detectors_for_block, 2);
         assert_eq!(config.decision.timed_out_weight, 0.1);
         assert_eq!(config.decision.errored_weight, 0.0);
         assert_eq!(config.decision.min_ttl_secs, 30);
@@ -438,7 +442,9 @@ mod tests {
     fn test_decision_config_conversion() {
         let config = AgentConfig::default();
         let dc = config.decision_config();
-        assert_eq!(dc.block_threshold, 0.5);
+        assert_eq!(dc.block_threshold, 0.7);
+        assert_eq!(dc.alert_threshold, 0.3);
+        assert_eq!(dc.min_detectors_for_block, 2);
         assert_eq!(dc.min_ttl, Duration::from_secs(30));
         assert_eq!(
             dc.ttl_by_severity[&Severity::Critical],
@@ -461,7 +467,8 @@ max_flows = 50000
         assert_eq!(config.decision.block_threshold, 0.8);
         assert_eq!(config.flow.max_flows, 50_000);
         // Defaulted
-        assert_eq!(config.decision.alert_threshold, 0.2);
+        assert_eq!(config.decision.alert_threshold, 0.3);
+        assert_eq!(config.decision.min_detectors_for_block, 2);
         assert_eq!(config.enrichment.worker_count, 4);
         assert_eq!(config.flow.expiry_secs, 5);
     }

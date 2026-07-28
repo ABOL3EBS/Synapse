@@ -21,6 +21,41 @@ use synapse_common::{
 pub struct ProcessCorrelator;
 
 impl ProcessCorrelator {
+    /// Known-safe process basenames — browsers, OS services, common CLI tools.
+    /// These are never scored by behavioral sub-detectors.
+    const ALLOWLIST: &'static [&'static str] = &[
+        "Brave Browser",
+        "Brave Browser Helper",
+        "Safari",
+        "SafariHelper",
+        "SafariCloudTabsAgent",
+        "WebContent",
+        "firefox",
+        "Google Chrome",
+        "Google Chrome Helper",
+        "Chromium",
+        "Microsoft Edge",
+        "curl",
+        "wget",
+        "ssh",
+        "git",
+        "npm",
+        "node",
+        "cargo",
+        "rustc",
+        "Finder",
+        "launchd",
+        "cfprefsd",
+        "nsurlsessiond",
+        "SystemUIServer",
+        "ControlCenter",
+        "Spotlight",
+        "mds",
+        "mdworker",
+        "WindowServer",
+        "loginwindow",
+    ];
+
     /// Paths where legitimate long-running processes are rare.
     const TEMP_DIRS: &'static [&'static str] = &["/tmp/", "/var/tmp/", "/private/tmp/"];
 
@@ -118,6 +153,18 @@ impl ProcessCorrelator {
             0.2
         }
     }
+
+    /// Check if a process path basename matches the known-safe allowlist.
+    fn is_known_safe(process_path: &str) -> bool {
+        if process_path.is_empty() {
+            return false;
+        }
+        let basename = Path::new(process_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        Self::ALLOWLIST.contains(&basename)
+    }
 }
 
 impl Default for ProcessCorrelator {
@@ -139,6 +186,23 @@ impl Detector for ProcessCorrelator {
         let start = Instant::now();
 
         let process_path = flow.process_path.as_deref().unwrap_or("");
+
+        // Known-safe process → skip behavioral scoring entirely.
+        if Self::is_known_safe(process_path) {
+            return DetectorFinding {
+                detector_id: self.id(),
+                detector_version: self.version().to_string(),
+                score: 0.0,
+                confidence: 1.0,
+                severity: Severity::Low,
+                evidence: vec![Evidence {
+                    description: "Known safe process".to_string(),
+                    detail: Some(process_path.to_string()),
+                }],
+                latency_us: start.elapsed().as_micros() as u64,
+                status: DetectorStatus::Completed,
+            };
+        }
 
         // If no process info at all, check if unresolved process is suspicious.
         if process_path.is_empty() && flow.pid.is_none() {
@@ -382,5 +446,18 @@ mod tests {
         );
         let finding = detector.evaluate(&flow);
         assert!(finding.score > 0.0, "Unknown location should score > 0");
+    }
+
+    #[test]
+    fn test_known_safe_browser_scores_zero() {
+        let detector = ProcessCorrelator;
+        let flow = make_flow_with_process(
+            Some("Brave Browser Helper".to_string()),
+            Some(42),
+            "172.217.14.99".parse().unwrap(),
+        );
+        let finding = detector.evaluate(&flow);
+        assert_eq!(finding.score, 0.0, "Known safe browser should score 0");
+        assert_eq!(finding.confidence, 1.0);
     }
 }

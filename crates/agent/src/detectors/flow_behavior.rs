@@ -120,6 +120,16 @@ impl Detector for FlowBehavior {
             0.0
         };
 
+        // Resolve the actual remote port. Canonical b_port is the port of the
+        // numerically larger IP — for outbound connections that's the LOCAL
+        // ephemeral port, not the remote service port. Use local_port to
+        // disambiguate.
+        let remote_port = if flow.local_port == flow.b_port {
+            flow.a_port
+        } else {
+            flow.b_port
+        };
+
         let mut evidence = Vec::new();
         let mut total_score = 0.0f32;
         let mut max_possible = 0.0f32;
@@ -134,7 +144,7 @@ impl Detector for FlowBehavior {
         total_score += e;
         max_possible += 1.0;
 
-        let e = Self::score_bytes_per_packet(bpp, flow.b_port);
+        let e = Self::score_bytes_per_packet(bpp, remote_port);
         if e > 0.0 {
             evidence.push(Evidence {
                 description: format!("Unusual bytes/packet: {:.0}", bpp),
@@ -180,7 +190,7 @@ impl Detector for FlowBehavior {
         total_score += e;
         max_possible += 1.0;
 
-        let e = Self::score_port_protocol_mismatch(flow.protocol, flow.b_port);
+        let e = Self::score_port_protocol_mismatch(flow.protocol, remote_port);
         if e > 0.0 {
             evidence.push(Evidence {
                 description: "Protocol/port mismatch heuristic".to_string(),

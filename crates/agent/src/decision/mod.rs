@@ -69,6 +69,7 @@ impl DecisionEngine {
         let mut total_score = 0.0_f32;
         let mut most_severe: Option<Severity> = None;
         let mut evidence_summary = Vec::new();
+        let mut detectors_with_score = 0usize;
 
         for finding in findings {
             let weight = match finding.status {
@@ -79,6 +80,10 @@ impl DecisionEngine {
 
             let adjusted = finding.score * finding.confidence * weight;
             total_score += adjusted;
+
+            if adjusted > 0.0 {
+                detectors_with_score += 1;
+            }
 
             // Track the most severe Completed finding for TTL calculation.
             if finding.status == DetectorStatus::Completed && finding.score > 0.0 {
@@ -103,12 +108,21 @@ impl DecisionEngine {
         }
 
         debug!(
-            "decision: flow={} total_score={:.4} threshold(block={:.2}, alert={:.2})",
-            features.flow_id, total_score, self.config.block_threshold, self.config.alert_threshold
+            "decision: flow={} total_score={:.4} detectors_with_score={} threshold(block={:.2}, alert={:.2}, min_detectors={})",
+            features.flow_id,
+            total_score,
+            detectors_with_score,
+            self.config.block_threshold,
+            self.config.alert_threshold,
+            self.config.min_detectors_for_block
         );
 
-        // Determine verdict based on thresholds.
-        if total_score >= self.config.block_threshold {
+        // Block requires BOTH: score above threshold AND enough detectors agree.
+        // Single-detector scores cannot trigger blocks — prevents noisy detectors
+        // from blocking legitimate traffic.
+        if total_score >= self.config.block_threshold
+            && detectors_with_score >= self.config.min_detectors_for_block
+        {
             let ttl = self.compute_ttl(most_severe);
             let reason = if evidence_summary.is_empty() {
                 format!("score {:.2} exceeds block threshold", total_score)
@@ -236,9 +250,9 @@ mod tests {
     fn test_medium_score_triggers_alert() {
         let engine = DecisionEngine::new(DecisionConfig::default());
         let features = make_features(1);
-        // score=0.3, confidence=0.8 → adjusted=0.24, above alert (0.2), below block (0.5)
+        // score=0.5, confidence=0.8 → adjusted=0.40, above alert (0.3), below block (0.7)
         let findings = vec![make_finding(
-            0.3,
+            0.5,
             0.8,
             Severity::Low,
             DetectorStatus::Completed,
@@ -246,7 +260,7 @@ mod tests {
         let verdict = engine.evaluate(&features, &findings);
         assert!(
             matches!(verdict, Verdict::Alert { .. }),
-            "adjusted score 0.24 should trigger Alert"
+            "adjusted score 0.40 should trigger Alert"
         );
     }
 
@@ -254,13 +268,11 @@ mod tests {
     fn test_high_score_triggers_block() {
         let engine = DecisionEngine::new(DecisionConfig::default());
         let features = make_features(1);
-        // score=0.8, confidence=0.8 → adjusted=0.64, above block (0.5)
-        let findings = vec![make_finding(
-            0.8,
-            0.8,
-            Severity::High,
-            DetectorStatus::Completed,
-        )];
+        // Two findings: 0.5*0.8 + 0.5*0.8 = 0.80, above block (0.7), 2 detectors agree.
+        let findings = vec![
+            make_finding(0.5, 0.8, Severity::High, DetectorStatus::Completed),
+            make_finding(0.5, 0.8, Severity::High, DetectorStatus::Completed),
+        ];
         let verdict = engine.evaluate(&features, &findings);
         match verdict {
             Verdict::Block { ttl, reason } => {
@@ -271,7 +283,7 @@ mod tests {
                 );
                 assert!(reason.contains("score"), "reason should mention score");
             }
-            _ => panic!("adjusted score 0.64 should trigger Block"),
+            _ => panic!("adjusted score 0.80 should trigger Block"),
         }
     }
 
@@ -318,7 +330,7 @@ mod tests {
         // Two findings: Critical (Completed) and High (TimedOut).
         // Most severe Completed is Critical → 1 hour TTL.
         let findings = vec![
-            make_finding(0.6, 0.9, Severity::Critical, DetectorStatus::Completed),
+            make_finding(0.8, 0.9, Severity::Critical, DetectorStatus::Completed),
             make_finding(0.5, 0.8, Severity::High, DetectorStatus::TimedOut),
         ];
         let verdict = engine.evaluate(&features, &findings);
@@ -343,12 +355,10 @@ mod tests {
         let engine = DecisionEngine::new(config);
         let features = make_features(1);
         // Low severity → 60s, but min_ttl is 120s → clamped to 120s.
-        let findings = vec![make_finding(
-            0.8,
-            0.8,
-            Severity::Low,
-            DetectorStatus::Completed,
-        )];
+        let findings = vec![
+            make_finding(0.8, 0.8, Severity::Low, DetectorStatus::Completed),
+            make_finding(0.5, 0.8, Severity::Low, DetectorStatus::Completed),
+        ];
         let verdict = engine.evaluate(&features, &findings);
         match verdict {
             Verdict::Block { ttl, .. } => {
@@ -371,12 +381,10 @@ mod tests {
         let engine = DecisionEngine::new(config);
         let features = make_features(1);
         // Critical severity → 3600s, but max_ttl is 600s → clamped to 600s.
-        let findings = vec![make_finding(
-            0.8,
-            0.8,
-            Severity::Critical,
-            DetectorStatus::Completed,
-        )];
+        let findings = vec![
+            make_finding(0.8, 0.8, Severity::Critical, DetectorStatus::Completed),
+            make_finding(0.5, 0.8, Severity::Critical, DetectorStatus::Completed),
+        ];
         let verdict = engine.evaluate(&features, &findings);
         match verdict {
             Verdict::Block { ttl, .. } => {
@@ -394,27 +402,48 @@ mod tests {
     fn test_multiple_findings_cumulative_score() {
         let engine = DecisionEngine::new(DecisionConfig::default());
         let features = make_features(1);
-        // Two Low findings: each 0.3 * 0.8 = 0.24, total = 0.48
-        // Below block (0.5) but above alert (0.2).
+        // Three Low findings: each 0.3 * 0.8 = 0.24, total = 0.72
+        // Above block (0.7), 3 detectors agree.
         let findings = vec![
+            make_finding(0.3, 0.8, Severity::Low, DetectorStatus::Completed),
             make_finding(0.3, 0.8, Severity::Low, DetectorStatus::Completed),
             make_finding(0.3, 0.8, Severity::Low, DetectorStatus::Completed),
         ];
         let verdict = engine.evaluate(&features, &findings);
         assert!(
-            matches!(verdict, Verdict::Alert { .. }),
-            "cumulative 0.48 should trigger Alert, not Block"
+            matches!(verdict, Verdict::Block { .. }),
+            "cumulative 0.72 with 3 detectors should trigger Block"
         );
     }
 
     #[test]
     fn test_default_config_thresholds() {
         let config = DecisionConfig::default();
-        assert_eq!(config.block_threshold, 0.5);
-        assert_eq!(config.alert_threshold, 0.2);
+        assert_eq!(config.block_threshold, 0.7);
+        assert_eq!(config.alert_threshold, 0.3);
+        assert_eq!(config.min_detectors_for_block, 2);
         assert_eq!(config.timed_out_weight, 0.1);
         assert_eq!(config.errored_weight, 0.0);
         assert_eq!(config.min_ttl, std::time::Duration::from_secs(30));
         assert_eq!(config.max_ttl, std::time::Duration::from_secs(86400));
+    }
+
+    #[test]
+    fn test_single_detector_cannot_block() {
+        let engine = DecisionEngine::new(DecisionConfig::default());
+        let features = make_features(1);
+        // Single finding: score=0.9, confidence=0.9 → adjusted=0.81
+        // Above block threshold (0.7) but only 1 detector — should NOT block.
+        let findings = vec![make_finding(
+            0.9,
+            0.9,
+            Severity::Critical,
+            DetectorStatus::Completed,
+        )];
+        let verdict = engine.evaluate(&features, &findings);
+        assert!(
+            !matches!(verdict, Verdict::Block { .. }),
+            "single detector should not trigger Block even with high score"
+        );
     }
 }

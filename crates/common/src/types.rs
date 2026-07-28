@@ -383,6 +383,9 @@ pub struct DecisionConfig {
     pub block_threshold: f32,
     /// Score threshold above which an Alert verdict is produced (below block_threshold).
     pub alert_threshold: f32,
+    /// Minimum number of detectors that must have non-zero scores for a Block
+    /// to be issued. Prevents a single noisy detector from blocking traffic.
+    pub min_detectors_for_block: usize,
     /// TTL for blocks, keyed by the most severe Completed finding's severity.
     pub ttl_by_severity: std::collections::HashMap<Severity, Duration>,
     /// Minimum TTL floor — prevents rapid block/unblock cycling.
@@ -404,8 +407,9 @@ impl Default for DecisionConfig {
         ttl_by_severity.insert(Severity::Low, Duration::from_secs(60)); // 1 min
 
         Self {
-            block_threshold: 0.5,
-            alert_threshold: 0.2,
+            block_threshold: 0.7,
+            alert_threshold: 0.3,
+            min_detectors_for_block: 2,
             ttl_by_severity,
             min_ttl: Duration::from_secs(30),
             max_ttl: Duration::from_secs(86400), // 24 hours

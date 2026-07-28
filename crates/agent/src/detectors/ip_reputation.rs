@@ -158,6 +158,16 @@ impl Detector for IpReputation {
         }
 
         // RFC1918 — reduces score (internal traffic is less suspicious).
+        // Check BOTH IPs — canonical a_ip/b_ip ordering means either could be local.
+        let e = Self::score_rfc1918(&flow.a_ip);
+        total_score += e;
+        if e < 0.0 {
+            evidence.push(Evidence {
+                description: "Source IP is RFC1918 (local network)".to_string(),
+                detail: None,
+            });
+        }
+
         let e = Self::score_rfc1918(&flow.b_ip);
         total_score += e;
         if e < 0.0 {
