@@ -3,12 +3,19 @@
 // Reusable SCM_RIGHTS fd-passing and length-prefixed bincode message protocol.
 // Same implementation as the binaries — this module exists so other crates
 // (e.g. the Tauri UI layer) can use the IPC primitives without reimplementing.
+//
+// Wire format (S9):
+//   send_message: [4B magic "SYNP"][1B version][4B length][N bincode payload]
+//   recv_message: validates magic+version before deserialising payload.
+//   send_fd/recv_fd: SCM_RIGHTS fd-passing (unchanged — no framing prefix).
 
 use std::io::{self, Read, Write};
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
 
 use serde::{Deserialize, Serialize};
+
+use synapse_common::{IPC_MAGIC, IPC_VERSION};
 
 // ---------------------------------------------------------------------------
 // SCM_RIGHTS — fd passing
@@ -90,12 +97,42 @@ pub fn recv_fd(stream: &UnixStream) -> io::Result<RawFd> {
 pub fn send_message<S: Serialize>(stream: &mut UnixStream, msg: &S) -> io::Result<()> {
     let payload = bincode::serialize(msg)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("serialize: {e}")))?;
+    // Wire format: [4B magic][1B version][4B length][payload]
+    stream.write_all(&IPC_MAGIC)?;
+    stream.write_all(&[IPC_VERSION])?;
     stream.write_all(&(payload.len() as u32).to_be_bytes())?;
     stream.write_all(&payload)?;
     stream.flush()
 }
 
 pub fn recv_message<D: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> io::Result<D> {
+    // Read and validate 4-byte magic prefix.
+    let mut magic = [0u8; 4];
+    stream.read_exact(&mut magic)?;
+    if magic != IPC_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "IPC magic mismatch: expected {:?}, got {:?}",
+                &IPC_MAGIC, &magic
+            ),
+        ));
+    }
+
+    // Read and validate version byte.
+    let mut version_buf = [0u8; 1];
+    stream.read_exact(&mut version_buf)?;
+    if version_buf[0] != IPC_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "IPC version mismatch: expected {}, got {}",
+                IPC_VERSION, version_buf[0]
+            ),
+        ));
+    }
+
+    // Read length-prefixed payload.
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
     let len = u32::from_be_bytes(len_buf) as usize;

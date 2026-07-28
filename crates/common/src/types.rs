@@ -7,8 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{mpsc, Arc};
-use std::thread;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -521,70 +520,120 @@ impl Default for DecisionConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Detector Worker Pool (R1: bounded workers, no per-call thread spawning)
+// ---------------------------------------------------------------------------
+
+/// Task sent to a detector worker thread.
+struct DetectorTask {
+    detector: Arc<dyn Detector>,
+    flow: FlowRecord,
+    result_tx: crossbeam_channel::Sender<DetectorFinding>,
+}
+
+/// Global bounded worker pool — initialized once at startup, reused for all
+/// detector invocations. Eliminates per-flow OS thread spawning overhead.
+static POOL_TX: OnceLock<crossbeam_channel::Sender<DetectorTask>> = OnceLock::new();
+const DEFAULT_POOL_WORKERS: usize = 32;
+
+/// Initialize the global detector worker pool with `num_workers` threads.
+/// Call once at agent startup. If not called, a default pool (4 workers)
+/// is lazily created on first use.
+pub fn init_detector_pool(num_workers: usize) {
+    let (tx, rx) = crossbeam_channel::bounded(num_workers * 4);
+    for i in 0..num_workers {
+        let rx = rx.clone();
+        std::thread::Builder::new()
+            .name(format!("det-worker-{i}"))
+            .spawn(move || worker_loop(rx))
+            .ok();
+    }
+    let _ = POOL_TX.set(tx);
+}
+
+/// Ensure the pool is available — lazy-init with defaults if not explicitly set.
+fn ensure_pool() -> &'static crossbeam_channel::Sender<DetectorTask> {
+    POOL_TX.get_or_init(|| {
+        let num_workers = DEFAULT_POOL_WORKERS;
+        let (tx, rx) = crossbeam_channel::bounded(num_workers * 4);
+        for i in 0..num_workers {
+            let rx = rx.clone();
+            std::thread::Builder::new()
+                .name(format!("det-worker-{i}"))
+                .spawn(move || worker_loop(rx))
+                .ok();
+        }
+        tx
+    })
+}
+
+/// Worker loop — each thread pulls tasks from the shared channel.
+/// Panic-safe: catch_unwind wraps every evaluate() call.
+fn worker_loop(rx: crossbeam_channel::Receiver<DetectorTask>) {
+    while let Ok(task) = rx.recv() {
+        let start = Instant::now();
+        let id = task.detector.id();
+        let version = task.detector.version().to_string();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            task.detector.evaluate(&task.flow)
+        }));
+
+        let mut finding = match result {
+            Ok(f) => f,
+            Err(panic) => {
+                let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "detector panicked (non-string payload)".to_string()
+                };
+                DetectorFinding::errored(id, &version, &msg, 0)
+            }
+        };
+        finding.latency_us = start.elapsed().as_micros() as u64;
+        let _ = task.result_tx.send(finding);
+    }
+}
+
 /// Run a detector against a flow with an enforced timeout.
+/// Uses the bounded worker pool — no OS thread is spawned per call.
 /// Returns a DetectorFinding — either the detector's result or a TimedOut/Errored finding.
-/// The detector runs on its own thread; if it exceeds `budget`, we return TimedOut
-/// without waiting for the detector thread to finish (it can finish later and be dropped).
 pub fn run_detector_with_timeout(
     detector: Arc<dyn Detector>,
-    flow: &FlowRecord,
+    flow: Arc<FlowRecord>,
     budget: Duration,
 ) -> DetectorFinding {
-    let id = detector.id();
-    let version = detector.version().to_string();
-    let flow = flow.clone();
-    let version_clone = version.clone();
+    let tx = ensure_pool();
+    let (result_tx, result_rx) = crossbeam_channel::bounded(1);
 
-    // Channel for the detector thread to send its result back.
-    let (tx, rx) = mpsc::channel::<DetectorFinding>();
+    let task = DetectorTask {
+        detector: Arc::clone(&detector),
+        flow: Arc::try_unwrap(flow).unwrap_or_else(|arc| (*arc).clone()),
+        result_tx,
+    };
 
-    // Spawn the detector on its own thread.
-    let _handle = thread::Builder::new()
-        .name(format!("detector-{:?}", id))
-        .spawn(move || {
-            // catch_unwind ensures a panicking detector doesn't silently
-            // detach — the panic message is captured and sent as Errored.
-            let result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| detector.evaluate(&flow)));
+    if tx.send(task).is_err() {
+        return DetectorFinding::errored(
+            detector.id(),
+            detector.version(),
+            "detector pool shut down",
+            0,
+        );
+    }
 
-            let finding = match result {
-                Ok(finding) => finding,
-                Err(panic) => {
-                    let msg = if let Some(s) = panic.downcast_ref::<&str>() {
-                        s.to_string()
-                    } else if let Some(s) = panic.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "detector panicked (non-string payload)".to_string()
-                    };
-                    DetectorFinding::errored(id, &version_clone, &msg, 0)
-                }
-            };
-            // If the receiver has already been dropped (timeout fired),
-            // this send will fail silently — the thread finishes and is dropped.
-            let _ = tx.send(finding);
-        });
-
-    let start = Instant::now();
-
-    // Wait for the result with a timeout.
-    match rx.recv_timeout(budget) {
-        Ok(mut finding) => {
-            // Detector completed within budget — record actual latency.
-            finding.latency_us = start.elapsed().as_micros() as u64;
-            finding
+    match result_rx.recv_timeout(budget) {
+        Ok(finding) => finding,
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+            DetectorFinding::timed_out(detector.id(), detector.version(), 0)
         }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            // Detector exceeded budget — return TimedOut.
-            // The detector thread continues running but its result is dropped.
-            let latency_us = start.elapsed().as_micros() as u64;
-            DetectorFinding::timed_out(id, &version, latency_us)
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            // Detector thread panicked or exited without sending a result.
-            let latency_us = start.elapsed().as_micros() as u64;
-            DetectorFinding::errored(id, &version, "detector thread disconnected", latency_us)
-        }
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => DetectorFinding::errored(
+            detector.id(),
+            detector.version(),
+            "detector pool worker disconnected",
+            0,
+        ),
     }
 }
 

@@ -97,7 +97,7 @@ impl CircuitState {
 /// ```
 pub fn run_detectors(
     detectors: &[Arc<dyn Detector>],
-    flow: &FlowRecord,
+    flow: Arc<FlowRecord>,
     timeout: Duration,
     circuit_breaker: &mut HashMap<DetectorId, CircuitState>,
     cb_config: &CircuitBreakerConfig,
@@ -137,7 +137,11 @@ pub fn run_detectors(
                 return DetectorFinding::timed_out(id, d.version(), 0);
             }
 
-            let finding = synapse_common::run_detector_with_timeout(Arc::clone(d), flow, timeout);
+            let finding = synapse_common::run_detector_with_timeout(
+                Arc::clone(d),
+                Arc::clone(&flow),
+                timeout,
+            );
 
             // State transition based on result.
             match finding.status {
@@ -335,12 +339,12 @@ mod tests {
         let detector: Arc<dyn Detector> = Arc::new(SlowDetector {
             sleep_duration: Duration::from_millis(500),
         });
-        let flow = make_test_flow();
+        let flow = Arc::new(make_test_flow());
         let budget = Duration::from_millis(50);
 
         let start = Instant::now();
         let finding =
-            synapse_common::run_detector_with_timeout(Arc::clone(&detector), &flow, budget);
+            synapse_common::run_detector_with_timeout(Arc::clone(&detector), flow, budget);
         let elapsed = start.elapsed();
 
         assert_eq!(finding.status, DetectorStatus::TimedOut);
@@ -353,11 +357,11 @@ mod tests {
         let detector: Arc<dyn Detector> = Arc::new(SlowDetector {
             sleep_duration: Duration::from_millis(10),
         });
-        let flow = make_test_flow();
+        let flow = Arc::new(make_test_flow());
         let budget = Duration::from_millis(200);
 
         let finding =
-            synapse_common::run_detector_with_timeout(Arc::clone(&detector), &flow, budget);
+            synapse_common::run_detector_with_timeout(Arc::clone(&detector), flow, budget);
 
         assert_eq!(finding.status, DetectorStatus::Completed);
         assert_eq!(finding.score, 1.0);
@@ -375,13 +379,13 @@ mod tests {
                 sleep_duration: Duration::from_millis(500),
             }),
         ];
-        let flow = make_test_flow();
+        let flow = Arc::new(make_test_flow());
         let timeout = Duration::from_millis(50);
         let mut cb = HashMap::new();
 
         let findings = run_detectors(
             &detectors,
-            &flow,
+            flow,
             timeout,
             &mut cb,
             &CircuitBreakerConfig::default(),
@@ -407,14 +411,15 @@ mod tests {
         let detectors: Vec<Arc<dyn Detector>> = vec![Arc::new(SlowDetector {
             sleep_duration: Duration::from_millis(500),
         })];
-        let flow = make_test_flow();
+        let flow = Arc::new(make_test_flow());
         let timeout = Duration::from_millis(50);
         let mut cb = HashMap::new();
         let cb_config = CircuitBreakerConfig::default();
 
         // Fail max_failures times.
         for _ in 0..cb_config.max_failures {
-            let findings = run_detectors(&detectors, &flow, timeout, &mut cb, &cb_config);
+            let findings =
+                run_detectors(&detectors, Arc::clone(&flow), timeout, &mut cb, &cb_config);
             assert_eq!(findings[0].status, DetectorStatus::TimedOut);
         }
         // Should be Open now.
@@ -430,19 +435,19 @@ mod tests {
         let detectors: Vec<Arc<dyn Detector>> = vec![Arc::new(SlowDetector {
             sleep_duration: Duration::from_millis(500),
         })];
-        let flow = make_test_flow();
+        let flow = Arc::new(make_test_flow());
         let timeout = Duration::from_millis(50);
         let mut cb = HashMap::new();
         let cb_config = CircuitBreakerConfig::default();
 
         // Trip the circuit.
         for _ in 0..cb_config.max_failures {
-            run_detectors(&detectors, &flow, timeout, &mut cb, &cb_config);
+            run_detectors(&detectors, Arc::clone(&flow), timeout, &mut cb, &cb_config);
         }
 
         // Should skip — returns instantly with zero latency.
         let start = Instant::now();
-        let findings = run_detectors(&detectors, &flow, timeout, &mut cb, &cb_config);
+        let findings = run_detectors(&detectors, flow, timeout, &mut cb, &cb_config);
         let elapsed = start.elapsed();
 
         assert_eq!(findings[0].status, DetectorStatus::TimedOut);
@@ -459,14 +464,14 @@ mod tests {
         let detectors: Vec<Arc<dyn Detector>> = vec![Arc::new(SlowDetector {
             sleep_duration: Duration::from_millis(500),
         })];
-        let flow = make_test_flow();
+        let flow = Arc::new(make_test_flow());
         let timeout = Duration::from_millis(50);
         let mut cb = HashMap::new();
         let cb_config = CircuitBreakerConfig::default();
 
         // Trip the circuit.
         for _ in 0..cb_config.max_failures {
-            run_detectors(&detectors, &flow, timeout, &mut cb, &cb_config);
+            run_detectors(&detectors, Arc::clone(&flow), timeout, &mut cb, &cb_config);
         }
         assert!(matches!(
             cb.get(&DetectorId::Custom(999)),
@@ -482,7 +487,7 @@ mod tests {
         }
 
         // Next run should transition to HalfOpen and allow execution.
-        let findings = run_detectors(&detectors, &flow, timeout, &mut cb, &cb_config);
+        let findings = run_detectors(&detectors, flow, timeout, &mut cb, &cb_config);
         // SlowDetector will timeout again → should transition back to Open.
         assert_eq!(findings[0].status, DetectorStatus::TimedOut);
         // Should be Open again (probe failed).
@@ -499,14 +504,14 @@ mod tests {
         let detectors: Vec<Arc<dyn Detector>> = vec![Arc::new(ControllableDetector {
             should_fail: should_fail.clone(),
         })];
-        let flow = make_test_flow();
+        let flow = Arc::new(make_test_flow());
         let timeout = Duration::from_millis(200);
         let mut cb = HashMap::new();
         let cb_config = CircuitBreakerConfig::default();
 
         // Trip the circuit (5 failures).
         for _ in 0..cb_config.max_failures {
-            run_detectors(&detectors, &flow, timeout, &mut cb, &cb_config);
+            run_detectors(&detectors, Arc::clone(&flow), timeout, &mut cb, &cb_config);
         }
         assert!(matches!(
             cb.get(&DetectorId::Custom(997)),
@@ -525,7 +530,7 @@ mod tests {
         should_fail.store(false, std::sync::atomic::Ordering::Relaxed);
 
         // Half-open probe should succeed → circuit closes.
-        let findings = run_detectors(&detectors, &flow, timeout, &mut cb, &cb_config);
+        let findings = run_detectors(&detectors, flow, timeout, &mut cb, &cb_config);
         assert_eq!(findings[0].status, DetectorStatus::Completed);
         // Circuit should be cleared (Closed state removed = no entry).
         assert!(
@@ -540,14 +545,14 @@ mod tests {
         let detectors: Vec<Arc<dyn Detector>> = vec![Arc::new(SlowDetector {
             sleep_duration: Duration::from_millis(500),
         })];
-        let flow = make_test_flow();
+        let flow = Arc::new(make_test_flow());
         let timeout = Duration::from_millis(50);
         let mut cb = HashMap::new();
         let cb_config = CircuitBreakerConfig::default();
 
         // Trip the circuit.
         for _ in 0..cb_config.max_failures {
-            run_detectors(&detectors, &flow, timeout, &mut cb, &cb_config);
+            run_detectors(&detectors, Arc::clone(&flow), timeout, &mut cb, &cb_config);
         }
 
         // Expire the cooldown.
@@ -559,7 +564,7 @@ mod tests {
         }
 
         // Probe attempt — SlowDetector will timeout again.
-        let findings = run_detectors(&detectors, &flow, timeout, &mut cb, &cb_config);
+        let findings = run_detectors(&detectors, flow, timeout, &mut cb, &cb_config);
         assert_eq!(findings[0].status, DetectorStatus::TimedOut);
 
         // Should be back to Open with a fresh timer.
@@ -584,14 +589,14 @@ mod tests {
             }),
             Arc::new(ErrorDetector),
         ];
-        let flow = make_test_flow();
+        let flow = Arc::new(make_test_flow());
         let timeout = Duration::from_millis(50);
         let mut cb = HashMap::new();
         let cb_config = CircuitBreakerConfig::default();
 
         // Run until SlowDetector trips (5 timeouts).
         for _ in 0..cb_config.max_failures {
-            run_detectors(&detectors, &flow, timeout, &mut cb, &cb_config);
+            run_detectors(&detectors, Arc::clone(&flow), timeout, &mut cb, &cb_config);
         }
 
         // SlowDetector should be Open.
@@ -616,7 +621,7 @@ mod tests {
 
         // Run again — SlowDetector gets a probe (will timeout → back to Open),
         // ErrorDetector trips to Open.
-        run_detectors(&detectors, &flow, timeout, &mut cb, &cb_config);
+        run_detectors(&detectors, flow, timeout, &mut cb, &cb_config);
 
         // Both should be Open now.
         assert!(matches!(
@@ -635,14 +640,14 @@ mod tests {
         let detectors: Vec<Arc<dyn Detector>> = vec![Arc::new(SlowDetector {
             sleep_duration: Duration::from_millis(500),
         })];
-        let flow = make_test_flow();
+        let flow = Arc::new(make_test_flow());
         let timeout = Duration::from_millis(50);
         let mut cb = HashMap::new();
         let cb_config = CircuitBreakerConfig::default();
 
         // Fail 3 times (below threshold).
         for _ in 0..3 {
-            run_detectors(&detectors, &flow, timeout, &mut cb, &cb_config);
+            run_detectors(&detectors, Arc::clone(&flow), timeout, &mut cb, &cb_config);
         }
         assert!(matches!(
             cb.get(&DetectorId::Custom(999)),
@@ -651,7 +656,7 @@ mod tests {
 
         // Now use a detector that completes instantly.
         let fast: Vec<Arc<dyn Detector>> = vec![Arc::new(dns_analyzer::DnsAnalyzer::new())];
-        let findings = run_detectors(&fast, &flow, timeout, &mut cb, &cb_config);
+        let findings = run_detectors(&fast, flow, timeout, &mut cb, &cb_config);
         assert_eq!(findings[0].status, DetectorStatus::Completed);
 
         // DnsAnalyzer should have no entry (clean reset — no failures).

@@ -19,7 +19,7 @@ pub use types::{
 pub use types::{MAX_BLOCK_TTL, MAX_CONCURRENT_BLOCKS, MIN_BLOCK_TTL};
 
 // Re-export the Detector trait and run_detector_with_timeout function.
-pub use types::{run_detector_with_timeout, Detector};
+pub use types::{init_detector_pool, run_detector_with_timeout, Detector};
 
 // ---------------------------------------------------------------------------
 // Enforcement Protocol

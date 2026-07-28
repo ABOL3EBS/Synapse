@@ -157,9 +157,10 @@ impl AgentConfig {
         Duration::from_millis(self.agent.detector_timeout_ms)
     }
 
-    /// Poll timeout for BPF reads.
+    /// Poll timeout for BPF reads. Clamped to [0, i32::MAX] —
+    /// `libc::poll` takes an i32, and negative means infinite wait.
     pub fn poll_timeout_ms(&self) -> i32 {
-        self.agent.poll_timeout_ms as i32
+        self.agent.poll_timeout_ms.min(i32::MAX as u64) as i32
     }
 
     /// Local IP refresh interval.

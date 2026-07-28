@@ -185,6 +185,19 @@ const OFF_FPORT: usize = 264;
 /// This avoids the pitfall of reading via c_int (which native-endian reinterprets
 /// the raw bytes, producing a wrong value on little-endian macOS).
 fn read_port_be(info: &SocketFDInfo, byte_offset: usize) -> u16 {
+    let struct_size = mem::size_of::<SocketFDInfo>();
+    // Runtime bounds check — prevents raw pointer OOB read if struct layout
+    // changes across macOS versions or Apple Silicon revisions.
+    if byte_offset + 2 > struct_size {
+        log::warn!(
+            "read_port_be: offset {byte_offset} + 2 exceeds SocketFDInfo size {struct_size}, returning 0"
+        );
+        return 0;
+    }
+    debug_assert!(
+        byte_offset + 2 <= struct_size,
+        "read_port_be: offset {byte_offset} beyond struct size {struct_size}"
+    );
     let raw = info as *const SocketFDInfo as *const u8;
     let bytes = unsafe { std::slice::from_raw_parts(raw, byte_offset + 2) };
     u16::from_be_bytes([bytes[byte_offset], bytes[byte_offset + 1]])

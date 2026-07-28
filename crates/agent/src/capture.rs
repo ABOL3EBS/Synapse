@@ -56,17 +56,25 @@ impl BpfHdr {
         if buf.len() < Self::SIZE {
             return None;
         }
-        Some(Self {
+        let hdr = Self {
             tv_sec: i32::from_ne_bytes(buf[0..4].try_into().ok()?),
             tv_usec: i32::from_ne_bytes(buf[4..8].try_into().ok()?),
             bh_caplen: u32::from_ne_bytes(buf[8..12].try_into().ok()?),
             bh_datalen: u32::from_ne_bytes(buf[12..16].try_into().ok()?),
             bh_hdrlen: u16::from_ne_bytes(buf[16..18].try_into().ok()?),
-        })
+        };
+        // S6: Sanity-check bh_hdrlen. Kernel sets this to sizeof(bpf_hdr) (20)
+        // or sizeof(bpf_hdr32) (24) on macOS. A value >128 is impossible
+        // from a valid kernel and indicates buffer corruption.
+        if hdr.bh_hdrlen as usize > 128 {
+            return None;
+        }
+        Some(hdr)
     }
 
-    pub fn next_offset(&self) -> usize {
-        bpf_wordalign(self.bh_hdrlen as usize + self.bh_caplen as usize)
+    pub fn next_offset(&self) -> Option<usize> {
+        let total = (self.bh_hdrlen as usize).checked_add(self.bh_caplen as usize)?;
+        Some(bpf_wordalign(total))
     }
 }
 
@@ -150,7 +158,12 @@ fn parse_ipv6(frame: &[u8]) -> Option<PacketInfo> {
     };
     let (sp, dp) = match nh {
         6 | 17 => {
+            // S7: Validate frame has room for TCP/UDP header (4 bytes ports)
+            // after the 40-byte IPv6 fixed header.
             let t = ip + 40;
+            if frame.len() < t + 4 {
+                return None;
+            }
             (
                 u16::from_be_bytes([frame[t], frame[t + 1]]),
                 u16::from_be_bytes([frame[t + 2], frame[t + 3]]),
@@ -385,7 +398,12 @@ pub struct CaptureEngine {
     write_half: UnixStream,
     pkt_count: u64,
     poll_timeout_ms: i32,
+    /// Consecutive IPC send failures. Reset on success. Agent exits at threshold.
+    ipc_failures: u32,
 }
+
+/// Consecutive IPC failures before the agent exits for launchd/systemd restart.
+const MAX_IPC_FAILURES: u32 = 5;
 
 impl CaptureEngine {
     #[allow(clippy::too_many_arguments)]
@@ -423,6 +441,7 @@ impl CaptureEngine {
             write_half,
             pkt_count: 0,
             poll_timeout_ms,
+            ipc_failures: 0,
         }
     }
 
@@ -432,6 +451,22 @@ impl CaptureEngine {
 
     pub fn flows_tracked(&self) -> usize {
         self.tracker.len()
+    }
+
+    /// Check IPC health — returns Err if consecutive failures exceed threshold.
+    /// The main loop should exit cleanly so launchd/systemd can restart the agent.
+    pub fn check_ipc_health(&self) -> io::Result<()> {
+        if self.ipc_failures >= MAX_IPC_FAILURES {
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                format!(
+                    "IPC channel dead — {MAX_IPC_FAILURES} consecutive enforcement send failures. \
+                     Exiting for restart."
+                ),
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     /// poll() + tick(). Returns Ok(has_data) — true if packets available,
@@ -456,15 +491,11 @@ impl CaptureEngine {
         // Always tick on every iteration — even on timeout.
         // Expires stale flows and reclaims memory.
         let (expired, re_evaluate) = self.tracker.tick();
-        if !expired.is_empty() || !re_evaluate.is_empty() {
-            info!(
-                "tick: expired {} flows, re-evaluate {} flows ({} remaining)",
-                expired.len(),
-                re_evaluate.len(),
-                self.tracker.len()
-            );
 
-            // Lazy cleanup of expired cooldown entries.
+        // R6: Sweep block_cooldown on every tick, not only inside the
+        // expired/re_evaluate guard — prevents stale entries from piling up
+        // when the network is quiet (no flow expiry or re-evaluation).
+        {
             let now = Instant::now();
             self.block_cooldown.retain(|_ip, expires_at| {
                 if now >= *expires_at {
@@ -474,6 +505,15 @@ impl CaptureEngine {
                     true
                 }
             });
+        }
+
+        if !expired.is_empty() || !re_evaluate.is_empty() {
+            info!(
+                "tick: expired {} flows, re-evaluate {} flows ({} remaining)",
+                expired.len(),
+                re_evaluate.len(),
+                self.tracker.len()
+            );
 
             self.process_expired_flows(&expired);
             self.process_re_evaluate_flows(&re_evaluate);
@@ -486,22 +526,31 @@ impl CaptureEngine {
     /// Verbatim extraction from main.rs lines 456-527.
     pub fn process_expired_flows(&mut self, expired: &[u64]) {
         // Temporarily take local_ip to avoid borrow conflicts.
-        let local_ip = self
+        // R9: Recover from mutex poison — keep last-known value rather than aborting.
+        // R10: If local_ip is unknown, skip all expired flow processing —
+        // direction resolution requires a known local IP.
+        let local_ip = match *self
             .local_ip_cache
             .lock()
-            .ok()
-            .and_then(|g| *g)
-            .unwrap_or_else(|| {
-                warn!("local_ip unknown during expired flow processing — blocks may misroute");
-                IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))
-            });
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            Some(ip) => ip,
+            None => {
+                warn!(
+                    "local_ip unknown — skipping expired flow processing ({} flows skipped)",
+                    expired.len()
+                );
+                return;
+            }
+        };
 
         for &flow_id in expired {
             if let Some(flow_ref) = self.tracker.get(flow_id) {
                 let common_flow: synapse_common::FlowRecord = flow_ref.clone().into();
+                let common_flow = std::sync::Arc::new(common_flow);
                 let findings = detectors::run_detectors(
                     &self.detectors,
-                    &common_flow,
+                    std::sync::Arc::clone(&common_flow),
                     self.detector_timeout,
                     &mut self.circuit_breaker,
                     &self.cb_config,
@@ -517,22 +566,31 @@ impl CaptureEngine {
     /// Verbatim extraction from main.rs lines 528-602.
     pub fn process_re_evaluate_flows(&mut self, re_evaluate: &[u64]) {
         // Temporarily take local_ip to avoid borrow conflicts.
-        let local_ip = self
+        // R9: Recover from mutex poison — keep last-known value rather than aborting.
+        // R10: If local_ip is unknown, skip all re-evaluation —
+        // direction resolution requires a known local IP.
+        let local_ip = match *self
             .local_ip_cache
             .lock()
-            .ok()
-            .and_then(|g| *g)
-            .unwrap_or_else(|| {
-                warn!("local_ip unknown during re-evaluation — blocks may misroute");
-                IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))
-            });
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            Some(ip) => ip,
+            None => {
+                warn!(
+                    "local_ip unknown — skipping re-evaluation ({} flows skipped)",
+                    re_evaluate.len()
+                );
+                return;
+            }
+        };
 
         for &flow_id in re_evaluate {
             if let Some(flow_ref) = self.tracker.get(flow_id) {
                 let common_flow: synapse_common::FlowRecord = flow_ref.clone().into();
+                let common_flow = std::sync::Arc::new(common_flow);
                 let findings = detectors::run_detectors(
                     &self.detectors,
-                    &common_flow,
+                    std::sync::Arc::clone(&common_flow),
                     self.detector_timeout,
                     &mut self.circuit_breaker,
                     &self.cb_config,
@@ -577,8 +635,14 @@ impl CaptureEngine {
                         );
                         let cmd = EnforcementCommand::Block { ip: remote, ttl };
                         if let Err(e) = protocol::send_message(&mut self.write_half, &cmd) {
-                            error!("enforcement send failed for {remote}: {e} — continuing");
+                            self.ipc_failures += 1;
+                            error!(
+                                "enforcement send failed for {remote}: {e} — \
+                                 consecutive failures: {}/{}",
+                                self.ipc_failures, MAX_IPC_FAILURES,
+                            );
                         } else {
+                            self.ipc_failures = 0;
                             info!("[ENFORCE] command sent: Block {remote} ttl={ttl:?}");
                             self.block_cooldown.insert(remote, Instant::now() + ttl);
                         }
@@ -592,7 +656,9 @@ impl CaptureEngine {
     /// Returns Some(reason) if blocked, None if blocking is allowed.
     fn should_skip_block(&self, remote: IpAddr) -> Option<&'static str> {
         // Own IPs (all address families — v4 and v6).
-        let own = self.own_ips.lock().ok()?;
+        // R9: Recover from mutex poison — use last-known own_ips rather than
+        // silently allowing blocks through on a poisoned mutex.
+        let own = self.own_ips.lock().unwrap_or_else(|e| e.into_inner());
         if own.contains(&remote) {
             return Some("remote is own IP");
         }
@@ -656,8 +722,20 @@ impl CaptureEngine {
                 None => break,
             };
 
-            let data_start = offset + hdr.bh_hdrlen as usize;
-            let data_end = data_start + hdr.bh_caplen as usize;
+            let data_start = match offset.checked_add(hdr.bh_hdrlen as usize) {
+                Some(v) => v,
+                None => {
+                    warn!("BPF header overflow at offset {offset}");
+                    break;
+                }
+            };
+            let data_end = match data_start.checked_add(hdr.bh_caplen as usize) {
+                Some(v) => v,
+                None => {
+                    warn!("BPF caplen overflow at offset {data_start}");
+                    break;
+                }
+            };
             if data_end > n {
                 warn!("truncated packet at offset {offset}");
                 break;
@@ -680,23 +758,29 @@ impl CaptureEngine {
                 }
 
                 let (local_port, pid) = {
-                    let cache_guard = self.port_pid_cache.lock().ok();
-                    let cache = cache_guard.as_ref();
+                    // R9: Recover from mutex poison — use last-known cache rather than degrading.
+                    let cache_guard = self
+                        .port_pid_cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let cache = cache_guard;
                     let lookup = |port: u16, proto: u8| -> Option<(u16, u32)> {
-                        cache.and_then(|c| {
-                            let key = (port, proto);
-                            c.get(&key).map(|&pid| (port, pid))
-                        })
+                        let key = (port, proto);
+                        cache.get(&key).map(|&pid| (port, pid))
                     };
-                    let current_local_ip = self
+                    // R10: If local_ip is unknown, skip direction resolution entirely
+                    // rather than falling back to 0.0.0.0 (which would misclassify packets).
+                    let current_local_ip = match *self
                         .local_ip_cache
                         .lock()
-                        .ok()
-                        .and_then(|g| *g)
-                        .unwrap_or_else(|| {
-                            warn!("local_ip unknown during packet processing — PID attribution degraded");
-                            IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))
-                        });
+                        .unwrap_or_else(|e| e.into_inner())
+                    {
+                        Some(ip) => ip,
+                        None => {
+                            debug!("local_ip unknown — skipping packet (direction unknown)");
+                            continue;
+                        }
+                    };
                     let (local, _remote) = determine_local_port(
                         info_pkt.src_ip,
                         info_pkt.src_port,
@@ -747,7 +831,13 @@ impl CaptureEngine {
                 }
             }
 
-            offset += hdr.next_offset();
+            match hdr.next_offset() {
+                Some(next) => offset += next,
+                None => {
+                    warn!("BPF next_offset overflow at offset {offset}");
+                    break;
+                }
+            }
         }
 
         Ok(true)
@@ -1006,7 +1096,7 @@ mod tests {
         assert_eq!(hdr.bh_datalen, 1500);
         assert_eq!(hdr.bh_hdrlen, 20);
         // next_offset = wordalign(20 + 100) = wordalign(120) = 120
-        assert_eq!(hdr.next_offset(), 120);
+        assert_eq!(hdr.next_offset(), Some(120));
     }
 
     #[test]
@@ -1016,7 +1106,18 @@ mod tests {
         buf[16..18].copy_from_slice(&24u16.to_ne_bytes()); // hdrlen=24
                                                            // 24 + 98 = 122 → wordalign(122) = 124
         let hdr = BpfHdr::from_bytes(&buf).unwrap();
-        assert_eq!(hdr.next_offset(), 124);
+        assert_eq!(hdr.next_offset(), Some(124));
+    }
+
+    #[test]
+    fn test_bpf_hdr_hdrlen_too_large_rejected() {
+        let mut buf = [0u8; 20];
+        buf[8..12].copy_from_slice(&100u32.to_ne_bytes()); // caplen
+        buf[16..18].copy_from_slice(&200u16.to_ne_bytes()); // hdrlen=200 > 128
+        assert!(
+            BpfHdr::from_bytes(&buf).is_none(),
+            "bh_hdrlen > 128 must be rejected"
+        );
     }
 
     #[test]

@@ -246,7 +246,7 @@ impl FlowTracker {
         }
 
         let flow_id = self.next_id;
-        self.next_id += 1;
+        self.next_id = self.next_id.saturating_add(1);
 
         let now = Instant::now();
         let flow = FlowRecord {
@@ -307,6 +307,31 @@ impl FlowTracker {
         for &flow_id in &expired {
             if let Some(flow) = self.flows.get(&flow_id) {
                 self.index.remove(&flow.key);
+            }
+        }
+
+        // R8: Periodically purge stale entries from the eviction heap.
+        // Stale entries accumulate because flow expiry removes from self.flows
+        // but not from the heap (which is only cleaned lazily in evict_oldest()).
+        // Purge when heap is >2x active flow count — amortised O(n) cost,
+        // happens infrequently (only during active expiry).
+        if !expired.is_empty() && self.eviction_heap.len() > self.flows.len().saturating_mul(2) {
+            let before = self.eviction_heap.len();
+            let mut purged = BinaryHeap::new();
+            while let Some(entry) = self.eviction_heap.pop() {
+                if self.flows.contains_key(&entry.0 .1) {
+                    purged.push(entry);
+                }
+            }
+            self.eviction_heap = purged;
+            let after = self.eviction_heap.len();
+            if before > after {
+                debug!(
+                    "eviction_heap purged {} stale entries ({} → {})",
+                    before - after,
+                    before,
+                    after
+                );
             }
         }
 

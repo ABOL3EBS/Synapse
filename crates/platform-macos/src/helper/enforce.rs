@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use log::{error, info, warn};
 use synapse_common::{
@@ -19,7 +19,7 @@ use synapse_common::{
 
 /// macOS enforcement backend — owns the set of active blocks and the pf anchor.
 pub struct MacOsEnforcementBackend {
-    active_blocks: HashSet<IpAddr>,
+    active_blocks: Arc<Mutex<HashSet<IpAddr>>>,
     /// Cancellation flags for TTL auto-unblock threads.
     /// On remove_block(), the flag is set to true so the sleeping thread
     /// skips the unblock — avoids a double-unblock and misleading log.
@@ -29,14 +29,14 @@ pub struct MacOsEnforcementBackend {
 impl MacOsEnforcementBackend {
     pub fn new() -> Self {
         Self {
-            active_blocks: HashSet::new(),
+            active_blocks: Arc::new(Mutex::new(HashSet::new())),
             cancel_handles: HashMap::new(),
         }
     }
 
     /// Number of currently active blocks — used to enforce MAX_CONCURRENT_BLOCKS.
     pub fn active_block_count(&self) -> usize {
-        self.active_blocks.len()
+        self.active_blocks.lock().map(|g| g.len()).unwrap_or(0)
     }
 
     fn block_ip(ip: IpAddr) -> Result<(), String> {
@@ -95,17 +95,24 @@ impl EnforcementBackend for MacOsEnforcementBackend {
         // (idempotent — pfctl table add is a no-op for an existing entry)
         // but do NOT spawn a second timer. Two timers for the same IP means
         // whichever fires first unblocks it, losing the intended duration.
-        if self.active_blocks.contains(&ip) {
-            Self::block_ip(ip)?;
-            return Ok(EnforcementReceipt {
-                block_id,
-                success: true,
-                message: format!("already blocked {ip}"),
-            });
+        {
+            let blocks = self.active_blocks.lock().map_err(|e| e.to_string())?;
+            if blocks.contains(&ip) {
+                drop(blocks);
+                Self::block_ip(ip)?;
+                return Ok(EnforcementReceipt {
+                    block_id,
+                    success: true,
+                    message: format!("already blocked {ip}"),
+                });
+            }
         }
 
         Self::block_ip(ip)?;
-        self.active_blocks.insert(ip);
+        self.active_blocks
+            .lock()
+            .map_err(|e| e.to_string())?
+            .insert(ip);
 
         // Spawn TTL auto-unblock in a background thread.
         // v1 tradeoff: one OS thread per active block, no cap. Fine at
@@ -116,6 +123,7 @@ impl EnforcementBackend for MacOsEnforcementBackend {
         // unblock without waiting for the sleep to finish.
         let cancelled = Arc::new(AtomicBool::new(false));
         self.cancel_handles.insert(ip, Arc::clone(&cancelled));
+        let active_blocks = Arc::clone(&self.active_blocks);
         std::thread::spawn(move || {
             std::thread::sleep(ttl);
             if cancelled.load(Ordering::Relaxed) {
@@ -124,6 +132,11 @@ impl EnforcementBackend for MacOsEnforcementBackend {
             }
             if let Err(e) = Self::unblock_ip(ip) {
                 error!("TTL unblock failed for {ip}: {e}");
+            } else {
+                // R5: Remove from active_blocks after successful unblock.
+                if let Ok(mut blocks) = active_blocks.lock() {
+                    blocks.remove(&ip);
+                }
             }
             info!("[ENFORCE] TTL expired: unblocked {ip}");
         });
@@ -144,7 +157,10 @@ impl EnforcementBackend for MacOsEnforcementBackend {
         }
 
         Self::unblock_ip(ip)?;
-        self.active_blocks.remove(&ip);
+        self.active_blocks
+            .lock()
+            .map_err(|e| e.to_string())?
+            .remove(&ip);
 
         Ok(EnforcementReceipt {
             block_id,

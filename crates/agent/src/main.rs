@@ -213,6 +213,11 @@ fn main() -> io::Result<()> {
 
     let enrich_pool =
         enrichment::EnrichmentPool::new(geoip_db, reputation, cfg.enrichment.worker_count);
+
+    // Initialize bounded detector worker pool (R1: no per-call thread spawning).
+    synapse_common::init_detector_pool(8);
+    info!("detector worker pool initialized (8 workers)");
+
     let detectors: Vec<Arc<dyn synapse_common::Detector>> = vec![
         Arc::new(detectors::dns_analyzer::DnsAnalyzer::new()),
         Arc::new(detectors::process_correlator::ProcessCorrelator),
@@ -269,6 +274,12 @@ fn main() -> io::Result<()> {
             }
         }
         engine.collect_enrichment_results();
+
+        // R3/R4: Exit cleanly if IPC channel is dead — lets launchd/systemd restart.
+        if let Err(e) = engine.check_ipc_health() {
+            error!("{e}");
+            break;
+        }
     }
 
     info!(

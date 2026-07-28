@@ -15,9 +15,10 @@ pub mod reputation_store;
 
 use std::net::IpAddr;
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+
+use crossbeam_channel::{bounded, Receiver, Sender};
 
 use log::{debug, error, info};
 use maxminddb::Reader;
@@ -154,8 +155,8 @@ impl EnrichmentPool {
         reputation: Option<Arc<ReputationStore>>,
         worker_count: usize,
     ) -> Self {
-        let (req_tx, req_rx) = mpsc::channel::<EnrichmentRequest>();
-        let (res_tx, res_rx) = mpsc::channel::<EnrichmentResult>();
+        let (req_tx, req_rx) = bounded::<EnrichmentRequest>(worker_count * 32);
+        let (res_tx, res_rx) = bounded::<EnrichmentResult>(worker_count * 64);
 
         // Wrap request receiver in Arc<Mutex<>> so workers can share it.
         // Lock contention is minimal — workers hold the lock only while calling recv().
@@ -191,11 +192,11 @@ impl EnrichmentPool {
 
     /// Dispatch an enrichment request to the worker pool.
     /// Returns immediately — does not block the hot path.
-    /// Returns Err if the pool has shut down (all workers exited).
+    /// Returns Err if the pool is saturated (all workers busy) or shut down.
     pub fn dispatch(&self, request: EnrichmentRequest) -> Result<(), String> {
         self.tx
-            .send(request)
-            .map_err(|e| format!("enrichment pool shut down: {e}"))
+            .try_send(request)
+            .map_err(|e| format!("enrichment pool dispatch failed: {e}"))
     }
 
     /// Non-blocking receive of completed enrichment results.
