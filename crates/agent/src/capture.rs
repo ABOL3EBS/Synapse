@@ -557,12 +557,12 @@ impl CaptureEngine {
             synapse_common::Verdict::Allow => {}
             synapse_common::Verdict::Alert { ref reason } => {
                 let remote = determine_remote_ip(a_ip, b_ip, local_ip);
-                info!("ALERT flow={} remote={} {}", flow_id, remote, reason);
+                info!("[ALERT] flow={} remote={} {}", flow_id, remote, reason);
             }
             synapse_common::Verdict::Block { ttl, ref reason } => {
                 let remote = determine_remote_ip(a_ip, b_ip, local_ip);
                 if let Some(skip_reason) = self.should_skip_block(remote) {
-                    warn!("BLOCK skip flow={} — {skip_reason}", flow_id);
+                    warn!("[SKIP] flow={} — {skip_reason}", flow_id);
                 } else {
                     let dominated = self
                         .block_cooldown
@@ -572,14 +572,14 @@ impl CaptureEngine {
                         debug!("BLOCK skip flow={} {remote} (cooldown active)", flow_id);
                     } else {
                         info!(
-                            "BLOCK flow={} remote={remote} ttl={ttl:?} {reason}",
+                            "[BLOCK] flow={} remote={remote} ttl={ttl:?} {reason}",
                             flow_id,
                         );
                         let cmd = EnforcementCommand::Block { ip: remote, ttl };
                         if let Err(e) = protocol::send_message(&mut self.write_half, &cmd) {
                             error!("enforcement send failed for {remote}: {e} — continuing");
                         } else {
-                            info!("enforcement command sent: Block {remote} ttl={ttl:?}");
+                            info!("[ENFORCE] command sent: Block {remote} ttl={ttl:?}");
                             self.block_cooldown.insert(remote, Instant::now() + ttl);
                         }
                     }
@@ -668,7 +668,7 @@ impl CaptureEngine {
 
             if let Some(info_pkt) = parse_ip_frame(frame) {
                 if self.pkt_count.is_multiple_of(10) {
-                    info!(
+                    debug!(
                         "pkt#{}: {}:{} → {}:{} (proto={})",
                         self.pkt_count,
                         info_pkt.src_ip,
@@ -715,7 +715,7 @@ impl CaptureEngine {
 
                 if let flow::FlowUpdate::NewFlow(flow_id) = update {
                     info!(
-                        "flow {} created: {}:{} → {}:{} (proto={}, local_port={}, pid={:?})",
+                        "[FLOW] created #{}: {}:{} → {}:{} (proto={}, local_port={}, pid={:?})",
                         flow_id,
                         info_pkt.src_ip,
                         info_pkt.src_port,
@@ -760,7 +760,7 @@ impl CaptureEngine {
                 match result.kind {
                     synapse_common::EnrichmentKind::DnsReverse => {
                         info!(
-                            "enrich: dns → {}",
+                            "[ENRICH] dns → {}",
                             result.dns_name.as_deref().unwrap_or("?"),
                         );
                         self.tracker.attach_enrichment(
@@ -775,7 +775,7 @@ impl CaptureEngine {
                     }
                     synapse_common::EnrichmentKind::ProcessAttribution => {
                         info!(
-                            "enrich: process → {} (start={:?})",
+                            "[ENRICH] process → {} (start={:?})",
                             result.process_path.as_deref().unwrap_or("?"),
                             result.process_start_time,
                         );

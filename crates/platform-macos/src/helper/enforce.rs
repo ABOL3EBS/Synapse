@@ -52,7 +52,7 @@ impl MacOsEnforcementBackend {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!("pfctl table add failed for {ip}: {stderr}"));
         }
-        info!("pfctl: added {ip} to table '{PF_TABLE_NAME}'");
+        info!("[ENFORCE] added {ip} to table '{PF_TABLE_NAME}'");
         Ok(())
     }
 
@@ -74,7 +74,7 @@ impl MacOsEnforcementBackend {
             let stderr = String::from_utf8_lossy(&output.stderr);
             warn!("pfctl table delete failed for {ip}: {stderr}");
         } else {
-            info!("pfctl: removed {ip} from table '{PF_TABLE_NAME}'");
+            info!("[ENFORCE] removed {ip} from table '{PF_TABLE_NAME}'");
         }
         Ok(())
     }
@@ -120,7 +120,7 @@ impl EnforcementBackend for MacOsEnforcementBackend {
             if let Err(e) = Self::unblock_ip(ip) {
                 error!("TTL unblock failed for {ip}: {e}");
             }
-            info!("TTL expired: unblocked {ip}");
+            info!("[ENFORCE] TTL expired: unblocked {ip}");
         });
 
         Ok(EnforcementReceipt {
@@ -176,7 +176,7 @@ impl EnforcementBackend for MacOsEnforcementBackend {
             return Err(format!("pfctl kill failed: {stderr}"));
         }
 
-        info!("pfctl: killed states {proto_name} {src} → {dst} (all protocols for this pair)");
+        info!("[ENFORCE] killed states {proto_name} {src} → {dst} (all protocols for this pair)");
 
         Ok(EnforcementReceipt {
             block_id: BlockId::from(src),

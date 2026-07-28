@@ -12,7 +12,6 @@ synapse-common = { path = "../common" }
 synapse-platform-macos = { path = "../platform-macos" }
 libc = "0.2"
 log = "0.4"
-env_logger = "0.11"
 maxminddb = "0.30"
 ipnetwork = "0.21"
 toml = "0.8"

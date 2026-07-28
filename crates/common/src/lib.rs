@@ -3,6 +3,7 @@
 // Shared data contracts between synapsed-helper (root) and synapse-agent (unprivileged).
 // Zero logic — just types. Both crates depend on this without pulling in engine internals.
 
+pub mod log_format;
 pub mod types;
 
 use serde::{Deserialize, Serialize};

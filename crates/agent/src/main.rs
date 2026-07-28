@@ -33,7 +33,7 @@ use synapse_platform_macos::protocol;
 // ---------------------------------------------------------------------------
 
 fn main() -> io::Result<()> {
-    env_logger::init();
+    synapse_common::log_format::init_logging();
     let euid = unsafe { libc::geteuid() };
     info!(
         "synapse-agent starting (pid={}, euid={})",

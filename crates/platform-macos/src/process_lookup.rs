@@ -241,7 +241,7 @@ pub fn build_port_pid_cache() -> PortPidCache {
 
     let elapsed = start.elapsed();
 
-    log::info!(
+    log::debug!(
         "port->PID cache: {} entries, {} PIDs, {} fds, {} sockets, {} ok, {:?}",
         entries.len(),
         pid_count,

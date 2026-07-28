@@ -314,7 +314,7 @@ fn ensure_anchor() -> io::Result<()> {
 // ---------------------------------------------------------------------------
 
 fn main() {
-    env_logger::init();
+    synapse_common::log_format::init_logging();
     if let Err(e) = run() {
         log::error!("helper exited with fatal error: {e:?} ({e})");
         std::process::exit(1);
@@ -444,7 +444,7 @@ fn run() -> io::Result<()> {
         loop {
             match protocol::recv_message::<EnforcementCommand>(&mut read_half) {
                 Ok(cmd) => {
-                    info!("received command: {cmd:?}");
+                    info!("[ENFORCE] received command: {cmd:?}");
                     let result = match &cmd {
                         EnforcementCommand::Block { ip, ttl } => {
                             let block = ValidatedBlock { ip: *ip, ttl: *ttl };
