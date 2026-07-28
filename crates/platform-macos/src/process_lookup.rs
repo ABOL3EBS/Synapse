@@ -198,6 +198,11 @@ fn read_port_be(info: &SocketFDInfo, byte_offset: usize) -> u16 {
         byte_offset + 2 <= struct_size,
         "read_port_be: offset {byte_offset} beyond struct size {struct_size}"
     );
+    debug_assert_eq!(
+        info as *const SocketFDInfo as usize % mem::align_of::<u32>(),
+        0,
+        "read_port_be: SocketFDInfo pointer misaligned"
+    );
     let raw = info as *const SocketFDInfo as *const u8;
     let bytes = unsafe { std::slice::from_raw_parts(raw, byte_offset + 2) };
     u16::from_be_bytes([bytes[byte_offset], bytes[byte_offset + 1]])
@@ -385,6 +390,11 @@ fn probe_socket(pid: u32, fd: i32) -> Option<(u16, u16, u8)> {
     let ret =
         unsafe { libc::proc_pidfdinfo(pid as i32, fd, PROC_PIDFDSOCKETINFO, buf_ptr, buf_size) };
 
+    debug_assert!(
+        ret >= mem::size_of::<SocketFDInfo>() as i32 || ret <= 0,
+        "probe_socket: proc_pidfdinfo returned {ret}, expected >= {} or <= 0",
+        mem::size_of::<SocketFDInfo>()
+    );
     let min_size = mem::size_of::<LibProcFDInfo>() + mem::size_of::<SocketInfoProto>() as usize;
     if ret < min_size as i32 {
         return None;

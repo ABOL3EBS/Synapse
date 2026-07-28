@@ -257,7 +257,34 @@ fn open_bpf_device(interface: &str) -> io::Result<std::os::unix::io::OwnedFd> {
 // pfctl — Anchor and Table Management
 // ---------------------------------------------------------------------------
 
+/// Acquire an advisory file lock to serialize concurrent helpers during
+/// `ensure_anchor()`. The lock is auto-released when the returned `OwnedFd`
+/// is dropped.
+fn acquire_pf_lock() -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    let lock_path = "/var/run/synapse-helper.lock";
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|e| io::Error::other(format!("open pf lock: {e}")))?;
+    let fd = file.into_raw_fd();
+    let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
+    if ret != 0 {
+        let err = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(io::Error::other(format!("flock failed: {err}")));
+    }
+    // Safety: we own the fd and it is valid.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
 fn ensure_anchor() -> io::Result<()> {
+    // Serialize concurrent helpers — prevents TOCTOU on /etc/pf.conf.
+    let _lock = acquire_pf_lock()?;
+
     // 1. Flush the anchor to clear stale rules from previous runs or manual testing.
     let flush = std::process::Command::new("pfctl")
         .args(["-a", PF_ANCHOR_NAME, "-F", "all"])
@@ -392,6 +419,19 @@ fn run() -> io::Result<()> {
     std::fs::set_permissions(IPC_SOCKET_PATH, std::fs::Permissions::from_mode(0o666))?;
     info!("listening on {IPC_SOCKET_PATH} (mode 0666, peer-credential auth active)");
 
+    // Signal handler — clean shutdown on SIGINT/SIGTERM.
+    let running = Arc::new(AtomicBool::new(true));
+    {
+        let r = running.clone();
+        ctrlc::set_handler(move || {
+            r.store(false, Ordering::Release);
+        })
+        .map_err(|e| io::Error::other(format!("signal handler: {e}")))?;
+    }
+
+    // Non-blocking accept so we can check the RUNNING flag periodically.
+    listener.set_nonblocking(true)?;
+
     // Resolve expected agent UID once — does not change across connections.
     let expected_uid = expected_agent_uid();
 
@@ -404,9 +444,16 @@ fn run() -> io::Result<()> {
     //    here when the agent disconnects so the next connection can be accepted.
     //    Everything inside is per-connection state that must not leak across loops.
     info!("waiting for synapse-agent to connect...");
-    loop {
+    while running.load(Ordering::Acquire) {
         // --- Accept and authenticate -----------------------------------------
-        let (stream, _addr) = listener.accept()?;
+        let (stream, _addr) = match listener.accept() {
+            Ok(pair) => pair,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         info!("incoming connection");
 
         match get_peer_uid(&stream) {
@@ -460,7 +507,7 @@ fn run() -> io::Result<()> {
             .spawn(move || {
                 let mut writer = write_half;
                 loop {
-                    if cancel_flag.load(Ordering::Relaxed) {
+                    if cancel_flag.load(Ordering::Acquire) {
                         break;
                     }
                     let cache = synapse_platform_macos::process_lookup::build_port_pid_cache();
@@ -472,19 +519,20 @@ fn run() -> io::Result<()> {
                     // Sleep in 1 s increments so cancellation is noticed within 1 s
                     // instead of blocking for the full 5 s interval.
                     for _ in 0..5 {
-                        if cancel_flag.load(Ordering::Relaxed) {
+                        if cancel_flag.load(Ordering::Acquire) {
                             break;
                         }
                         thread::sleep(Duration::from_secs(1));
                     }
                 }
             })
-            .expect("failed to spawn cache-push thread");
+            .map_err(|e| io::Error::other(format!("spawn cache-push: {e}")))?;
 
         // --- Enforcement loop (read half — blocks until agent disconnects) ----
         info!("enforcement loop active");
+        let mut recv_buf = Vec::with_capacity(64 * 1024);
         loop {
-            match protocol::recv_message::<EnforcementCommand>(&mut read_half) {
+            match protocol::recv_message_into::<EnforcementCommand>(&mut read_half, &mut recv_buf) {
                 Ok(cmd) => {
                     info!("[ENFORCE] received command: {cmd:?}");
                     let result = match &cmd {
@@ -540,12 +588,30 @@ fn run() -> io::Result<()> {
         // Signal cache-push thread to stop. It will observe the flag on its next
         // iteration (within 1 s) and exit; the write will also fail once the
         // stream is dropped.
-        cancel.store(true, Ordering::Relaxed);
+        cancel.store(true, Ordering::Release);
         // read_half is dropped here — closes the fd. write_half (moved into the
         // cache thread) is dropped when the thread exits, which happens promptly
         // because the write will fail after the fd closes.
         drop(read_half);
         let _ = cache_handle.join();
+        if !running.load(Ordering::Acquire) {
+            info!("signal received — shutting down...");
+            break;
+        }
         info!("connection torn down, awaiting next agent...");
     }
+
+    // --- Clean shutdown -------------------------------------------------------
+    // Flush the pf block table so a restarted helper starts clean.
+    let flush = std::process::Command::new("pfctl")
+        .args(["-a", PF_ANCHOR_NAME, "-t", PF_TABLE_NAME, "-T", "flush"])
+        .output();
+    if let Ok(o) = flush {
+        if o.status.success() {
+            info!("pf table flushed on shutdown");
+        }
+    }
+    let _ = std::fs::remove_file(IPC_SOCKET_PATH);
+    info!("helper shut down cleanly");
+    Ok(())
 }

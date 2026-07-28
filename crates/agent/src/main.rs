@@ -21,6 +21,7 @@ use std::io;
 use std::net::IpAddr;
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -43,6 +44,16 @@ fn main() -> io::Result<()> {
     );
     if euid == 0 {
         warn!("agent running as root — expected during milestone 1 testing");
+    }
+
+    // Signal handler — clean shutdown on SIGINT/SIGTERM.
+    let running = Arc::new(AtomicBool::new(true));
+    {
+        let r = running.clone();
+        ctrlc::set_handler(move || {
+            r.store(false, Ordering::Release);
+        })
+        .map_err(|e| io::Error::other(format!("signal handler: {e}")))?;
     }
 
     // 1. Connect to helper.
@@ -69,8 +80,9 @@ fn main() -> io::Result<()> {
             .name("ipc-reader".to_string())
             .spawn(move || {
                 let mut reader = read_half;
+                let mut recv_buf = Vec::with_capacity(64 * 1024);
                 loop {
-                    match protocol::recv_message::<IpcMessage>(&mut reader) {
+                    match protocol::recv_message_into::<IpcMessage>(&mut reader, &mut recv_buf) {
                         Ok(IpcMessage::PortPidCache(snapshot)) => {
                             let was_empty = cache.load().is_empty();
                             let new_entries = Arc::new(snapshot.entries);
@@ -98,7 +110,7 @@ fn main() -> io::Result<()> {
                     }
                 }
             })
-            .expect("failed to spawn IPC reader thread");
+            .map_err(|e| io::Error::other(format!("spawn ipc-reader: {e}")))?;
     }
 
     // 6. Query the ACTUAL buffer length the helper configured.
@@ -150,7 +162,7 @@ fn main() -> io::Result<()> {
                     cache.store(Arc::new(new_ips));
                 }
             })
-            .expect("failed to spawn own-ips-refresh thread");
+            .map_err(|e| io::Error::other(format!("spawn own-ips-refresh: {e}")))?;
     }
     {
         let cache = local_ip_cache.clone();
@@ -170,7 +182,7 @@ fn main() -> io::Result<()> {
                     cache.store(Arc::new(new_ip));
                 }
             })
-            .expect("failed to spawn local-ip-refresh thread");
+            .map_err(|e| io::Error::other(format!("spawn local-ip-refresh: {e}")))?;
     }
 
     // Build capture engine — all state lives here.
@@ -260,7 +272,7 @@ fn main() -> io::Result<()> {
     info!("capture started — watching for packets on BPF fd");
 
     // Capture loop — poll() with 100ms timeout so tick() fires even on quiet networks.
-    loop {
+    while running.load(Ordering::Acquire) {
         match engine.run_tick() {
             Ok(true) => {
                 // Data available — read and process packets.

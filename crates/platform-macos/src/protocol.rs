@@ -106,6 +106,14 @@ pub fn send_message<S: Serialize>(stream: &mut UnixStream, msg: &S) -> io::Resul
 }
 
 pub fn recv_message<D: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> io::Result<D> {
+    let mut buf = Vec::new();
+    recv_message_into(stream, &mut buf)
+}
+
+pub fn recv_message_into<D: for<'de> Deserialize<'de>>(
+    stream: &mut UnixStream,
+    buf: &mut Vec<u8>,
+) -> io::Result<D> {
     // Read and validate 4-byte magic prefix.
     let mut magic = [0u8; 4];
     stream.read_exact(&mut magic)?;
@@ -148,8 +156,9 @@ pub fn recv_message<D: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> io
             "empty message payload",
         ));
     }
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload)?;
-    bincode::deserialize(&payload)
+    buf.clear();
+    buf.resize(len, 0);
+    stream.read_exact(buf)?;
+    bincode::deserialize(buf)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("deserialize: {e}")))
 }

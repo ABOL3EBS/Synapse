@@ -126,7 +126,7 @@ impl EnforcementBackend for MacOsEnforcementBackend {
         let active_blocks = Arc::clone(&self.active_blocks);
         std::thread::spawn(move || {
             std::thread::sleep(ttl);
-            if cancelled.load(Ordering::Relaxed) {
+            if cancelled.load(Ordering::Acquire) {
                 // remove_block() already handled unblock — skip.
                 return;
             }
@@ -153,7 +153,7 @@ impl EnforcementBackend for MacOsEnforcementBackend {
 
         // Cancel the TTL auto-unblock thread if it's still sleeping.
         if let Some(cancelled) = self.cancel_handles.remove(&ip) {
-            cancelled.store(true, Ordering::Relaxed);
+            cancelled.store(true, Ordering::Release);
         }
 
         Self::unblock_ip(ip)?;
