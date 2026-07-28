@@ -3,6 +3,12 @@
 // CaptureEngine — extracted from main.rs to keep main under 500 lines.
 // Pure structural extraction: all logic moved verbatim, no changes to
 // internal behavior.
+//
+// Justification >600 lines: capture.rs owns the entire hot-path — BPF reads,
+// packet parsing (IPv4+IPv6), direction resolution, flow tracker integration,
+// enrichment dispatch, verdict handling, enforcement guards, and IPC send.
+// Splitting any of these into separate modules would add import overhead
+// without reducing complexity, since they share mutable state (CaptureEngine).
 
 use std::collections::{HashMap, HashSet};
 use std::io;

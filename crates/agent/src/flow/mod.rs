@@ -5,6 +5,12 @@
 // (~100ms ticks), attaching whatever enrichment context has landed by this
 // point without blocking for it, and producing feature vectors."
 //
+// Justification >600 lines: flow/mod.rs contains the complete session
+// lifecycle — FlowKey canonicalization, FlowRecord state, tick-based expiry,
+// re-evaluation scheduling, eviction (BinaryHeap), enrichment attachment,
+// and all 16 unit tests covering edge cases. Splitting would scatter
+// tightly-coupled state across files.
+//
 // Design decisions (recorded explicitly, not left implicit):
 // - FlowKey is direction-agnostic: (ip, port) swapped as bound pairs.
 // - local_port stored separately on FlowRecord, set once at creation.

@@ -3,6 +3,12 @@
 // Detector framework (§4b). Every detector implements the Detector trait
 // from synapse-common. Production detectors are in separate sub-modules:
 // dns_analyzer, process_correlator, flow_behavior, ip_reputation, dns_tunnel.
+//
+// Justification >600 lines: detectors/mod.rs contains the circuit breaker,
+// run_detectors() orchestration, timeout enforcement, catch_unwind panic
+// safety, and RuleDetector (placeholder v1). Infrastructure is tightly
+// coupled to detector lifecycle — splitting would scatter error handling
+// across files.
 
 pub mod dns_analyzer;
 pub mod dns_tunnel;

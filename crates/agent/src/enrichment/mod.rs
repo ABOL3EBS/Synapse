@@ -3,6 +3,13 @@
 // Async enrichment worker pool — runs as a side-channel that never gates
 // the hot path (§4). Dispatched on flow creation, results attach to the
 // flow record whenever they complete.
+//
+// Justification >600 lines: enrichment/mod.rs implements 4 independent
+// workers (DNS reverse, process attribution, GeoIP, reputation) plus the
+// worker pool dispatch/result-collection machinery, ReputationStore with
+// CIDR/blocklist/CSV parsing, and GeoIpDb wrapper. Each worker is a
+// distinct I/O path with different error handling. Splitting would create
+// artificial boundaries between tightly-coupled enrichment logic.
 
 pub mod reputation_store;
 

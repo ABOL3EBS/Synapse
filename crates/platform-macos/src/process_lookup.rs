@@ -4,6 +4,11 @@
 // §4: "Process attribution via PID + process-start-time resolution
 // (start-time captured alongside PID to avoid PID-reuse/TOCTOU misattribution)"
 //
+// Justification >600 lines: process_lookup.rs owns all libproc FFI — typed
+// structs for kernel data, port→PID cache builder (per-process fd scan),
+// raw BE port reading at verified offsets, and probe_socket. The FFI
+// boundary requires everything in one module for correctness.
+//
 // Also: port→PID cache builder via per-process fd scan (Apple DTS recommended
 // approach: proc_listpids → proc_pidinfo(PROC_PIDLISTFDS) →
 // proc_pidfdinfo(PROC_PIDFDSOCKETINFO)).
