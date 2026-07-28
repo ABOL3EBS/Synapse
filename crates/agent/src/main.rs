@@ -16,7 +16,7 @@ mod detectors;
 mod enrichment;
 mod flow;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::IpAddr;
 use std::os::unix::io::RawFd;
@@ -122,6 +122,33 @@ fn main() -> io::Result<()> {
         Arc::new(Mutex::new(capture::detect_local_ip().inspect(|&ip| {
             info!("local IP detected: {ip}");
         })));
+
+    // Detect default gateway — protected from blocking in handle_verdict.
+    let gateway_ip = capture::detect_default_gateway();
+    match gateway_ip {
+        Some(gw) => info!("default gateway detected: {gw}"),
+        None => warn!("could not detect default gateway — gateway guard disabled"),
+    }
+
+    // Detect ALL own IPs (v4+v6) — never block our own addresses.
+    let own_ips: Arc<Mutex<HashSet<IpAddr>>> = Arc::new(Mutex::new(capture::detect_own_ips()));
+    {
+        let cache = own_ips.clone();
+        let refresh_secs = cfg.local_ip_refresh_secs();
+        std::thread::Builder::new()
+            .name("own-ips-refresh".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(refresh_secs));
+                let new_ips = capture::detect_own_ips();
+                if let Ok(mut guard) = cache.lock() {
+                    if *guard != new_ips {
+                        info!("own IPs refreshed: {} addresses", new_ips.len());
+                        *guard = new_ips;
+                    }
+                }
+            })
+            .expect("failed to spawn own-ips-refresh thread");
+    }
     {
         let cache = local_ip_cache.clone();
         let refresh_secs = cfg.local_ip_refresh_secs();
@@ -209,6 +236,7 @@ fn main() -> io::Result<()> {
         bpf_fd,
         read_buf,
         local_ip_cache,
+        own_ips,
         port_pid_cache,
         enrich_pool,
         tracker,
@@ -218,6 +246,7 @@ fn main() -> io::Result<()> {
         write_half,
         cb_config,
         cfg.poll_timeout_ms(),
+        gateway_ip,
     );
 
     info!("capture started — watching for packets on BPF fd");

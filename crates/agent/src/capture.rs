@@ -4,7 +4,7 @@
 // Pure structural extraction: all logic moved verbatim, no changes to
 // internal behavior.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::IpAddr;
 use std::os::unix::io::RawFd;
@@ -252,6 +252,111 @@ pub fn detect_local_ip() -> Option<IpAddr> {
     result
 }
 
+/// Detect the default gateway IP by parsing `route -n get default`.
+/// Returns the gateway IP if found, None on failure.
+pub fn detect_default_gateway() -> Option<IpAddr> {
+    use std::process::Command;
+
+    let output = Command::new("route")
+        .args(["-n", "get", "default"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(gw) = line.strip_prefix("gateway: ") {
+            let gw = gw.trim();
+            if let Ok(ip) = gw.parse::<IpAddr>() {
+                debug!("detected default gateway: {ip}");
+                return Some(ip);
+            }
+        }
+    }
+    warn!("could not detect default gateway from route output");
+    None
+}
+
+/// Detect ALL local IPs (IPv4 + IPv6) and subnet broadcast addresses.
+/// Broadcast is computed from ifa_netmask alongside each address — same
+/// getifaddrs() call, zero extra syscalls. Returns a HashSet for O(1)
+/// lookup in the block guard.
+pub fn detect_own_ips() -> HashSet<IpAddr> {
+    use std::ffi::CStr;
+
+    let mut ifa_ptr: *mut libc::ifaddrs = std::ptr::null_mut();
+    let ret = unsafe { libc::getifaddrs(&mut ifa_ptr) };
+    if ret != 0 {
+        return HashSet::new();
+    }
+
+    let mut ips = HashSet::new();
+    let mut ptr = ifa_ptr;
+    while !ptr.is_null() {
+        let ifa = unsafe { &*ptr };
+        if ifa.ifa_flags & libc::IFF_LOOPBACK as u32 != 0 {
+            ptr = ifa.ifa_next;
+            continue;
+        }
+        if let Some(ip) = sockaddr_to_ip(ifa.ifa_addr) {
+            if !ip.is_unspecified() {
+                let name = unsafe { CStr::from_ptr(ifa.ifa_name) };
+                debug!("own IP detected: {} on {}", ip, name.to_string_lossy());
+                ips.insert(ip);
+                // Compute subnet broadcast: ip | !mask.
+                if let Some(bcast) = compute_broadcast(ip, ifa.ifa_netmask) {
+                    debug!("subnet broadcast: {} on {}", bcast, name.to_string_lossy());
+                    ips.insert(bcast);
+                }
+            }
+        }
+        ptr = ifa.ifa_next;
+    }
+    unsafe { libc::freeifaddrs(ifa_ptr) };
+    ips
+}
+
+/// Compute subnet broadcast address: ip | !mask.
+/// Handles both IPv4 and IPv6. Returns None on parse failure.
+fn compute_broadcast(ip: IpAddr, netmask: *const libc::sockaddr) -> Option<IpAddr> {
+    let mask_ip = sockaddr_to_ip(netmask)?;
+    match (ip, mask_ip) {
+        (IpAddr::V4(addr), IpAddr::V4(mask)) => {
+            let bcast = u32::from_be_bytes(addr.octets()) | !u32::from_be_bytes(mask.octets());
+            Some(IpAddr::V4(std::net::Ipv4Addr::from(bcast)))
+        }
+        (IpAddr::V6(addr), IpAddr::V6(mask)) => {
+            let addr_bits = u128::from_be_bytes(addr.octets());
+            let mask_bits = u128::from_be_bytes(mask.octets());
+            let bcast = addr_bits | !mask_bits;
+            Some(IpAddr::V6(std::net::Ipv6Addr::from(bcast.to_be_bytes())))
+        }
+        _ => None,
+    }
+}
+
+/// Convert a sockaddr to an IpAddr (IPv4 or IPv6). Returns None for AF_UNIX etc.
+fn sockaddr_to_ip(addr: *const libc::sockaddr) -> Option<IpAddr> {
+    if addr.is_null() {
+        return None;
+    }
+    let sa = unsafe { &*addr };
+    match sa.sa_family as libc::c_int {
+        libc::AF_INET => {
+            let sin = unsafe { &*(addr as *const libc::sockaddr_in) };
+            let octets = sin.sin_addr.s_addr.to_ne_bytes();
+            Some(IpAddr::V4(std::net::Ipv4Addr::new(
+                octets[0], octets[1], octets[2], octets[3],
+            )))
+        }
+        libc::AF_INET6 => {
+            let sin6 = unsafe { &*(addr as *const libc::sockaddr_in6) };
+            let octets = sin6.sin6_addr.s6_addr;
+            Some(IpAddr::V6(std::net::Ipv6Addr::from(octets)))
+        }
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CaptureEngine
 // ---------------------------------------------------------------------------
@@ -260,6 +365,7 @@ pub struct CaptureEngine {
     bpf_fd: RawFd,
     buf: Vec<u8>,
     local_ip_cache: Arc<Mutex<Option<IpAddr>>>,
+    own_ips: Arc<Mutex<HashSet<IpAddr>>>,
     port_pid_cache: Arc<Mutex<HashMap<(u16, u8), u32>>>,
     enrich_pool: EnrichmentPool,
     tracker: FlowTracker,
@@ -269,6 +375,7 @@ pub struct CaptureEngine {
     circuit_breaker: HashMap<synapse_common::DetectorId, detectors::CircuitState>,
     cb_config: detectors::CircuitBreakerConfig,
     block_cooldown: HashMap<IpAddr, Instant>,
+    gateway_ip: Option<IpAddr>,
     write_half: UnixStream,
     pkt_count: u64,
     poll_timeout_ms: i32,
@@ -280,6 +387,7 @@ impl CaptureEngine {
         bpf_fd: RawFd,
         buf: Vec<u8>,
         local_ip_cache: Arc<Mutex<Option<IpAddr>>>,
+        own_ips: Arc<Mutex<HashSet<IpAddr>>>,
         port_pid_cache: Arc<Mutex<HashMap<(u16, u8), u32>>>,
         enrich_pool: EnrichmentPool,
         tracker: FlowTracker,
@@ -289,11 +397,13 @@ impl CaptureEngine {
         write_half: UnixStream,
         cb_config: detectors::CircuitBreakerConfig,
         poll_timeout_ms: i32,
+        gateway_ip: Option<IpAddr>,
     ) -> Self {
         Self {
             bpf_fd,
             buf,
             local_ip_cache,
+            own_ips,
             port_pid_cache,
             enrich_pool,
             tracker,
@@ -303,6 +413,7 @@ impl CaptureEngine {
             circuit_breaker: HashMap::new(),
             cb_config,
             block_cooldown: HashMap::new(),
+            gateway_ip,
             write_half,
             pkt_count: 0,
             poll_timeout_ms,
@@ -374,7 +485,10 @@ impl CaptureEngine {
             .lock()
             .ok()
             .and_then(|g| *g)
-            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)));
+            .unwrap_or_else(|| {
+                warn!("local_ip unknown during expired flow processing — blocks may misroute");
+                IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))
+            });
 
         for &flow_id in expired {
             if let Some(flow_ref) = self.tracker.get(flow_id) {
@@ -402,7 +516,10 @@ impl CaptureEngine {
             .lock()
             .ok()
             .and_then(|g| *g)
-            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)));
+            .unwrap_or_else(|| {
+                warn!("local_ip unknown during re-evaluation — blocks may misroute");
+                IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))
+            });
 
         for &flow_id in re_evaluate {
             if let Some(flow_ref) = self.tracker.get(flow_id) {
@@ -422,11 +539,8 @@ impl CaptureEngine {
         }
     }
 
-    /// Handle a verdict — enforcement via IPC. Verbatim from main.rs.
-    /// Moved verbatim — no logic changes.
+    /// Handle a verdict — enforcement via IPC.
     fn handle_verdict(&mut self, flow_id: u64, verdict: synapse_common::Verdict, local_ip: IpAddr) {
-        // We need common_flow.a_ip and common_flow.b_ip for determine_remote_ip.
-        // Re-fetch the flow to get the canonical key.
         let (a_ip, b_ip) = if let Some(flow_ref) = self.tracker.get(flow_id) {
             (flow_ref.key.a_ip, flow_ref.key.b_ip)
         } else {
@@ -441,20 +555,15 @@ impl CaptureEngine {
             }
             synapse_common::Verdict::Block { ttl, ref reason } => {
                 let remote = determine_remote_ip(a_ip, b_ip, local_ip);
-                // Belt-and-suspenders: never block the local IP, even if
-                // determine_remote_ip() returns it (fallback path).
-                if remote == local_ip {
-                    warn!(
-                        "BLOCK skip flow={} — remote resolved to local IP {remote} (fallback)",
-                        flow_id,
-                    );
+                if let Some(skip_reason) = self.should_skip_block(remote) {
+                    warn!("BLOCK skip flow={} — {skip_reason}", flow_id);
                 } else {
                     let dominated = self
                         .block_cooldown
                         .get(&remote)
                         .is_some_and(|&expires| Instant::now() < expires);
                     if dominated {
-                        debug!("BLOCK skip flow={} {remote} (cooldown active)", flow_id,);
+                        debug!("BLOCK skip flow={} {remote} (cooldown active)", flow_id);
                     } else {
                         info!(
                             "BLOCK flow={} remote={remote} ttl={ttl:?} {reason}",
@@ -471,6 +580,44 @@ impl CaptureEngine {
                 }
             }
         }
+    }
+
+    /// Check whether a remote IP should be exempt from blocking.
+    /// Returns Some(reason) if blocked, None if blocking is allowed.
+    fn should_skip_block(&self, remote: IpAddr) -> Option<&'static str> {
+        // Own IPs (all address families — v4 and v6).
+        let own = self.own_ips.lock().ok()?;
+        if own.contains(&remote) {
+            return Some("remote is own IP");
+        }
+        // Default gateway.
+        if Some(remote) == self.gateway_ip {
+            return Some("remote is default gateway");
+        }
+        match remote {
+            IpAddr::V4(v4) => {
+                if v4.is_broadcast() {
+                    return Some("remote is broadcast");
+                }
+                if v4.is_link_local() {
+                    return Some("remote is link-local");
+                }
+            }
+            IpAddr::V6(v6) => {
+                if v6.is_loopback() || v6.is_unspecified() {
+                    return Some("remote is IPv6 loopback/unspecified");
+                }
+                // fe80::/10 — IPv6 link-local.
+                if v6.octets()[0] == 0xfe && (v6.octets()[1] & 0xc0) == 0x80 {
+                    return Some("remote is IPv6 link-local");
+                }
+            }
+        }
+        // Multicast — protocol-level group addresses, not attacker-controlled hosts.
+        if remote.is_multicast() {
+            return Some("remote is multicast");
+        }
+        None
     }
 
     /// Read BPF packets and process them. Returns Ok(false) on timeout/close.
@@ -540,7 +687,10 @@ impl CaptureEngine {
                         .lock()
                         .ok()
                         .and_then(|g| *g)
-                        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)));
+                        .unwrap_or_else(|| {
+                            warn!("local_ip unknown during packet processing — PID attribution degraded");
+                            IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))
+                        });
                     let (local, _remote) = determine_local_port(
                         info_pkt.src_ip,
                         info_pkt.src_port,
@@ -962,5 +1112,44 @@ mod tests {
             pkt.length, 106,
             "Zero payload_length should fall back to frame_len - 14"
         );
+    }
+
+    #[test]
+    fn test_detect_default_gateway_returns_valid_ip() {
+        let gw = detect_default_gateway();
+        // On any connected Mac, we should get a valid gateway IP.
+        assert!(
+            gw.is_some(),
+            "gateway detection should succeed on a connected host"
+        );
+        let ip = gw.unwrap();
+        // Gateway must not be unspecified or loopback.
+        assert!(!ip.is_unspecified(), "gateway must not be 0.0.0.0");
+        assert!(!ip.is_loopback(), "gateway must not be loopback");
+    }
+
+    #[test]
+    fn test_detect_own_ips_includes_all_local_addresses() {
+        let ips = detect_own_ips();
+        // Must have at least the primary IPv4 address.
+        let has_ipv4 = ips.iter().any(|ip| ip.is_ipv4());
+        assert!(has_ipv4, "own IPs must include at least one IPv4 address");
+
+        // Must contain a subnet broadcast (computed from ifa_netmask).
+        // On any real interface, broadcast != address, so set size > 1.
+        assert!(
+            ips.len() >= 2,
+            "own IPs must include at least one address + its broadcast, got {}",
+            ips.len()
+        );
+
+        // Must not contain loopback or unspecified.
+        for ip in &ips {
+            assert!(!ip.is_loopback(), "own IPs must not contain loopback: {ip}");
+            assert!(
+                !ip.is_unspecified(),
+                "own IPs must not contain unspecified: {ip}"
+            );
+        }
     }
 }
