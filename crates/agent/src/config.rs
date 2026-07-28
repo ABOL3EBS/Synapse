@@ -189,7 +189,6 @@ impl AgentConfig {
             expiry_secs: self.flow.expiry_secs,
             evaluation_interval_secs: self.flow.evaluation_interval_secs,
             max_re_eval_per_tick: self.flow.max_re_eval_per_tick,
-            batch_interval_ticks: self.flow.batch_interval_ticks,
         }
     }
 
@@ -300,7 +299,6 @@ pub struct FlowSection {
     pub expiry_secs: u64,
     pub evaluation_interval_secs: u64,
     pub max_re_eval_per_tick: usize,
-    pub batch_interval_ticks: u64,
 }
 
 impl Default for FlowSection {
@@ -310,7 +308,6 @@ impl Default for FlowSection {
             expiry_secs: 5,
             evaluation_interval_secs: 1,
             max_re_eval_per_tick: 100,
-            batch_interval_ticks: 10,
         }
     }
 }
@@ -422,7 +419,6 @@ mod tests {
         assert_eq!(config.flow.expiry_secs, 5);
         assert_eq!(config.flow.evaluation_interval_secs, 1);
         assert_eq!(config.flow.max_re_eval_per_tick, 100);
-        assert_eq!(config.flow.batch_interval_ticks, 10);
         assert_eq!(config.enrichment.worker_count, 4);
         assert_eq!(config.circuit_breaker.max_failures, 5);
         assert_eq!(config.circuit_breaker.cooldown_secs, 30);

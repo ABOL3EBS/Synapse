@@ -21,9 +21,10 @@ use std::io;
 use std::net::IpAddr;
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 
+use arc_swap::ArcSwap;
 use log::{error, info, warn};
 use synapse_common::{IpcMessage, IPC_SOCKET_PATH};
 use synapse_platform_macos::protocol;
@@ -57,7 +58,9 @@ fn main() -> io::Result<()> {
     let read_half = stream;
 
     // 4. Shared port→PID cache — updated by reader thread, read by main loop.
-    let port_pid_cache: Arc<Mutex<HashMap<(u16, u8), u32>>> = Arc::new(Mutex::new(HashMap::new()));
+    //    P1: ArcSwap for lock-free reads on the hot path.
+    let port_pid_cache: Arc<ArcSwap<HashMap<(u16, u8), u32>>> =
+        Arc::new(ArcSwap::from_pointee(HashMap::new()));
 
     // 5. Spawn IPC reader thread: receives cache pushes from helper.
     {
@@ -69,21 +72,17 @@ fn main() -> io::Result<()> {
                 loop {
                     match protocol::recv_message::<IpcMessage>(&mut reader) {
                         Ok(IpcMessage::PortPidCache(snapshot)) => {
-                            let mut cache = match cache.lock() {
-                                Ok(g) => g,
-                                Err(poisoned) => poisoned.into_inner(),
-                            };
-                            let was_empty = cache.is_empty();
-                            *cache = snapshot.entries;
+                            let was_empty = cache.load().is_empty();
+                            let new_entries = Arc::new(snapshot.entries);
+                            let len = new_entries.len();
+                            cache.store(new_entries);
                             info!(
                                 "port→PID cache updated: {} entries ({} PIDs, {} fds, {:?})",
-                                cache.len(),
-                                snapshot.pid_count,
-                                snapshot.fd_count,
-                                snapshot.elapsed,
+                                len, snapshot.pid_count, snapshot.fd_count, snapshot.elapsed,
                             );
-                            if was_empty && !cache.is_empty() {
-                                let mut keys: Vec<_> = cache.keys().collect();
+                            if was_empty && len > 0 {
+                                let snapshot = cache.load();
+                                let mut keys: Vec<_> = snapshot.keys().collect();
                                 keys.sort();
                                 info!("cache keys (first 20): {:?}", &keys[..keys.len().min(20)]);
                             }
@@ -118,10 +117,12 @@ fn main() -> io::Result<()> {
     info!("configuration loaded (paths: {})", cfg.summary());
 
     // Detect local IP from network interface — used for port→PID direction.
-    let local_ip_cache: Arc<Mutex<Option<IpAddr>>> =
-        Arc::new(Mutex::new(capture::detect_local_ip().inspect(|&ip| {
+    //    P1: ArcSwap for lock-free reads on the hot path.
+    let local_ip_cache: Arc<ArcSwap<Option<IpAddr>>> = Arc::new(ArcSwap::from_pointee(
+        capture::detect_local_ip().inspect(|&ip| {
             info!("local IP detected: {ip}");
-        })));
+        }),
+    ));
 
     // Detect default gateway — protected from blocking in handle_verdict.
     let gateway_ip = capture::detect_default_gateway();
@@ -131,7 +132,9 @@ fn main() -> io::Result<()> {
     }
 
     // Detect ALL own IPs (v4+v6) — never block our own addresses.
-    let own_ips: Arc<Mutex<HashSet<IpAddr>>> = Arc::new(Mutex::new(capture::detect_own_ips()));
+    //    P1: ArcSwap for lock-free reads in should_skip_block.
+    let own_ips: Arc<ArcSwap<HashSet<IpAddr>>> =
+        Arc::new(ArcSwap::from_pointee(capture::detect_own_ips()));
     {
         let cache = own_ips.clone();
         let refresh_secs = cfg.local_ip_refresh_secs();
@@ -140,11 +143,11 @@ fn main() -> io::Result<()> {
             .spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_secs(refresh_secs));
                 let new_ips = capture::detect_own_ips();
-                if let Ok(mut guard) = cache.lock() {
-                    if *guard != new_ips {
-                        info!("own IPs refreshed: {} addresses", new_ips.len());
-                        *guard = new_ips;
-                    }
+                let current = cache.load();
+                if **current != new_ips {
+                    info!("own IPs refreshed: {} addresses", new_ips.len());
+                    drop(current);
+                    cache.store(Arc::new(new_ips));
                 }
             })
             .expect("failed to spawn own-ips-refresh thread");
@@ -157,14 +160,14 @@ fn main() -> io::Result<()> {
             .spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_secs(refresh_secs));
                 let new_ip = capture::detect_local_ip();
-                if let Ok(mut guard) = cache.lock() {
-                    if *guard != new_ip {
-                        match new_ip {
-                            Some(ip) => info!("local IP changed: {:?} → {}", *guard, ip),
-                            None => warn!("local IP lost (interface down?)"),
-                        }
-                        *guard = new_ip;
+                let current = cache.load();
+                if **current != new_ip {
+                    match new_ip {
+                        Some(ip) => info!("local IP changed: {:?} → {}", **current, ip),
+                        None => warn!("local IP lost (interface down?)"),
                     }
+                    drop(current);
+                    cache.store(Arc::new(new_ip));
                 }
             })
             .expect("failed to spawn local-ip-refresh thread");

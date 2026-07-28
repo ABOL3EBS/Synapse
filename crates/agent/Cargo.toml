@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 synapse-common = { path = "../common" }
 synapse-platform-macos = { path = "../platform-macos" }
+arc-swap = "1"
 crossbeam-channel = "0.5"
 libc = "0.2"
 log = "0.4"

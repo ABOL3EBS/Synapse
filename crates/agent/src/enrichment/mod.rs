@@ -639,9 +639,11 @@ mod tests {
             dst_port: 443,
             protocol: 6,
             pid: Some(std::process::id()),
-            kinds: vec![
+            kinds: [
                 EnrichmentKind::DnsReverse,
                 EnrichmentKind::ProcessAttribution,
+                EnrichmentKind::GeoIp,
+                EnrichmentKind::Reputation,
             ],
         };
 

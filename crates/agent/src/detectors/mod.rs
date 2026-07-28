@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use synapse_common::{Detector, DetectorFinding, DetectorId, DetectorStatus, FlowRecord};
 
-use log::{debug, info};
+use log::debug;
 
 // ---------------------------------------------------------------------------
 // Circuit Breaker — per-detector failure tracking with recovery
@@ -207,7 +207,7 @@ pub fn run_detectors(
                 }
             }
 
-            info!(
+            debug!(
                 "detector {:?} on flow {}: score={:.2} status={:?} latency={}us",
                 finding.detector_id,
                 flow.flow_id,

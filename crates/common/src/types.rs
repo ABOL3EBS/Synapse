@@ -202,7 +202,8 @@ pub struct EnrichmentRequest {
     /// PID of the local process, if known (from flow tracker / BPF).
     pub pid: Option<u32>,
     /// Which enrichments to perform.
-    pub kinds: Vec<EnrichmentKind>,
+    /// P4: Fixed array avoids heap allocation per request.
+    pub kinds: [EnrichmentKind; 4],
 }
 
 /// Result of an enrichment lookup. One per `EnrichmentKind` requested.

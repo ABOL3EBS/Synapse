@@ -15,8 +15,10 @@ use std::io;
 use std::net::IpAddr;
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
+
+use arc_swap::ArcSwap;
 
 use log::{debug, error, info, warn};
 use synapse_common::{EnforcementCommand, EnrichmentKind, EnrichmentRequest, PacketInfo};
@@ -383,9 +385,9 @@ fn sockaddr_to_ip(addr: *const libc::sockaddr) -> Option<IpAddr> {
 pub struct CaptureEngine {
     bpf_fd: RawFd,
     buf: Vec<u8>,
-    local_ip_cache: Arc<Mutex<Option<IpAddr>>>,
-    own_ips: Arc<Mutex<HashSet<IpAddr>>>,
-    port_pid_cache: Arc<Mutex<HashMap<(u16, u8), u32>>>,
+    local_ip_cache: Arc<ArcSwap<Option<IpAddr>>>,
+    own_ips: Arc<ArcSwap<HashSet<IpAddr>>>,
+    port_pid_cache: Arc<ArcSwap<HashMap<(u16, u8), u32>>>,
     enrich_pool: EnrichmentPool,
     tracker: FlowTracker,
     decision_engine: crate::decision::DecisionEngine,
@@ -410,9 +412,9 @@ impl CaptureEngine {
     pub fn new(
         bpf_fd: RawFd,
         buf: Vec<u8>,
-        local_ip_cache: Arc<Mutex<Option<IpAddr>>>,
-        own_ips: Arc<Mutex<HashSet<IpAddr>>>,
-        port_pid_cache: Arc<Mutex<HashMap<(u16, u8), u32>>>,
+        local_ip_cache: Arc<ArcSwap<Option<IpAddr>>>,
+        own_ips: Arc<ArcSwap<HashSet<IpAddr>>>,
+        port_pid_cache: Arc<ArcSwap<HashMap<(u16, u8), u32>>>,
         enrich_pool: EnrichmentPool,
         tracker: FlowTracker,
         decision_engine: crate::decision::DecisionEngine,
@@ -508,7 +510,7 @@ impl CaptureEngine {
         }
 
         if !expired.is_empty() || !re_evaluate.is_empty() {
-            info!(
+            debug!(
                 "tick: expired {} flows, re-evaluate {} flows ({} remaining)",
                 expired.len(),
                 re_evaluate.len(),
@@ -525,15 +527,10 @@ impl CaptureEngine {
     /// Run detectors + decision engine on expired flows.
     /// Verbatim extraction from main.rs lines 456-527.
     pub fn process_expired_flows(&mut self, expired: &[u64]) {
-        // Temporarily take local_ip to avoid borrow conflicts.
-        // R9: Recover from mutex poison — keep last-known value rather than aborting.
+        // P1: Lock-free snapshot via arc_swap — no mutex contention on hot path.
         // R10: If local_ip is unknown, skip all expired flow processing —
         // direction resolution requires a known local IP.
-        let local_ip = match *self
-            .local_ip_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-        {
+        let local_ip = match **self.local_ip_cache.load() {
             Some(ip) => ip,
             None => {
                 warn!(
@@ -567,13 +564,10 @@ impl CaptureEngine {
     pub fn process_re_evaluate_flows(&mut self, re_evaluate: &[u64]) {
         // Temporarily take local_ip to avoid borrow conflicts.
         // R9: Recover from mutex poison — keep last-known value rather than aborting.
+        // P1: Lock-free snapshot via arc_swap.
         // R10: If local_ip is unknown, skip all re-evaluation —
         // direction resolution requires a known local IP.
-        let local_ip = match *self
-            .local_ip_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-        {
+        let local_ip = match **self.local_ip_cache.load() {
             Some(ip) => ip,
             None => {
                 warn!(
@@ -656,9 +650,8 @@ impl CaptureEngine {
     /// Returns Some(reason) if blocked, None if blocking is allowed.
     fn should_skip_block(&self, remote: IpAddr) -> Option<&'static str> {
         // Own IPs (all address families — v4 and v6).
-        // R9: Recover from mutex poison — use last-known own_ips rather than
-        // silently allowing blocks through on a poisoned mutex.
-        let own = self.own_ips.lock().unwrap_or_else(|e| e.into_inner());
+        // P1: Lock-free snapshot via arc_swap.
+        let own = self.own_ips.load();
         if own.contains(&remote) {
             return Some("remote is own IP");
         }
@@ -758,23 +751,15 @@ impl CaptureEngine {
                 }
 
                 let (local_port, pid) = {
-                    // R9: Recover from mutex poison — use last-known cache rather than degrading.
-                    let cache_guard = self
-                        .port_pid_cache
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    let cache = cache_guard;
+                    // P1: Lock-free snapshot via arc_swap — no mutex on hot path.
+                    let cache = self.port_pid_cache.load();
                     let lookup = |port: u16, proto: u8| -> Option<(u16, u32)> {
                         let key = (port, proto);
                         cache.get(&key).map(|&pid| (port, pid))
                     };
-                    // R10: If local_ip is unknown, skip direction resolution entirely
-                    // rather than falling back to 0.0.0.0 (which would misclassify packets).
-                    let current_local_ip = match *self
-                        .local_ip_cache
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                    {
+                    // P1 + R10: Lock-free snapshot. If local_ip unknown,
+                    // skip direction resolution rather than misclassifying.
+                    let current_local_ip = match **self.local_ip_cache.load() {
                         Some(ip) => ip,
                         None => {
                             debug!("local_ip unknown — skipping packet (direction unknown)");
@@ -798,7 +783,7 @@ impl CaptureEngine {
                 );
 
                 if let flow::FlowUpdate::NewFlow(flow_id) = update {
-                    info!(
+                    debug!(
                         "[FLOW] created #{}: {}:{} → {}:{} (proto={}, local_port={}, pid={:?})",
                         flow_id,
                         info_pkt.src_ip,
@@ -817,7 +802,7 @@ impl CaptureEngine {
                         dst_port: info_pkt.dst_port,
                         protocol: info_pkt.protocol,
                         pid: if pid != 0 { Some(pid) } else { None },
-                        kinds: vec![
+                        kinds: [
                             EnrichmentKind::DnsReverse,
                             EnrichmentKind::ProcessAttribution,
                             EnrichmentKind::GeoIp,
@@ -844,62 +829,54 @@ impl CaptureEngine {
     }
 
     /// Collect enrichment results and attach to flows (non-blocking).
+    /// P5: Batches results by flow_id — one attach_enrichment call per flow
+    /// instead of one per enrichment kind (reduces HashMap lookups 4x).
     pub fn collect_enrichment_results(&mut self) {
-        for result in self.enrich_pool.drain_results() {
+        use std::collections::HashMap;
+
+        let results = self.enrich_pool.drain_results();
+        if results.is_empty() {
+            return;
+        }
+
+        // Accumulate per-flow enrichment data.
+        #[derive(Default)]
+        struct FlowEnrichment {
+            dns_name: Option<String>,
+            process_path: Option<String>,
+            process_start_time: Option<f64>,
+            country_code: Option<String>,
+            asn: Option<u32>,
+            reputation_score: Option<f32>,
+        }
+
+        let mut batch: HashMap<u64, FlowEnrichment> = HashMap::new();
+        for result in results {
             if result.success {
+                let entry = batch.entry(result.flow_id).or_default();
                 match result.kind {
                     synapse_common::EnrichmentKind::DnsReverse => {
-                        info!(
+                        debug!(
                             "[ENRICH] dns → {}",
                             result.dns_name.as_deref().unwrap_or("?"),
                         );
-                        self.tracker.attach_enrichment(
-                            result.flow_id,
-                            result.dns_name,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                        );
+                        entry.dns_name = result.dns_name;
                     }
                     synapse_common::EnrichmentKind::ProcessAttribution => {
-                        info!(
+                        debug!(
                             "[ENRICH] process → {} (start={:?})",
                             result.process_path.as_deref().unwrap_or("?"),
                             result.process_start_time,
                         );
-                        self.tracker.attach_enrichment(
-                            result.flow_id,
-                            None,
-                            result.process_path,
-                            result.process_start_time,
-                            None,
-                            None,
-                            None,
-                        );
+                        entry.process_path = result.process_path;
+                        entry.process_start_time = result.process_start_time;
                     }
                     synapse_common::EnrichmentKind::GeoIp => {
-                        self.tracker.attach_enrichment(
-                            result.flow_id,
-                            None,
-                            None,
-                            None,
-                            result.country_code,
-                            result.asn,
-                            None,
-                        );
+                        entry.country_code = result.country_code;
+                        entry.asn = result.asn;
                     }
                     synapse_common::EnrichmentKind::Reputation => {
-                        self.tracker.attach_enrichment(
-                            result.flow_id,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            result.reputation_score,
-                        );
+                        entry.reputation_score = result.reputation_score;
                     }
                 }
             } else {
@@ -910,6 +887,19 @@ impl CaptureEngine {
                     result.error.as_deref().unwrap_or("unknown"),
                 );
             }
+        }
+
+        // Single attach_enrichment call per flow (reduces HashMap lookups).
+        for (flow_id, e) in batch {
+            self.tracker.attach_enrichment(
+                flow_id,
+                e.dns_name,
+                e.process_path,
+                e.process_start_time,
+                e.country_code,
+                e.asn,
+                e.reputation_score,
+            );
         }
     }
 }
