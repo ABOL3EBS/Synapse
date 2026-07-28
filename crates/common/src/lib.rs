@@ -14,8 +14,9 @@ pub use types::{
     BlockId, DecisionConfig, DesiredFirewallState, DetectorConfig, DetectorFinding, DetectorId,
     DetectorStatus, EnforcementReceipt, EnrichmentKind, EnrichmentRequest, EnrichmentResult,
     Evidence, FlowFeatures, FlowRecord, PortPidCache, ReconciliationReport, Severity,
-    ValidatedBlock, Verdict,
+    ValidatedBlock, ValidationError, Verdict,
 };
+pub use types::{MAX_BLOCK_TTL, MAX_CONCURRENT_BLOCKS, MIN_BLOCK_TTL};
 
 // Re-export the Detector trait and run_detector_with_timeout function.
 pub use types::{run_detector_with_timeout, Detector};
@@ -98,8 +99,8 @@ pub const IPC_SOCKET_PATH: &str = "/tmp/synapse-helper.sock";
 // ---------------------------------------------------------------------------
 // The only safe execution guarantee isn't just typed data — it's that the
 // implementation uses argv-based process execution, never a shell.
-// ValidatedBlock/BlockId are constructed only through a validation path
-// the caller can't bypass.
+// ValidatedBlock is constructed only via try_new() which validates IP and TTL
+// at the type boundary — the enforcement backend receives pre-validated input.
 
 pub trait EnforcementBackend {
     fn apply_block(&mut self, block: ValidatedBlock) -> Result<EnforcementReceipt, String>;

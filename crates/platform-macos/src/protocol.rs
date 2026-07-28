@@ -102,7 +102,13 @@ pub fn recv_message<D: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> io
     if len > 1024 * 1024 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("too large: {len}"),
+            format!("message too large: {len} bytes (max 1MB)"),
+        ));
+    }
+    if len == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "empty message payload",
         ));
     }
     let mut payload = vec![0u8; len];

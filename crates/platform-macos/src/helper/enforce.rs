@@ -34,6 +34,11 @@ impl MacOsEnforcementBackend {
         }
     }
 
+    /// Number of currently active blocks — used to enforce MAX_CONCURRENT_BLOCKS.
+    pub fn active_block_count(&self) -> usize {
+        self.active_blocks.len()
+    }
+
     fn block_ip(ip: IpAddr) -> Result<(), String> {
         let output = std::process::Command::new("pfctl")
             .args([
@@ -82,23 +87,25 @@ impl MacOsEnforcementBackend {
 
 impl EnforcementBackend for MacOsEnforcementBackend {
     fn apply_block(&mut self, block: ValidatedBlock) -> Result<EnforcementReceipt, String> {
-        let block_id = BlockId::from(block.ip);
+        let ip = block.ip();
+        let ttl = block.ttl();
+        let block_id = BlockId::from(ip);
 
         // If already blocked, keep the original TTL. Re-issue block_ip()
         // (idempotent — pfctl table add is a no-op for an existing entry)
         // but do NOT spawn a second timer. Two timers for the same IP means
         // whichever fires first unblocks it, losing the intended duration.
-        if self.active_blocks.contains(&block.ip) {
-            Self::block_ip(block.ip)?;
+        if self.active_blocks.contains(&ip) {
+            Self::block_ip(ip)?;
             return Ok(EnforcementReceipt {
                 block_id,
                 success: true,
-                message: format!("already blocked {ip}", ip = block.ip),
+                message: format!("already blocked {ip}"),
             });
         }
 
-        Self::block_ip(block.ip)?;
-        self.active_blocks.insert(block.ip);
+        Self::block_ip(ip)?;
+        self.active_blocks.insert(ip);
 
         // Spawn TTL auto-unblock in a background thread.
         // v1 tradeoff: one OS thread per active block, no cap. Fine at
@@ -107,8 +114,6 @@ impl EnforcementBackend for MacOsEnforcementBackend {
         //
         // Cancellation: Arc<AtomicBool> flag lets remove_block() abort the
         // unblock without waiting for the sleep to finish.
-        let ip = block.ip;
-        let ttl = block.ttl;
         let cancelled = Arc::new(AtomicBool::new(false));
         self.cancel_handles.insert(ip, Arc::clone(&cancelled));
         std::thread::spawn(move || {
@@ -126,7 +131,7 @@ impl EnforcementBackend for MacOsEnforcementBackend {
         Ok(EnforcementReceipt {
             block_id,
             success: true,
-            message: format!("blocked {ip} with TTL {ttl:?}", ip = block.ip),
+            message: format!("blocked {ip} with TTL {ttl:?}"),
         })
     }
 

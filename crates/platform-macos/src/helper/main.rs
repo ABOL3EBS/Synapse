@@ -23,7 +23,7 @@ use std::time::Duration;
 use log::{error, info, warn};
 use synapse_common::{
     BlockId, EnforcementBackend, EnforcementCommand, IpcMessage, ValidatedBlock, IPC_SOCKET_PATH,
-    PF_ANCHOR_NAME, PF_TABLE_NAME,
+    MAX_CONCURRENT_BLOCKS, PF_ANCHOR_NAME, PF_TABLE_NAME,
 };
 use synapse_platform_macos::protocol;
 
@@ -77,6 +77,27 @@ fn expected_agent_uid() -> u32 {
     }
     // Fallback: only accept root — safe default when no env var is set.
     unsafe { libc::getuid() }
+}
+
+/// Check whether an IP is unsafe to block/kill at the enforcement boundary.
+/// Defense-in-depth: rejects loopback, multicast, broadcast, link-local,
+/// and unspecified addresses even if the agent's guard was bypassed.
+fn is_unsafe_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_multicast()
+                || v6.is_unspecified()
+                || (v6.octets()[0] == 0xfe && (v6.octets()[1] & 0xc0) == 0x80)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -352,10 +373,22 @@ fn run() -> io::Result<()> {
     }
 
     // 4. Create IPC socket.
-    let _ = std::fs::remove_file(IPC_SOCKET_PATH);
-    let listener = std::os::unix::net::UnixListener::bind(IPC_SOCKET_PATH)?;
-    // 0666 — world-accessible so the agent can physically connect.
-    // Real access control is peer-credential authentication via getpeereid().
+    //    Bind-first pattern: avoid TOCTOU from preemptive remove_file.
+    //    If bind fails with EADDRINUSE (stale socket from previous crash),
+    //    remove the stale socket and retry once.
+    let listener = match std::os::unix::net::UnixListener::bind(IPC_SOCKET_PATH) {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            info!("stale socket detected — removing and rebinding");
+            std::fs::remove_file(IPC_SOCKET_PATH)
+                .map_err(|e| io::Error::other(format!("failed to remove stale socket: {e}")))?;
+            std::os::unix::net::UnixListener::bind(IPC_SOCKET_PATH)?
+        }
+        Err(e) => return Err(e),
+    };
+    // 0666 — world-accessible so the non-root agent can connect.
+    // Real access control is peer-credential authentication via getpeereid()
+    // — see S1 fix below which rejects unauthenticated connections.
     std::fs::set_permissions(IPC_SOCKET_PATH, std::fs::Permissions::from_mode(0o666))?;
     info!("listening on {IPC_SOCKET_PATH} (mode 0666, peer-credential auth active)");
 
@@ -391,21 +424,30 @@ fn run() -> io::Result<()> {
             }
             None => {
                 warn!(
-                    "could not verify peer credentials (getpeereid failed) — \
-                     allowing connection for backward compatibility"
+                    "rejecting connection: could not verify peer credentials \
+                     (getpeereid failed) — refusing unauthenticated access to root daemon"
                 );
-                info!("synapse-agent connected (unauthenticated)");
+                continue;
             }
         }
 
         // --- Handoff BPF fd -------------------------------------------------
-        protocol::send_fd(&stream, bpf_raw_fd)?;
+        if let Err(e) = protocol::send_fd(&stream, bpf_raw_fd) {
+            warn!("fd handoff failed: {e} — rejecting connection");
+            continue;
+        }
         // bpf_fd (OwnedFd) is NOT dropped here — kept alive so we can re-send
         // it to the next agent if the current one disconnects.  The agent's
         // received copy (via SCM_RIGHTS) is independent once the kernel dup's it.
 
         // --- Stream split ----------------------------------------------------
-        let mut read_half = stream.try_clone()?;
+        let mut read_half = match stream.try_clone() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("stream clone failed: {e} — rejecting connection");
+                continue;
+            }
+        };
         let write_half = stream;
 
         // --- Cache-push thread (per-connection) ------------------------------
@@ -447,15 +489,36 @@ fn run() -> io::Result<()> {
                     info!("[ENFORCE] received command: {cmd:?}");
                     let result = match &cmd {
                         EnforcementCommand::Block { ip, ttl } => {
-                            let block = ValidatedBlock { ip: *ip, ttl: *ttl };
-                            backend.apply_block(block).map(|r| r.message)
+                            // S3: Enforce concurrent block limit before validation.
+                            if backend.active_block_count() >= MAX_CONCURRENT_BLOCKS {
+                                Err(format!(
+                                    "block rejected: at capacity ({}/{MAX_CONCURRENT_BLOCKS})",
+                                    backend.active_block_count(),
+                                ))
+                            } else {
+                                // S4: Validate IP and TTL via try_new — rejects
+                                // loopback, multicast, broadcast, link-local,
+                                // unspecified, and out-of-range TTLs.
+                                match ValidatedBlock::try_new(*ip, *ttl) {
+                                    Ok(block) => backend.apply_block(block).map(|r| r.message),
+                                    Err(e) => Err(format!("block rejected for {ip}: {e}")),
+                                }
+                            }
                         }
                         EnforcementCommand::Unblock { ip } => {
                             let block_id = BlockId::from(*ip);
                             backend.remove_block(block_id).map(|r| r.message)
                         }
                         EnforcementCommand::KillState { src, dst, proto } => {
-                            backend.kill_state(*src, *dst, *proto).map(|r| r.message)
+                            // S3: Defense-in-depth — reject dangerous IP pairs
+                            // even if the agent's guard was bypassed.
+                            if is_unsafe_ip(*src) || is_unsafe_ip(*dst) {
+                                Err(format!(
+                                    "kill_state rejected: unsafe IP in pair {src} → {dst}"
+                                ))
+                            } else {
+                                backend.kill_state(*src, *dst, *proto).map(|r| r.message)
+                            }
                         }
                     };
                     if let Err(e) = result {
