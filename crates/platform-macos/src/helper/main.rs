@@ -447,7 +447,14 @@ fn run() -> io::Result<()> {
     while running.load(Ordering::Acquire) {
         // --- Accept and authenticate -----------------------------------------
         let (stream, _addr) = match listener.accept() {
-            Ok(pair) => pair,
+            Ok(pair) => {
+                // Reset to blocking mode — macOS inherits O_NONBLOCK from the
+                // listening socket; the enforcement loop needs blocking reads.
+                pair.0.set_nonblocking(false).map_err(|e| {
+                    io::Error::other(format!("set stream blocking: {e}"))
+                })?;
+                pair
+            }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(100));
                 continue;
