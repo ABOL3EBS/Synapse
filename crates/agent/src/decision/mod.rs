@@ -117,14 +117,25 @@ impl DecisionEngine {
             self.config.min_detectors_for_block
         );
 
-        // Block requires BOTH: score above threshold AND enough detectors agree.
-        // Single-detector scores cannot trigger blocks — prevents noisy detectors
-        // from blocking legitimate traffic.
+        // Override check — single high-confidence finding can bypass
+        // min_detectors_for_block. Only Completed findings are eligible;
+        // TimedOut/Errored have status weight = 0.
+        // override_threshold = 0.85; only CrossFlowDetector's heavy-scan
+        // sub-detector (0.9 × 0.95 = 0.855) crosses it among production detectors.
+        let has_override = findings.iter().any(|f| {
+            if f.status != DetectorStatus::Completed {
+                return false;
+            }
+            f.score * f.confidence >= self.config.override_threshold
+        });
+
+        // Block requires EITHER: override AND score above threshold,
+        // OR score above threshold AND enough detectors agree.
         if total_score >= self.config.block_threshold
-            && detectors_with_score >= self.config.min_detectors_for_block
+            && (has_override || detectors_with_score >= self.config.min_detectors_for_block)
         {
             let ttl = self.compute_ttl(most_severe);
-            let reason = if evidence_summary.is_empty() {
+            let mut reason = if evidence_summary.is_empty() {
                 format!("score {:.2} exceeds block threshold", total_score)
             } else {
                 format!(
@@ -133,6 +144,9 @@ impl DecisionEngine {
                     evidence_summary.join("; ")
                 )
             };
+            if has_override && detectors_with_score < self.config.min_detectors_for_block {
+                reason.push_str(" (override)");
+            }
             Verdict::Block { ttl, reason }
         } else if total_score >= self.config.alert_threshold {
             let reason = if evidence_summary.is_empty() {
@@ -413,6 +427,71 @@ mod tests {
         assert!(
             matches!(verdict, Verdict::Block { .. }),
             "cumulative 0.72 with 3 detectors should trigger Block"
+        );
+    }
+
+    #[test]
+    fn test_override_single_high_confidence_triggers_block() {
+        // CrossFlowDetector heavy scan: score=0.9, conf=0.95 → product=0.855 ≥ 0.85.
+        let engine = DecisionEngine::new(DecisionConfig::default());
+        let features = make_features(1);
+        let findings = vec![make_finding(
+            0.9,
+            0.95,
+            Severity::Critical,
+            DetectorStatus::Completed,
+        )];
+        let verdict = engine.evaluate(&features, &findings);
+        match verdict {
+            Verdict::Block { reason, .. } => {
+                assert!(
+                    reason.contains("override"),
+                    "single-detector override block should mention override, got: {reason}"
+                );
+            }
+            _ => panic!("override product 0.855 should trigger Block"),
+        }
+    }
+
+    #[test]
+    fn test_override_not_triggered_below_threshold() {
+        // IpReputation blocklist: score=1.0, conf=0.8 → product=0.80 < 0.85.
+        let engine = DecisionEngine::new(DecisionConfig::default());
+        let features = make_features(1);
+        let findings = vec![make_finding(
+            1.0,
+            0.8,
+            Severity::Critical,
+            DetectorStatus::Completed,
+        )];
+        let verdict = engine.evaluate(&features, &findings);
+        assert!(
+            !matches!(verdict, Verdict::Block { .. }),
+            "product 0.80 below override 0.85, single detector should NOT block"
+        );
+    }
+
+    #[test]
+    fn test_override_not_triggered_on_timed_out() {
+        // The raw product 0.9 × 0.95 = 0.855 exceeds override_threshold (0.85).
+        // If this finding were Completed, it would trigger the override bypass
+        // and produce a Block verdict via single-detector exception.
+        // Because it is TimedOut, has_override returns false (status check,
+        // not score check) — confirming the override has a hard ineligibility
+        // for non-Completed findings, not just a math issue.
+        let engine = DecisionEngine::new(DecisionConfig::default());
+        let features = make_features(1);
+        let findings = vec![make_finding(
+            0.9,
+            0.95,
+            Severity::Critical,
+            DetectorStatus::TimedOut,
+        )];
+        let verdict = engine.evaluate(&features, &findings);
+        assert!(
+            matches!(verdict, Verdict::Allow),
+            "TimedOut finding (product 0.855) should NOT trigger override — \
+             status check blocks non-Completed findings regardless of score"
         );
     }
 

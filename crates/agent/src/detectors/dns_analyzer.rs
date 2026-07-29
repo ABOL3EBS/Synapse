@@ -25,7 +25,6 @@ pub struct DnsAnalyzer {
     blocklist: HashSet<String>,
     suspicious_tlds: HashSet<&'static str>,
     allowlist: HashSet<String>,
-    cdn_suffixes: HashSet<String>,
 }
 
 impl DnsAnalyzer {
@@ -54,18 +53,10 @@ impl DnsAnalyzer {
             allowlist.insert(domain.to_string());
         }
 
-        // CDN suffixes — high subdomain counts are normal for these domains.
-        // e.g. d1234.cloudfront.net, a1.b2.c3.akadns.net
-        let mut cdn_suffixes = HashSet::new();
-        for suffix in &["cloudfront.net", "akadns.net", "1e100.net", "azure.com"] {
-            cdn_suffixes.insert(suffix.to_string());
-        }
-
         Self {
             blocklist,
             suspicious_tlds,
             allowlist,
-            cdn_suffixes,
         }
     }
 
@@ -120,15 +111,6 @@ impl DnsAnalyzer {
         allowlist
             .iter()
             .any(|a| lower == a.as_str() || lower.ends_with(&format!(".{}", a)))
-    }
-
-    /// Check if hostname ends with a known CDN suffix.
-    /// CDN domains routinely have 5+ labels — label count scoring is exempt.
-    fn is_cdn(hostname: &str, cdn_suffixes: &HashSet<String>) -> bool {
-        let lower = hostname.to_ascii_lowercase();
-        cdn_suffixes
-            .iter()
-            .any(|s| lower == s.as_str() || lower.ends_with(&format!(".{}", s)))
     }
 
     /// Score entropy of the hostname.
@@ -252,24 +234,6 @@ impl Detector for DnsAnalyzer {
                 severity: Severity::Low,
                 evidence: vec![Evidence {
                     description: "DNS name is allowlisted".to_string(),
-                    detail: Some(dns_name.to_string()),
-                }],
-                latency_us: start.elapsed().as_micros() as u64,
-                status: DetectorStatus::Completed,
-            };
-        }
-
-        // CDN check — full short-circuit. CDN domains have high label counts
-        // and long hostnames by design (e.g. d1234.cloudfront.net).
-        if Self::is_cdn(dns_name, &self.cdn_suffixes) {
-            return DetectorFinding {
-                detector_id: self.id(),
-                detector_version: self.version().to_string(),
-                score: 0.0,
-                confidence: 1.0,
-                severity: Severity::Low,
-                evidence: vec![Evidence {
-                    description: "DNS name is on a known CDN suffix".to_string(),
                     detail: Some(dns_name.to_string()),
                 }],
                 latency_us: start.elapsed().as_micros() as u64,
@@ -491,29 +455,34 @@ mod tests {
     }
 
     #[test]
-    fn test_cdn_bypass_cloudfront() {
+    fn test_cdn_now_scored_cloudfront() {
         let analyzer = DnsAnalyzer::new();
+        // CDN carve-out removed — CloudFront domains are now scored for entropy/length/labels.
         let flow = make_flow_with_dns(Some("d1234abcdef.cloudfront.net".to_string()));
         let finding = analyzer.evaluate(&flow);
-        assert_eq!(finding.score, 0.0, "CloudFront CDN should bypass scoring");
+        assert!(
+            finding.score > 0.0,
+            "CloudFront CDN should now be scored (carve-out removed), got {}",
+            finding.score
+        );
     }
 
     #[test]
-    fn test_cdn_label_count_exempt() {
+    fn test_cdn_label_count_now_scored() {
         let analyzer = DnsAnalyzer::new();
-        // 7 labels — would normally trigger label count heuristic.
+        // 7 labels — no longer exempt.
         let flow = make_flow_with_dns(Some("a.b.c.d.e.f.cloudfront.net".to_string()));
         let finding = analyzer.evaluate(&flow);
-        assert_eq!(
-            finding.score, 0.0,
-            "CDN domains should be exempt from label count scoring"
+        assert!(
+            finding.score > 0.0,
+            "CDN domains should no longer be exempt from label count scoring, got {}",
+            finding.score
         );
     }
 
     #[test]
     fn test_non_cdn_high_label_count() {
         let analyzer = DnsAnalyzer::new();
-        // 7 labels on a non-CDN domain — should trigger.
         let flow = make_flow_with_dns(Some("a.b.c.d.e.f.example.com".to_string()));
         let finding = analyzer.evaluate(&flow);
         assert!(

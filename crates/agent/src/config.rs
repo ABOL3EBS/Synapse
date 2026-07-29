@@ -149,6 +149,7 @@ impl AgentConfig {
             max_ttl: Duration::from_secs(self.decision.max_ttl_secs),
             timed_out_weight: self.decision.timed_out_weight,
             errored_weight: self.decision.errored_weight,
+            override_threshold: self.decision.override_threshold,
         }
     }
 
@@ -348,6 +349,7 @@ pub struct DecisionSection {
     pub min_detectors_for_block: usize,
     pub timed_out_weight: f32,
     pub errored_weight: f32,
+    pub override_threshold: f32,
     pub min_ttl_secs: u64,
     pub max_ttl_secs: u64,
     pub ttl_by_severity: TtlBySeverity,
@@ -361,6 +363,7 @@ impl Default for DecisionSection {
             min_detectors_for_block: 2,
             timed_out_weight: 0.1,
             errored_weight: 0.0,
+            override_threshold: 0.85,
             min_ttl_secs: 30,
             max_ttl_secs: 86_400,
             ttl_by_severity: TtlBySeverity::default(),

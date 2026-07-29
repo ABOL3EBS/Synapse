@@ -233,12 +233,21 @@ fn main() -> io::Result<()> {
     synapse_common::init_detector_pool(8);
     info!("detector worker pool initialized (8 workers)");
 
+    let cross_flow_state = Arc::new(std::sync::Mutex::new(
+        detectors::cross_flow::CrossFlowState::new(
+            detectors::cross_flow::CrossFlowConfig::default(),
+        ),
+    ));
+
     let detectors: Vec<Arc<dyn synapse_common::Detector>> = vec![
         Arc::new(detectors::dns_analyzer::DnsAnalyzer::new()),
         Arc::new(detectors::process_correlator::ProcessCorrelator),
         Arc::new(detectors::flow_behavior::FlowBehavior),
         Arc::new(detectors::ip_reputation::IpReputation::new()),
         Arc::new(detectors::dns_tunnel::DnsTunnelDetector),
+        Arc::new(detectors::cross_flow::CrossFlowDetector::new(
+            cross_flow_state.clone(),
+        )),
     ];
     let detector_timeout = cfg.detector_timeout();
     let cb_config = cfg.circuit_breaker_config();
@@ -267,6 +276,7 @@ fn main() -> io::Result<()> {
         cb_config,
         cfg.poll_timeout_ms(),
         gateway_ip,
+        cross_flow_state,
     );
 
     info!("capture started — watching for packets on BPF fd");

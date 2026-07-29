@@ -274,6 +274,8 @@ pub enum DetectorId {
     IpReputation,
     /// DNS tunnel detection — high-entropy subdomains, label anomalies.
     DnsTunnelDetector,
+    /// Cross-flow pattern detection — scan, beacon, DNS burst, connection diversity.
+    CrossFlow,
     /// Catch-all for future detectors.
     Custom(u16),
 }
@@ -498,6 +500,13 @@ pub struct DecisionConfig {
     pub timed_out_weight: f32,
     /// Status weight for Errored findings (zeroed).
     pub errored_weight: f32,
+    /// Score threshold for single-finding override.
+    /// If any single Completed finding's score × confidence >= this value,
+    /// the min_detectors_for_block requirement is bypassed and a Block verdict
+    /// is issued. Default 0.85 — no existing detector reaches this product
+    /// (DnsAnalyzer 0.55, IpReputation 0.80, etc.). Only the CrossFlowDetector's
+    /// heavy-scan sub-detector (0.9 × 0.95 = 0.855) crosses it.
+    pub override_threshold: f32,
 }
 
 impl Default for DecisionConfig {
@@ -517,6 +526,7 @@ impl Default for DecisionConfig {
             max_ttl: Duration::from_secs(86400), // 24 hours
             timed_out_weight: 0.1,
             errored_weight: 0.0,
+            override_threshold: 0.85,
         }
     }
 }

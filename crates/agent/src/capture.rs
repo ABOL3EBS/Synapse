@@ -24,6 +24,7 @@ use log::{debug, error, info, warn};
 use synapse_common::{EnforcementCommand, EnrichmentKind, EnrichmentRequest, PacketInfo};
 
 use crate::detectors;
+use crate::detectors::cross_flow::CrossFlowState;
 use crate::enrichment::EnrichmentPool;
 use crate::flow::{self, FlowTracker};
 use synapse_platform_macos::protocol;
@@ -402,6 +403,8 @@ pub struct CaptureEngine {
     poll_timeout_ms: i32,
     /// Consecutive IPC send failures. Reset on success. Agent exits at threshold.
     ipc_failures: u32,
+    /// Cross-flow state shared with CrossFlowDetector.
+    cross_flow_state: Arc<std::sync::Mutex<CrossFlowState>>,
 }
 
 /// Consecutive IPC failures before the agent exits for launchd/systemd restart.
@@ -424,6 +427,7 @@ impl CaptureEngine {
         cb_config: detectors::CircuitBreakerConfig,
         poll_timeout_ms: i32,
         gateway_ip: Option<IpAddr>,
+        cross_flow_state: Arc<std::sync::Mutex<CrossFlowState>>,
     ) -> Self {
         Self {
             bpf_fd,
@@ -444,6 +448,7 @@ impl CaptureEngine {
             pkt_count: 0,
             poll_timeout_ms,
             ipc_failures: 0,
+            cross_flow_state,
         }
     }
 
@@ -514,6 +519,11 @@ impl CaptureEngine {
                     true
                 }
             });
+        }
+
+        // Purge expired entries from the cross-flow state on every tick.
+        if let Ok(mut state) = self.cross_flow_state.lock() {
+            state.purge_expired();
         }
 
         if !expired.is_empty() || !re_evaluate.is_empty() {
@@ -813,6 +823,26 @@ impl CaptureEngine {
                         local_port,
                         if pid != 0 { Some(pid) } else { None },
                     );
+
+                    // Record cross-flow state (no IPC or blocking, just in-memory stats).
+                    // Re-compute local IP for direction resolution (current_local_ip
+                    // is scoped inside the pid lookup block above).
+                    let cf_local_ip = match **self.local_ip_cache.load() {
+                        Some(ip) => ip,
+                        None => {
+                            debug!("cross-flow: local_ip unknown — skipping record");
+                            continue;
+                        }
+                    };
+                    let remote_ip = if info_pkt.src_ip == cf_local_ip {
+                        info_pkt.dst_ip
+                    } else {
+                        info_pkt.src_ip
+                    };
+                    if let Ok(mut state) = self.cross_flow_state.lock() {
+                        state.record_connection(remote_ip, info_pkt.protocol, info_pkt.dst_port);
+                    }
+
                     let request = EnrichmentRequest {
                         flow_id,
                         src_ip: info_pkt.src_ip,

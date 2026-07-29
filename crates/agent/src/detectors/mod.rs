@@ -10,6 +10,7 @@
 // coupled to detector lifecycle — splitting would scatter error handling
 // across files.
 
+pub mod cross_flow;
 pub mod dns_analyzer;
 pub mod dns_tunnel;
 pub mod flow_behavior;
