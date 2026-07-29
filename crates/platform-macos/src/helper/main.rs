@@ -450,9 +450,9 @@ fn run() -> io::Result<()> {
             Ok(pair) => {
                 // Reset to blocking mode — macOS inherits O_NONBLOCK from the
                 // listening socket; the enforcement loop needs blocking reads.
-                pair.0.set_nonblocking(false).map_err(|e| {
-                    io::Error::other(format!("set stream blocking: {e}"))
-                })?;
+                pair.0
+                    .set_nonblocking(false)
+                    .map_err(|e| io::Error::other(format!("set stream blocking: {e}")))?;
                 pair
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {

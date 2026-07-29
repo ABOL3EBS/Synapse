@@ -37,9 +37,8 @@ use synapse_common::PacketInfo;
 pub struct FlowConfig {
     pub max_flows: usize,
     pub expiry_secs: u64,
-    /// P3: No longer checked in tick() — re-evaluation is driven by queue
-    /// entry timestamps. Kept for config compatibility / documentation.
-    #[allow(dead_code)]
+    /// Minimum time between re-evaluations of the same flow (wall-clock seconds).
+    /// Checked in tick() against now - last_evaluated.
     pub evaluation_interval_secs: u64,
     pub max_re_eval_per_tick: usize,
 }
@@ -229,6 +228,17 @@ impl FlowTracker {
     /// Process a packet: insert or update a flow.
     /// Returns NewFlow (caller should dispatch enrichment) or ExistingFlow.
     pub fn update(&mut self, info: &PacketInfo, local_port: u16, pid: Option<u32>) -> FlowUpdate {
+        debug!(
+            "update() called: {}:{} → {}:{} proto={} local_port={} pid={:?} total_flows={}",
+            info.src_ip,
+            info.src_port,
+            info.dst_ip,
+            info.dst_port,
+            info.protocol,
+            local_port,
+            pid,
+            self.flows.len()
+        );
         let key = FlowKey::from_packet(info);
 
         if let Some(&flow_id) = self.index.get(&key) {
@@ -272,6 +282,19 @@ impl FlowTracker {
         self.flows.insert(flow_id, flow);
         self.eviction_heap.push(Reverse((now, flow_id)));
         // P3: Append to re-evaluation queue (O(1) amortized).
+        // INVARIANT: All push_back calls must maintain monotonically
+        // increasing (entry_time, flow_id) order, because tick() assumes
+        // earlier entries have older or equal last_evaluated times and
+        // breaks on the first entry not yet due by wall-clock. This holds
+        // because (a) evaluation_interval_secs is a single global constant,
+        // and (b) EVERY push goes to the back — creation entries at
+        // flow-creation time and re-evaluation entries at mark_evaluated()
+        // time, both using Instant::now(). If either condition changes,
+        // the break-on-first-not-due logic in tick() breaks silently.
+        debug_assert!(
+            self.re_eval_queue.back().is_none_or(|&(t, _)| t <= now),
+            "re_eval_queue monotonic invariant violated: back time > now"
+        );
         self.re_eval_queue.push_back((now, flow_id));
 
         debug!(
@@ -285,10 +308,15 @@ impl FlowTracker {
     /// re-evaluation. Returns (expired, due_for_re_evaluate).
     ///
     /// - **expired**: flows past expiry_secs idle — caller should evaluate
-    ///   and remove from tracker.
+    ///   and then call `remove_expired()` to reclaim memory.
     /// - **due_for_re_evaluate**: active flows where now - last_evaluated >
     ///   evaluation_interval_secs — caller should re-run detectors and call
     ///   mark_evaluated(). Capped at max_re_eval_per_tick.
+    ///
+    /// IMPORTANT: Expired flows remain in the tracker after tick() returns.
+    /// The caller must evaluate them (run detectors, produce verdicts) and
+    /// then call `remove_expired()` to reclaim memory. This ordering ensures
+    /// flow data is still accessible for evaluation.
     ///
     /// Must be called on every capture-loop iteration (via poll() timeout),
     /// not only when a packet arrives — a quiet-but-stale network must not
@@ -297,21 +325,11 @@ impl FlowTracker {
         let now = Instant::now();
         let mut expired = Vec::new();
 
-        // Expiry via HashMap retain — O(N) but bounded by MAX_FLOWS (100k)
-        // and runs every 100ms. Cost is negligible vs the re-eval scan.
-        self.flows.retain(|&flow_id, flow| {
+        // Identify expired flows but do NOT remove them — caller needs the
+        // data for detector evaluation. Caller must call remove_expired().
+        for (&flow_id, flow) in &self.flows {
             if now.duration_since(flow.last_seen).as_secs() >= self.config.expiry_secs {
                 expired.push(flow_id);
-                false
-            } else {
-                true
-            }
-        });
-
-        // Remove expired flows from the index.
-        for &flow_id in &expired {
-            if let Some(flow) = self.flows.get(&flow_id) {
-                self.index.remove(&flow.key);
             }
         }
 
@@ -340,21 +358,37 @@ impl FlowTracker {
             }
         }
 
-        // P3: O(k) re-evaluation via VecDeque pop-from-front (replaces O(N) HashMap scan).
-        // Entries are ordered by last_evaluated. Stale entries (flow already
-        // re-evaluated since this entry was created) are skipped lazily.
+        // P3: O(k) re-evaluation via VecDeque (entry_time, flow_id) entries.
+        // Stale entries (flow removed or re-evaluated since entry creation)
+        // are popped and skipped. Active entries not yet due by wall-clock
+        // are left in the queue for the next tick.
         let due_for_re_evaluate = {
             let mut due = Vec::new();
             while let Some(&(entry_time, flow_id)) = self.re_eval_queue.front() {
-                let is_stale_or_due = self
-                    .flows
-                    .get(&flow_id)
-                    .is_none_or(|flow| flow.last_evaluated >= entry_time);
-                self.re_eval_queue.pop_front();
-                if is_stale_or_due {
+                let flow = match self.flows.get(&flow_id) {
+                    None => {
+                        self.re_eval_queue.pop_front();
+                        continue;
+                    }
+                    Some(f) => f,
+                };
+                // Skip stale: flow was re-evaluated AFTER this entry was created.
+                if flow.last_evaluated > entry_time {
+                    self.re_eval_queue.pop_front();
                     continue;
                 }
-                // Flow exists and is due for re-evaluation.
+                // Not yet due by wall-clock — leave in queue for next tick.
+                // INVARIANT: We can safely break (rather than continue scanning)
+                // because entries are pushed in monotonically increasing time
+                // order. This entry's last_evaluated is the oldest in the queue;
+                // if it isn't due yet, none of the later entries can be either.
+                // See update() for the full invariant justification.
+                if now.duration_since(flow.last_evaluated).as_secs()
+                    < self.config.evaluation_interval_secs
+                {
+                    break;
+                }
+                self.re_eval_queue.pop_front();
                 due.push(flow_id);
                 if due.len() >= self.config.max_re_eval_per_tick {
                     break;
@@ -448,8 +482,25 @@ impl FlowTracker {
         if let Some(flow) = self.flows.get_mut(&flow_id) {
             let now = Instant::now();
             flow.last_evaluated = now;
-            // P3: Append to re-evaluation queue (stale entries skipped lazily in tick()).
+            // P3: Append to re-evaluation queue. See update() for the
+            // monotonically-increasing-time invariant that makes this safe.
+            debug_assert!(
+                self.re_eval_queue.back().is_none_or(|&(t, _)| t <= now),
+                "re_eval_queue monotonic invariant violated in mark_evaluated"
+            );
             self.re_eval_queue.push_back((now, flow_id));
+        }
+    }
+
+    /// Remove expired flows from the tracker (both the flow map and the
+    /// canonical index). Must be called by the capture loop after running
+    /// detectors and handling verdicts on the expired flow IDs returned
+    /// by tick().
+    pub fn remove_expired(&mut self, expired: &[u64]) {
+        for &flow_id in expired {
+            if let Some(flow) = self.flows.remove(&flow_id) {
+                self.index.remove(&flow.key);
+            }
         }
     }
 
@@ -687,12 +738,14 @@ mod tests {
             flow.last_seen = Instant::now() - std::time::Duration::from_secs(FLOW_EXPIRY_SECS + 1);
         }
 
-        // Now tick should expire it.
+        // Now tick should mark it expired.
         let (expired, re_eval) = tracker.tick();
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0], 1);
+        // Flow is still in tracker until caller explicitly removes it.
+        assert_eq!(tracker.len(), 1);
+        tracker.remove_expired(&expired);
         assert!(tracker.is_empty());
-        // Expired flows are removed — nothing left for re-evaluation.
         assert!(re_eval.is_empty());
     }
 
@@ -893,10 +946,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Test: active flow with stale last_evaluated appears in re-evaluate list.
-    /// A flow that keeps receiving packets never expires, but after 1s without
-    /// re-evaluation it should appear in the due_for_re_evaluate list.
-    /// P3: With VecDeque-based scheduling, re-evaluation fires on the very
-    /// next tick (no batch_interval_ticks gating).
+    /// Exercises the real code path: update() pushes a creation-time entry,
+    /// we backdate last_evaluated to simulate wall-clock passage, and tick()
+    /// should return the flow as due for re-evaluation.
     #[test]
     fn test_tick_returns_re_evaluate_for_stale_last_evaluated() {
         let mut tracker = FlowTracker::new(FlowConfig::default());
@@ -918,16 +970,14 @@ mod tests {
         assert!(re_eval.is_empty());
 
         // Backdate last_evaluated by 2s (past EVALUATION_INTERVAL_SECS).
+        // The creation-time queue entry will become due on the next tick.
         // Keep last_seen fresh so the flow doesn't expire.
-        // P3: Push entry at current time, then backdate — so flow.last_evaluated < entry_time.
         {
-            let entry_time = Instant::now();
-            tracker.re_eval_queue.push_back((entry_time, id));
             tracker.get_mut(id).unwrap().last_evaluated =
-                entry_time - std::time::Duration::from_secs(EVALUATION_INTERVAL_SECS + 1);
+                Instant::now() - std::time::Duration::from_secs(EVALUATION_INTERVAL_SECS + 1);
         }
 
-        // P3: Should appear on the very next tick (no batching).
+        // Should appear on the very next tick (the creation-time entry is now due).
         let (expired, re_eval) = tracker.tick();
         assert!(
             expired.is_empty(),
@@ -941,6 +991,8 @@ mod tests {
 
     /// Test: mark_evaluated() bumps last_evaluated regardless of finding status.
     /// After marking, the flow should NOT appear in re-evaluate on next tick.
+    /// Exercises the real code path: creation-time entry, then mark_evaluated-
+    /// pushed entry.
     #[test]
     fn test_mark_evaluated_prevents_immediate_re_evaluate() {
         let mut tracker = FlowTracker::new(FlowConfig::default());
@@ -956,23 +1008,21 @@ mod tests {
             _ => panic!("expected NewFlow"),
         };
 
-        // Drain the creation-time queue entry (not yet due).
+        // Freshly created flow should not be due for re-evaluation.
         let (_, re_eval) = tracker.tick();
         assert!(re_eval.is_empty(), "freshly created flow should not be due");
 
-        // Backdate last_evaluated + push fresh queue entry to make it due.
+        // Backdate last_evaluated to make the creation-time entry due.
         {
-            let entry_time = Instant::now();
-            tracker.re_eval_queue.push_back((entry_time, id));
             tracker.get_mut(id).unwrap().last_evaluated =
-                entry_time - std::time::Duration::from_secs(EVALUATION_INTERVAL_SECS + 1);
+                Instant::now() - std::time::Duration::from_secs(EVALUATION_INTERVAL_SECS + 1);
         }
 
-        // P3: Should appear on the very next tick.
+        // Should appear on the very next tick (creation-time entry now due).
         let (_, re_eval) = tracker.tick();
         assert_eq!(re_eval.len(), 1);
 
-        // Mark as evaluated — pushes fresh entry at now.
+        // Mark as evaluated — pushes a fresh queue entry at now.
         tracker.mark_evaluated(id);
 
         // Now it should NOT be due on the next tick.
@@ -986,6 +1036,7 @@ mod tests {
     /// Test: MAX_RE_EVAL_PER_TICK caps the re-evaluation batch.
     /// Create more flows than the cap, backdate all their last_evaluated,
     /// verify only MAX_RE_EVAL_PER_TICK are returned on a single tick.
+    /// Exercises the real code path: creation-time entries drive scheduling.
     #[test]
     fn test_re_evaluate_capped_at_max_re_eval_per_tick() {
         let mut tracker = FlowTracker::new(FlowConfig::default());
@@ -1002,17 +1053,18 @@ mod tests {
         }
         assert_eq!(tracker.len(), 150);
 
-        // Backdate all last_evaluated + push fresh queue entries to make them due.
-        let entry_time = Instant::now();
+        // Backdate all last_evaluated to make their creation-time entries due.
+        // Tick() has never been called, so all 150 creation entries are still
+        // in the queue.
         for id in 1..=150 {
-            tracker.re_eval_queue.push_back((entry_time, id));
             if let Some(flow) = tracker.get_mut(id) {
                 flow.last_evaluated =
-                    entry_time - std::time::Duration::from_secs(EVALUATION_INTERVAL_SECS + 1);
+                    Instant::now() - std::time::Duration::from_secs(EVALUATION_INTERVAL_SECS + 1);
             }
         }
 
-        // P3: Should fire on the very next tick, capped at MAX_RE_EVAL_PER_TICK.
+        // Should fire on the very next tick, capped at MAX_RE_EVAL_PER_TICK.
+        // Remaining 50 entries stay in the queue for subsequent ticks.
         let (_, re_eval) = tracker.tick();
         assert_eq!(
             re_eval.len(),
@@ -1021,5 +1073,135 @@ mod tests {
         );
         // All 150 flows are still in the tracker (none expired).
         assert_eq!(tracker.len(), 150);
+    }
+
+    /// Stress test: single flow survives a full re-evaluation cycle and is
+    /// re-evaluated a SECOND time while still active. This proves periodic
+    /// re-evaluation is genuinely happening, not just firing once and then
+    /// going quiet.
+    ///
+    /// Sequence:
+    ///   1. Create flow (queue has creation-time entry, last_evaluated = now)
+    ///   2. Tick → not due yet
+    ///   3. Backdate last_evaluated → tick → first re-evaluation fires
+    ///   4. mark_evaluated() (pushes fresh entry at now)
+    ///   5. Tick → not due yet (fresh entry)
+    ///   6. Backdate last_evaluated again → tick → SECOND re-evaluation fires
+    #[test]
+    fn test_periodic_re_evaluation_cycle() {
+        let mut tracker = FlowTracker::new(FlowConfig::default());
+        let pkt = make_packet(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            5000,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            443,
+            6,
+        );
+        let id = match tracker.update(&pkt, 5000, None) {
+            FlowUpdate::NewFlow(id) => id,
+            _ => panic!("expected NewFlow"),
+        };
+
+        // --- Tick 0: freshly created, not yet due ---
+        let (expired, re_eval) = tracker.tick();
+        assert!(expired.is_empty());
+        assert!(re_eval.is_empty(), "fresh flow should not be due");
+
+        // --- First re-evaluation ---
+        {
+            tracker.get_mut(id).unwrap().last_evaluated =
+                Instant::now() - std::time::Duration::from_secs(EVALUATION_INTERVAL_SECS + 1);
+        }
+
+        let (expired, re_eval) = tracker.tick();
+        assert!(expired.is_empty());
+        assert_eq!(re_eval.len(), 1, "first re-evaluation should fire");
+        assert_eq!(re_eval[0], id);
+
+        // Simulate what process_re_evaluate_flows() does: mark as evaluated.
+        // This pushes a fresh (now, id) entry to the queue.
+        tracker.mark_evaluated(id);
+
+        // Immediately after mark_evaluated: not due.
+        let (expired, re_eval) = tracker.tick();
+        assert!(expired.is_empty());
+        assert!(
+            re_eval.is_empty(),
+            "should not be due immediately after mark_evaluated"
+        );
+
+        // --- Second re-evaluation: advance last_evaluated again ---
+        {
+            tracker.get_mut(id).unwrap().last_evaluated =
+                Instant::now() - std::time::Duration::from_secs(EVALUATION_INTERVAL_SECS + 1);
+        }
+
+        let (expired, re_eval) = tracker.tick();
+        assert!(expired.is_empty());
+        assert_eq!(
+            re_eval.len(),
+            1,
+            "second re-evaluation should fire — periodic re-evaluation is working"
+        );
+        assert_eq!(re_eval[0], id);
+
+        // Flow still in tracker (never expired).
+        assert_eq!(tracker.len(), 1);
+    }
+
+    /// Stress test: multiple flows with staggered evaluation cycles.
+    /// Confirms the queue correctly handles the full cycle: creation entry →
+    /// tick → due → mark_evaluated → new entry → tick → due again.
+    #[test]
+    fn test_mixed_flow_re_evaluation_staggered() {
+        let mut tracker = FlowTracker::new(FlowConfig::default());
+
+        for i in 0..5u16 {
+            let pkt = make_packet(
+                IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8)),
+                5000 + i,
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+                443,
+                6,
+            );
+            tracker.update(&pkt, 5000 + i, None);
+        }
+        assert_eq!(tracker.len(), 5);
+
+        // Tick 0: nothing due yet.
+        let (_, re_eval) = tracker.tick();
+        assert!(re_eval.is_empty());
+
+        // Make ALL 5 flows due.
+        for id in 1..=5 {
+            tracker.get_mut(id).unwrap().last_evaluated =
+                Instant::now() - std::time::Duration::from_secs(EVALUATION_INTERVAL_SECS + 1);
+        }
+
+        // Tick: all 5 creation entries become due.
+        let (_, re_eval) = tracker.tick();
+        assert_eq!(re_eval.len(), 5, "first re-eval: all 5 should fire");
+        for id in 1..=5 {
+            assert!(re_eval.contains(&id), "flow {id} should be in due list");
+        }
+
+        // Mark flows 2 and 3 as evaluated — pushes fresh (now, id) entries.
+        // Flows 1, 4, 5 consumed their creation entries and have nothing
+        // in the queue (they'd need mark_evaluated to get re-queued).
+        tracker.mark_evaluated(2);
+        tracker.mark_evaluated(3);
+
+        // Make flows 2 and 3 due again (backdate + re-queue entry from mark_evaluated).
+        for id in 2..=3 {
+            tracker.get_mut(id).unwrap().last_evaluated =
+                Instant::now() - std::time::Duration::from_secs(EVALUATION_INTERVAL_SECS + 1);
+        }
+
+        // Tick: flows 2 and 3 fire a SECOND time (periodic re-evaluation).
+        // Flows 1, 4, 5 have no queue entries and don't fire.
+        let (_, re_eval) = tracker.tick();
+        assert_eq!(re_eval.len(), 2, "flows 2,3 fire a second time");
+        assert!(re_eval.contains(&2), "flow 2 should fire second time");
+        assert!(re_eval.contains(&3), "flow 3 should fire second time");
     }
 }

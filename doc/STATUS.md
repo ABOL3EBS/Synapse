@@ -1,32 +1,43 @@
 # Implementation Status — Synapse IPS
 
-**Last verified:** 2026-07-28. Ground-truth ledger — if this file and the architecture doc disagree, this file wins.
+**Last verified:** 2026-07-29. Ground-truth ledger — if this file and the architecture doc disagree, this file wins.
+
+## Latest change (2026-07-29)
+
+- **Bug #2 fixed: re-evaluation scheduling broken by VecDeque regression.** The `flow/mod.rs` VecDeque-based re-evaluation queue (`eaa1566`, Jul 28) had a logic error: `flow.last_evaluated >= entry_time` treated creation-time entries (where `last_evaluated == entry_time == now`) as stale and consumed them immediately, leaving the queue permanently empty. Fix:
+  1. Changed stale check to `last_evaluated > entry_time` (strictly greater) — the creation-time `==` case no longer matches as stale.
+  2. Added explicit wall-clock due check `now - last_evaluated < evaluation_interval_secs` → leave entry in queue; only pop when truly due.
+  3. Removed `#[allow(dead_code)]` from `evaluation_interval_secs` — now actively used.
+  4. Rewrote 3 re-evaluation tests that had bypassed the bug by directly injecting into `re_eval_queue` — they now exercise the real code path (creation-time entry → backdate last_evaluated → tick → due).
+
+- Added `info!("[ALLOW] flow={}", flow_id)` to `handle_verdict()` in `capture.rs:620` — Allow verdicts were silently producing zero output, making the detector→decision→enforcement path appear broken. All normal traffic returns Allow (score < 0.3), and the empty match arm `Allow => {}` produced no log line. Now every flow's verdict is visible.
 
 ## Built and working
 
 | Component | File | Lines | Key details |
 |---|---|---|---|
 | Common types | `crates/common/src/lib.rs` | 115 | `EnforcementCommand`, `PacketInfo`, `EnforcementBackend` trait, `EnrichmentRequest`, `EnrichmentResult`, `EnrichmentKind`, IPC constants (`PF_ANCHOR_NAME`, `PF_TABLE_NAME`, `IPC_SOCKET_PATH`), re-exports `Detector`, `run_detector_with_timeout`, `DecisionConfig`, `Verdict`, `FlowFeatures` |
-| Shared types | `crates/common/src/types.rs` | 487 | `ValidatedBlock`, `BlockId`, `DesiredFirewallState`, `EnforcementReceipt`, `ReconciliationReport`, `PortPidCache` (HashMap-based), `IpcMessage` enum, enrichment types, `DetectorId` (7 variants: `RuleEngine`, `ReputationEngine`, `DnsAnalyzer`, `ProcessCorrelator`, `FlowBehavior`, `IpReputation`, `DnsTunnelDetector`, `Custom(u16)`), `Severity` (enum), `Evidence` (`description` + `detail`), `DetectorStatus`, `DetectorFinding`, `Detector` trait (returns single finding), `run_detector_with_timeout()` with `catch_unwind` (panic → `Errored`), `FlowRecord` (canonical `a_ip`/`b_ip` ordering, `Serialize, Deserialize`, `flow_age: Duration`, `process_start_time: Option<f64>`, `asn: Option<u32>`), `DecisionConfig` (block=0.7, alert=0.3, `min_detectors_for_block: 2`, `ttl_by_severity: HashMap<Severity, Duration>`), `Verdict`, `FlowFeatures` (`from_flow()` constructor, `dst_port` = remote port via `local_port` disambiguation) |
+| Shared types | `crates/common/src/types.rs` | 803 | `ValidatedBlock`, `BlockId`, `DesiredFirewallState`, `EnforcementReceipt`, `ReconciliationReport`, `PortPidCache` (HashMap-based), `IpcMessage` enum, enrichment types, `DetectorId` (8 variants: `CrossFlow`, `RuleEngine`, `ReputationEngine`, `DnsAnalyzer`, `ProcessCorrelator`, `FlowBehavior`, `IpReputation`, `DnsTunnelDetector`, `Custom(u16)`), `Severity`, `Evidence`, `DetectorStatus`, `DetectorFinding`, `Detector` trait, `run_detector_with_timeout()` with `catch_unwind`, `FlowRecord`, `DecisionConfig` (block=0.7, alert=0.3, `min_detectors_for_block: 2`, `override_threshold: 0.85`, `ttl_by_severity: HashMap<Severity, Duration>`), `Verdict`, `FlowFeatures` |
 | Log formatter | `crates/common/src/log_format.rs` | 68 | Shared ANSI-colored formatter via `env_logger` + `colored`. `init_logging()` called once per binary. Message-content-aware coloring: `[BLOCK]`=red, `[ENFORCE]`=green, `[ALERT]`/`[SKIP]`=yellow, flow/enrich=cyan. HH:MM:SS timestamps. |
 | Helper daemon | `crates/platform-macos/src/helper/main.rs` | 488 | BPF raw ioctls, SCM_RIGHTS fd handoff, pf anchor init, reconnect loop (accept→enforce→accept), per-connection cache-push thread with `AtomicBool` cancellation. Socket 0666 with `getpeereid()` peer-credential auth. |
 | Enforcement backend | `crates/platform-macos/src/helper/enforce.rs` | 196 | `MacOsEnforcementBackend` — only pfctl executor, idempotent apply_block with AtomicBool TTL cancellation, kill_state, stub reconcile |
 | Process lookup | `crates/platform-macos/src/process_lookup.rs` | 673 | `libproc` crate (v0.14) typed structs for all FFI. **Port→PID cache** (`build_port_pid_cache`): per-process fd scan. **Port reading** via `read_port_be()` — raw BE bytes at verified offsets (268/264), bypasses c_int native-endian corruption on LE ARM. |
-| Agent binary | `crates/agent/src/main.rs` | 280 | Startup + orchestration only. Loads `AgentConfig` (TOML), passes config to all components. BPF fd receive, IPC reader thread, local IP detection, GeoIP/feeds loading via config paths, CaptureEngine creation, capture loop delegation. 5 production detectors registered. Tests for BPF wordalign, packet parsing. |
-| Capture engine | `crates/agent/src/capture.rs` | 1161 | `CaptureEngine` struct: BPF read buffer, packet parsing (IPv4+IPv6 with `payload_length` parsing), flow tracker integration, enrichment dispatch, verdict handling via `handle_verdict()`, active-flow re-evaluation. Direction helpers (`determine_local_port`, `determine_remote_ip`, `detect_local_ip`). **Enforcement guards:** `detect_own_ips()` (all local IPs v4+v6 + subnet broadcasts via `getifaddrs()`), `should_skip_block()` (own IPs, gateway, broadcast, link-local, multicast), `own_ips` with 5s refresh thread. BpfHdr struct. Configurable `poll_timeout_ms` and `CircuitBreakerConfig`. 22 tests. |
+| Agent binary | `crates/agent/src/main.rs` | 316 | Startup + orchestration only. Loads `AgentConfig` (TOML), passes config to all components. BPF fd receive, IPC reader thread, local IP detection, GeoIP/feeds loading via config paths, CaptureEngine creation, capture loop delegation. 6 production detectors (incl. CrossFlow) registered. Tests for BPF wordalign, packet parsing. |
+| Capture engine | `crates/agent/src/capture.rs` | 1282 | `CaptureEngine` struct: BPF read buffer, packet parsing (IPv4+IPv6 with `payload_length` parsing), flow tracker integration, enrichment dispatch, verdict handling via `handle_verdict()`, active-flow re-evaluation, `CrossFlowState` wired (record_connection on NewFlow, purge_expired on tick). Direction helpers. **Enforcement guards.** BpfHdr struct. 22 tests. |
 | Config | `crates/agent/src/config.rs` | 518 | TOML config (`toml = "0.8"`) with `#[serde(default)]` on all structs. `AgentConfig::load()` reads from `SYNAPSE_CONFIG` env or `~/.synapse/synapse.toml`. Missing/malformed → all defaults. Env var overrides for GEOIP_DB_PATH, FEEDS_DIR, SYNAPSE_DB_PATH. Conversion methods: `decision_config()`, `flow_config()`, `circuit_breaker_config()`, `detector_timeout()`, `poll_timeout_ms()`, `geoip_db_path()`, `feeds_dir()`, `storage_db_path()`. 7 tests. |
-| Detector framework | `crates/agent/src/detectors/mod.rs` | 665 | Circuit breaker (`CircuitState` enum: Closed/Open/HalfOpen, configurable cooldown via `CircuitBreakerConfig`), `run_detectors()`, `run_detector_with_timeout()` with `catch_unwind` panic safety. 5 production detector sub-modules. 7 infrastructure tests (circuit breaker + timeout). |
-| DNS Analyzer | `crates/agent/src/detectors/dns_analyzer.rs` | 524 | `DetectorId::DnsAnalyzer` v1.0.0. 7 sub-detectors: entropy, length, longest label, label count, IP literal, blocklist, suspicious TLDs. CDN suffix short-circuit (cloudfront.net, akadns.net, 1e100.net, azure.com). Allowlist short-circuit. Normalized score [0,1]. 11 unit tests. |
+| Detector framework | `crates/agent/src/detectors/mod.rs` | 671 | Circuit breaker, `run_detectors()`, `run_detector_with_timeout()` with `catch_unwind` panic safety. 6 production detector sub-modules (incl. CrossFlow). 7 infrastructure tests. |
+| DNS Analyzer | `crates/agent/src/detectors/dns_analyzer.rs` | 493 | `DetectorId::DnsAnalyzer` v1.0.0. 7 sub-detectors: entropy, length, longest label, label count, IP literal, blocklist, suspicious TLDs. **CDN carve-out removed** — CDN-hosted C2 evaluated normally. Allowlist short-circuit. Normalized score [0,1]. 11 unit tests. |
+| CrossFlow Detector | `crates/agent/src/detectors/cross_flow.rs` | 303 | `DetectorId::CrossFlow` v1.0.0. Per-IP cross-flow analytics via `CrossFlowState` (Arc<Mutex>). 2 active sub-detectors (scan connection count, DNS query burst), 2 planned sub-detectors (beaconing, connection diversity — deferred, needs SQLite). Max-of-sub-detectors scoring. 5 unit tests. |
 | Process Correlator | `crates/agent/src/detectors/process_correlator.rs` | 463 | `DetectorId::ProcessCorrelator` v1.0.0. Contextual behavioral scoring: temp dir execution, shell/interpreter network activity, uncommon binary location (with Homebrew/usr/local/app bundle recognition), unresolved process. **Known-safe allowlist** (31 entries: browsers, OS services, common CLI tools) → score 0.0 immediately. NOT rigid process→port mappings. 10 unit tests. |
 | Flow Behavior | `crates/agent/src/detectors/flow_behavior.rs` | 355 | `DetectorId::FlowBehavior` v1.0.0. 6 sub-detectors: packet rate, bytes/packet (standard port exemption for 80/443/8443 using `remote_port` disambiguation), bulk transfer, scan pattern, burst, protocol/port mismatch. 8 unit tests. |
-| IP Reputation | `crates/agent/src/detectors/ip_reputation.rs` | 343 | `DetectorId::IpReputation` v1.0.0. Blocklist/allowlist/RFC1918 awareness (checks **both** `a_ip` and `b_ip`) + enrichment reputation score. Allowlisted IPs reduce score. Strict zero baseline: unknown public IPs = 0.0 score, 0.0 confidence. 7 unit tests. |
+| IP Reputation | `crates/agent/src/detectors/ip_reputation.rs` | 366 | `DetectorId::IpReputation` v1.0.0. Blocklist/allowlist/RFC1918 awareness (checks **both** IPs) + enrichment reputation score. Allowlisted IPs reduce score. **Expanded blocklist (20 entries).** 7 unit tests. |
 | DNS Tunnel Detector | `crates/agent/src/detectors/dns_tunnel.rs` | 387 | `DetectorId::DnsTunnelDetector` v1.0.0. Only triggers on DNS flows (UDP/53). DNS-over-HTTPS (port 443) returns early with 0.0. 4 sub-detectors: subdomain entropy, longest label, query frequency, payload size. 7 unit tests. |
-| Decision engine | `crates/agent/src/decision/mod.rs` | 449 | `DecisionEngine` with weighted scoring (score × confidence × status_weight), `Verdict` enum (Allow/Block/Alert), `FlowFeatures` extraction, `DecisionConfig` (block=0.7, alert=0.3, `min_detectors_for_block: 2`, severity→TTL map). **Single detector cannot block.** 12 unit tests. Wired into capture loop — Block verdicts send `EnforcementCommand::Block` via IPC to helper |
+| Decision engine | `crates/agent/src/decision/mod.rs` | 522 | `DecisionEngine` with weighted scoring, `Verdict` enum, `FlowFeatures` extraction, `DecisionConfig` (block=0.7, alert=0.3, `min_detectors_for_block: 2`, **`override_threshold: 0.85`**, severity→TTL map). **override_threshold allows single high-confidence detector to block.** 15 unit tests. Wired into capture loop — Block verdicts send `EnforcementCommand::Block` via IPC |
 | Enrichment pool | `crates/agent/src/enrichment/mod.rs` | 715 | Configurable worker count (`std::thread` + `mpsc`), DNS reverse via `getnameinfo`, process attribution via libproc, **GeoIP via maxminddb 0.30** (`GeoIpDb` wrapper over `Arc<Reader<Vec<u8>>>`, `lookup()` returns `(country_code, asn)`, `is_public_ip()` free fn skips RFC1918/loopback/CGNAT/link-local), reputation store |
-| Flow tracker | `crates/agent/src/flow/mod.rs` | 1012 | In-memory session window with configurable tick interval via `FlowConfig`. Direction-agnostic canonicalization, configurable `max_flows` eviction with O(log n) `BinaryHeap`, local_port + PID stored per-flow, enrichment attachment, `last_evaluated` per-flow. `tick()` returns `(expired, due_for_re_evaluate)` tuple. Batched re-evaluation scan. `From` impl populates `flow_age` from `first_seen.elapsed()`. |
-| IPC protocol | `crates/platform-macos/src/protocol.rs` | 112 | `send_fd`/`recv_fd` (SCM_RIGHTS), `send_message`/`recv_message` (bincode, length-prefixed), stream split via `try_clone()` |
+| Flow tracker | `crates/agent/src/flow/mod.rs` | 1045 | In-memory session window with configurable tick interval via `FlowConfig`. Direction-agnostic canonicalization, configurable `max_flows` eviction with O(log n) `BinaryHeap`, local_port + PID stored per-flow, enrichment attachment, `last_evaluated` per-flow. `tick()` returns `(expired, due_for_re_evaluate)` tuple. O(k) VecDeque-based re-evaluation scheduling with wall-clock due check. |
+| IPC protocol | `crates/platform-macos/src/protocol.rs` | 164 | `send_fd`/`recv_fd` (SCM_RIGHTS), `send_message`/`recv_message` (bincode, length-prefixed), stream split via `try_clone()` |
 
-**Total:** 9,011 lines across 19 files. 127 tests (121 agent + 6 platform-macos).
+**Total:** 10,119 lines across 20 files. 151 tests (130 agent + 15 common + 6 platform-macos).
 
 **Verified end-to-end (2026-07-22):** Helper sends PortPidCache (49–51 entries, ~483 PIDs, ~6675 fds, 62–64 probe_ok, ~7–8ms root scan). Agent receives cache, looks up src_port on each packet, resolves to correct PID + executable path. Live test: Brave Browser connection to 142.251.142.74:443 resolved to pid=743 → `Brave Browser Helper`.
 
@@ -55,17 +66,18 @@
 ### Detector framework (§4b) — verified
 
 - `Detector` trait + `DetectorFinding` + `run_detector_with_timeout()` in `common/src/types.rs`
-- **5 production detectors** (all implement `Detector` trait, return `DetectorFinding`):
-  - `DnsAnalyzer`: entropy, length, longest label, label count, IP literal, blocklist, suspicious TLDs. CDN suffix short-circuit.
+- **6 production detectors** (all implement `Detector` trait, return `DetectorFinding`):
+  - `DnsAnalyzer`: entropy, length, longest label, label count, IP literal, blocklist, suspicious TLDs. CDN carve-out removed.
   - `ProcessCorrelator`: contextual behavioral scoring (temp dir execution, shell network activity, uncommon binary location, unresolved process).
   - `FlowBehavior`: packet rate, bytes/packet, bulk transfer, scan pattern, burst, protocol/port mismatch.
   - `IpReputation`: blocklist/allowlist/RFC1918 awareness + enrichment reputation score.
   - `DnsTunnelDetector`: subdomain entropy, longest label, query frequency, payload size (DNS flows only).
+  - `CrossFlowDetector`: per-IP scan/DNS burst detection via shared CrossFlowState.
 - **RuleDetector** (placeholder v1): `dns_blocklist`, `suspicious_port`, `high_packet_count` — ALL THREE produce false positives until real tuning. Kept for backward compat.
 - Timeout enforcement: `run_detector_with_timeout()` runs `evaluate()` on its own thread, uses `recv_timeout()` with configurable budget. Returns `TimedOut` if exceeded.
 - Panic safety: `evaluate()` wrapped in `catch_unwind` — panics produce `Errored` finding instead of crashing the thread.
 - Wired into capture loop on flow expiry AND active-flow re-evaluation
-- **c2 false-positive fix (2026-07-25):** `dns_blocklist` rule's `name.contains("c2")` matched inside `ec2` hostnames (e.g. `ec2-52-73-240-202.compute-1.amazonaws.com`). Fixed: `has_label()` splits on `.`/`-` and checks for standalone label. Regression tests for ec2, malwarebytes, phishing.
+- **c2 false-positive — RuleDetector fixed, DnsAnalyzer still vulnerable (2026-07-29):** The RuleDetector's `dns_blocklist` rule was fixed via `has_label()` (splits on `.`/`-`). **However, DnsAnalyzer's `score_blocklist()` method still uses `lower.contains(b.as_str())`** — substring matching, not label-aware. A hostname like `ec2-malware.com` would match a blocklist entry containing `malware` even though it's a completely different name. See Known shortcomings #6.
 
 ### Decision engine — verified (enforcement live)
 
@@ -77,7 +89,8 @@
 - `FlowFeatures` extracted from FlowRecord
 - `DecisionConfig` with thresholds + severity→TTL map + max TTL clamps
 - **`min_detectors_for_block: 2`** — single detector cannot trigger Block
-- 12 unit tests pass
+- **`override_threshold: 0.85`** — single high-confidence detector CAN trigger Block
+- 15 unit tests pass
 - Wired into capture loop — Block verdicts send `EnforcementCommand::Block` via IPC to helper
 
 ### Active-flow re-evaluation — verified
@@ -111,15 +124,18 @@
 
 5. **Decision engine treats unavailable detectors as silent zeros** — A circuit-broken, timed-out, or errored detector returns `TimedOut { score: 0, confidence: 0 }`, contributing nothing to the verdict. A degraded pipeline (multiple detectors unavailable) produces normal-looking verdicts with reduced visibility. TODO in `decision/mod.rs` documents the planned `DetectorHealth` metadata fix.
 
+6. **DnsAnalyzer blocklist uses substring matching, not label-aware** — `score_blocklist()` at `dns_analyzer.rs:188` calls `lower.contains(b.as_str())`. A blocklist entry for `malware` matches any hostname containing `malware` anywhere (e.g. `legitimate-malware-analysis.com`). Same bug class as the original RuleDetector `ec2`/`c2` false-positive, but in a different code path. RuleDetector was fixed via `has_label()`; DnsAnalyzer remains unfixed because its blocklist is currently small (3 test entries) and the false-positive surface in probe testing was acceptable. Fix: replace `contains` with label-aware matching in a follow-up.
+
 ## Crash history
 
 | Date | Error | Duration before crash | Backtrace | Reproduced? | Root cause |
 |---|---|---|---|---|---|
 | 2026-07-23 | `Os { code: 13, kind: PermissionDenied }` | ~18s | No | No — not reproduced across 60s run (30s+60s) or 10-minute run (73,500+ packets) | Unexplained, not reproduced |
 | 2026-07-23 | Helper crash during 3-cycle reconnect test | Cycle 2→3 transition | No | No — not reproduced across 6 reconnect cycles post-diagnostic-wrapper (two clean 3-cycle runs) | Unconfirmed. Diagnostic wrapper logs error but does not prevent it. Root cause unknown. |
-| 2026-07-25 | False-positive block of own machine (192.168.0.102) | N/A — not a crash | N/A | Yes — deterministic. `dns_blocklist` rule's `name.contains("c2")` matched inside `ec2` in AWS EC2 hostnames. Fixed: `has_label()` splits on `.`/`-` and checks for standalone label. Regression tests for ec2, malwarebytes, phishing. | Rule bug: substring match on `c2` matched within `ec2-...` hostnames. All AWS EC2 traffic false-positived. |
+| 2026-07-25 | False-positive block of own machine (192.168.0.102) | N/A — not a crash | N/A | Yes — deterministic. RuleDetector's `dns_blocklist` rule's `name.contains("c2")` matched inside `ec2` in AWS EC2 hostnames. **RuleDetector fixed** via `has_label()`. **DnsAnalyzer still vulnerable** — see Known shortcomings #6. | Rule bug: substring match on `c2` matched within `ec2-...` hostnames. All AWS EC2 traffic false-positived. |
 | 2026-07-25 | Enforcement targets local IP instead of remote | N/A — not a crash | N/A | Yes — deterministic. `common_flow.dst_ip` reads `flow.key.b_ip` (the numerically larger IP). For flows where local IP > remote IP (e.g. 192.168.0.102 > 52.73.240.202), `b_ip` is the local machine. Fixed: `determine_remote_ip()` uses `is_local(ip)` to identify the remote endpoint. `FlowRecord.dst_ip` renamed to `b_ip` to prevent future confusion. 4 regression tests. Live verified: pfctl table shows remote IPs (172.65.90.23, 17.57.146.59), not 192.168.0.102. | Same class of bug as the original local_port issue — canonical key ordering loses direction info. |
 | 2026-07-28 | Mass false-positive blocking all legitimate traffic | N/A — not a crash | N/A | Yes — 3 design flaws combined. Fixed: (1) FlowBehavior bpp port check now uses `remote_port` via `local_port` disambiguation, not canonical `b_port`. (2) IpReputation RFC1918 check on both `a_ip` and `b_ip`. (3) DecisionEngine: block_threshold 0.5→0.7, alert_threshold 0.2→0.3, `min_detectors_for_block: 2`. (4) ProcessCorrelator known-safe allowlist (31 entries). (5) Deleted `/tmp/synapse-test.toml` (block_threshold=0.01 test config). 127 tests. | Test config with dangerously low threshold (`/tmp/synapse-test.toml`) plus FlowBehavior using canonical `b_port` (local ephemeral port) instead of remote port for standard port exemption. IpReputation only checked `b_ip` for RFC1918. |
+| 2026-07-29 | Re-evaluation dead code (every flow evaluated once at expiry, never re-checked during lifetime) | N/A — not a crash | N/A | Yes — deterministic. VecDeque introduced in `eaa1566` (Jul 28) replaced working HashMap scan. `last_evaluated >= entry_time` treated creation-time entries as stale (both equal `now`) and consumed them immediately. Queue permanently empty. **Tests bypassed the bug** by injecting queue entries directly. Fix: strict `>` stale check + wall-clock due guard. All 3 re-eval tests rewritten to exercise real code path. | VecDeque logic error: stale check `>=` instead of `>`. No review — applied directly to main ("hot path optimizations"). No test exercised the real `update()`→queue→`tick()`→due cycle. |
 
 **Investigation performed (EACCES crash):** Agent code audited for file I/O outside BPF/IPC — zero matches. Grep for `File::open`, `fs::write`, `database`, `GeoIP` — all field-name false positives. `RUST_BACKTRACE=full` set for all subsequent runs. No backtrace captured because the crash did not reproduce.
 
@@ -152,4 +168,4 @@
 
 | 10 | Helper reconnect loop (accept→enforce→accept) with per-connection cache-push cancellation via `Arc<AtomicBool>` | `platform-macos/helper/main.rs` | Verified |
 
-All 125 tests pass. clippy clean. fmt clean.
+All 151 tests pass. clippy clean. fmt clean.

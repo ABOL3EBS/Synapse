@@ -493,6 +493,13 @@ impl CaptureEngine {
         // Always tick on every iteration — even on timeout.
         // Expires stale flows and reclaims memory.
         let (expired, re_evaluate) = self.tracker.tick();
+        info!(
+            "poll_ret={} expired={} re_evaluate={} flows={}",
+            poll_ret,
+            expired.len(),
+            re_evaluate.len(),
+            self.tracker.len()
+        );
 
         // R6: Sweep block_cooldown on every tick, not only inside the
         // expired/re_evaluate guard — prevents stale entries from piling up
@@ -518,6 +525,7 @@ impl CaptureEngine {
             );
 
             self.process_expired_flows(&expired);
+            self.tracker.remove_expired(&expired);
             self.process_re_evaluate_flows(&re_evaluate);
         }
 
@@ -606,7 +614,9 @@ impl CaptureEngine {
         };
 
         match verdict {
-            synapse_common::Verdict::Allow => {}
+            synapse_common::Verdict::Allow => {
+                info!("[ALLOW] flow={}", flow_id);
+            }
             synapse_common::Verdict::Alert { ref reason } => {
                 let remote = determine_remote_ip(a_ip, b_ip, local_ip);
                 info!("[ALERT] flow={} remote={} {}", flow_id, remote, reason);
@@ -707,6 +717,7 @@ impl CaptureEngine {
             return Ok(false);
         }
         let n = n as usize;
+        debug!("BPF read: {} bytes from fd={}", n, self.bpf_fd);
 
         let mut offset = 0usize;
         while offset + BpfHdr::SIZE <= n {
@@ -738,6 +749,14 @@ impl CaptureEngine {
             let frame = &self.buf[data_start..data_end];
 
             if let Some(info_pkt) = parse_ip_frame(frame) {
+                debug!(
+                    "parsed packet: {}:{} → {}:{} proto={}",
+                    info_pkt.src_ip,
+                    info_pkt.src_port,
+                    info_pkt.dst_ip,
+                    info_pkt.dst_port,
+                    info_pkt.protocol
+                );
                 if self.pkt_count.is_multiple_of(10) {
                     debug!(
                         "pkt#{}: {}:{} → {}:{} (proto={})",
