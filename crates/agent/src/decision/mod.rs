@@ -110,6 +110,16 @@ impl DecisionEngine {
             );
         }
 
+        // Cap at 1.0. Without this, several mediocre findings can combine via
+        // simple addition to reach block_threshold (0.7) even though no single
+        // finding has the individual confidence the override_threshold (0.85)
+        // mechanism deliberately requires. That path was never designed or
+        // verified — it lets corroboration be faked by quantity rather than
+        // quality. The override path is the explicit, reasoned exception to
+        // corroboration; uncapped summation was an implicit, unintended second
+        // exception that bypassed both min_detectors_for_block and override_threshold.
+        let total_score = total_score.min(1.0);
+
         debug!(
             "decision: flow={} total_score={:.4} detectors_with_score={} threshold(block={:.2}, alert={:.2}, min_detectors={})",
             features.flow_id,
