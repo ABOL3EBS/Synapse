@@ -15,6 +15,7 @@ mod decision;
 mod detectors;
 mod enrichment;
 mod flow;
+mod storage;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -261,22 +262,36 @@ fn main() -> io::Result<()> {
     let decision_engine = decision::DecisionEngine::new(cfg.decision_config());
     info!("decision engine initialized");
 
+    // SQLite storage worker (enforcement_log only — graceful degradation).
+    let storage_worker = storage::StorageWorker::start(cfg.storage_db_path());
+    let storage_tx = storage_worker.as_ref().map(|w| w.event_tx());
+    if storage_worker.is_some() {
+        info!("storage worker initialized (enforcement_log)");
+    }
+
+    let cap_config = capture::CaptureConfig {
+        poll_timeout_ms: cfg.poll_timeout_ms(),
+        detector_timeout,
+        cb_config,
+        gateway_ip,
+    };
+    let net_caches = capture::NetworkCaches {
+        local_ip: local_ip_cache,
+        own_ips,
+        port_pid: port_pid_cache,
+    };
     let mut engine = capture::CaptureEngine::new(
         bpf_fd,
         read_buf,
-        local_ip_cache,
-        own_ips,
-        port_pid_cache,
+        net_caches,
         enrich_pool,
         tracker,
         decision_engine,
         detectors,
-        detector_timeout,
         write_half,
-        cb_config,
-        cfg.poll_timeout_ms(),
-        gateway_ip,
+        cap_config,
         cross_flow_state,
+        storage_tx,
     );
 
     info!("capture started — watching for packets on BPF fd");
@@ -312,5 +327,9 @@ fn main() -> io::Result<()> {
         engine.pkt_count(),
         engine.flows_tracked()
     );
+    drop(engine);
+    if let Some(worker) = storage_worker {
+        worker.shutdown();
+    }
     Ok(())
 }

@@ -2,6 +2,25 @@
 
 **Last verified:** 2026-07-29. Ground-truth ledger — if this file and the architecture doc disagree, this file wins.
 
+## Latest change (2026-07-30)
+
+- **Storage subsystem built (crash-safe, tiered-durability SQLite).** Full implementation across 5 files (1140 lines). Key properties:
+  - **Crash-safe spool:** separate SQLite (`synapse-spool.db`) with `synchronous=FULL; journal_mode=DELETE`. Every `EnforcementRequested` event is appended to the spool *before* the main DB write. On startup, unconfirmed spool entries are replayed via `INSERT OR IGNORE` (idempotent) into the main DB and then confirmed — enforcement records survive agent crash.
+  - **Three `StorageEvent` variants:** `EnforcementRequested` (Critical — goes to spool first), `VerdictDecided` (Important — Alert/Block verdicts with full findings), `CircuitBreakerTransition` (Important — detector health history).
+  - **Binary IP storage:** IPs stored as 16-byte BLOB (IPv4-mapped IPv6 form) for exact-match lookups plus TEXT (human-readable) for queries — both columns always populated.
+  - **SQLite hardening:** `WAL; foreign_keys=ON; trusted_schema=OFF; secure_delete=ON` applied on every connection open.
+  - **Versioned schema** via `PRAGMA user_version` — V1 DDL applied once, future versions apply `ALTER TABLE` incrementally.
+  - **Retention:** enforcement_log 90d, verdicts+findings (CASCADE) 7d, CB events 7d — pruned every 2000th batch.
+  - **Read path:** `StorageReader` (separate read-only connection, `query_only=ON`) with `recent_verdicts`, `verdict_findings`, `recent_enforcement`, `detector_health`, `kpi_since` — ready for Tauri IPC when wired up.
+  - **Boot ID:** `timestamp_nanos XOR Fibonacci_hash(pid)` — unique per process startup, prefixed to event IDs so cross-restart `INSERT OR IGNORE` deduplication is correct.
+  - 3 new tests: `test_ip_roundtrip_v4`, `test_ip_roundtrip_v6`, `test_spool_append_and_confirm`.
+
+- **`decision/mod.rs`: `evaluate()` now returns `(Verdict, f32)`.** Composite score was computed internally and discarded; surfacing it as the second return value lets `capture.rs` store it in `VerdictDecided` without re-computation. All 15 decision tests updated.
+
+- **`detectors/mod.rs`: `run_detectors()` now returns `(Vec<DetectorFinding>, Vec<CbTransition>)`.** Circuit breaker state transitions are collected during detection and returned as a second value rather than threading a `storage_tx` into the detector module. `capture.rs` calls `emit_cb_transitions()` with the returned vec — keeps all storage coupling at the capture layer. `CbTransition` struct added to `detectors/mod.rs`. All detector tests updated.
+
+- **`capture.rs`: `handle_verdict()` emits `VerdictDecided` and `EnforcementRequested`.** Now emits `VerdictDecided` for Alert and Block verdicts (before enforcement IPC), then `EnforcementRequested` for Block verdicts (with `send_error: None/Some` tracking whether IPC succeeded). `emit_cb_transitions()` helper method added.
+
 ## Latest change (2026-07-29)
 
 - **Bug #2 fixed: re-evaluation scheduling broken by VecDeque regression.** The `flow/mod.rs` VecDeque-based re-evaluation queue (`eaa1566`, Jul 28) had a logic error: `flow.last_evaluated >= entry_time` treated creation-time entries (where `last_evaluated == entry_time == now`) as stale and consumed them immediately, leaving the queue permanently empty. Fix:
@@ -23,21 +42,22 @@
 | Enforcement backend | `crates/platform-macos/src/helper/enforce.rs` | 196 | `MacOsEnforcementBackend` — only pfctl executor, idempotent apply_block with AtomicBool TTL cancellation, kill_state, stub reconcile |
 | Process lookup | `crates/platform-macos/src/process_lookup.rs` | 673 | `libproc` crate (v0.14) typed structs for all FFI. **Port→PID cache** (`build_port_pid_cache`): per-process fd scan. **Port reading** via `read_port_be()` — raw BE bytes at verified offsets (268/264), bypasses c_int native-endian corruption on LE ARM. |
 | Agent binary | `crates/agent/src/main.rs` | 316 | Startup + orchestration only. Loads `AgentConfig` (TOML), passes config to all components. BPF fd receive, IPC reader thread, local IP detection, GeoIP/feeds loading via config paths, CaptureEngine creation, capture loop delegation. 6 production detectors (incl. CrossFlow) registered. Tests for BPF wordalign, packet parsing. |
-| Capture engine | `crates/agent/src/capture.rs` | 1282 | `CaptureEngine` struct: BPF read buffer, packet parsing (IPv4+IPv6 with `payload_length` parsing), flow tracker integration, enrichment dispatch, verdict handling via `handle_verdict()`, active-flow re-evaluation, `CrossFlowState` wired (record_connection on NewFlow, purge_expired on tick). Direction helpers. **Enforcement guards.** BpfHdr struct. 22 tests. |
+| Capture engine | `crates/agent/src/capture.rs` | 1528 | `CaptureEngine` struct: BPF read buffer, packet parsing (IPv4+IPv6 with `payload_length` parsing), flow tracker integration, enrichment dispatch, verdict handling via `handle_verdict()`, active-flow re-evaluation, `CrossFlowState` wired (record_connection on NewFlow, purge_expired on tick). Direction helpers. **Enforcement guards.** BpfHdr struct. `handle_verdict()` emits `VerdictDecided` (Alert+Block) and `EnforcementRequested` (Block) to storage worker. `emit_cb_transitions()` emits circuit-breaker state changes. 22 tests. |
 | Config | `crates/agent/src/config.rs` | 518 | TOML config (`toml = "0.8"`) with `#[serde(default)]` on all structs. `AgentConfig::load()` reads from `SYNAPSE_CONFIG` env or `~/.synapse/synapse.toml`. Missing/malformed → all defaults. Env var overrides for GEOIP_DB_PATH, FEEDS_DIR, SYNAPSE_DB_PATH. Conversion methods: `decision_config()`, `flow_config()`, `circuit_breaker_config()`, `detector_timeout()`, `poll_timeout_ms()`, `geoip_db_path()`, `feeds_dir()`, `storage_db_path()`. 7 tests. |
-| Detector framework | `crates/agent/src/detectors/mod.rs` | 671 | Circuit breaker, `run_detectors()`, `run_detector_with_timeout()` with `catch_unwind` panic safety. 6 production detector sub-modules (incl. CrossFlow). 7 infrastructure tests. |
+| Detector framework | `crates/agent/src/detectors/mod.rs` | 718 | Circuit breaker, `run_detectors()`, `run_detector_with_timeout()` with `catch_unwind` panic safety. 6 production detector sub-modules (incl. CrossFlow). `run_detectors()` returns `(Vec<DetectorFinding>, Vec<CbTransition>)` — CB transitions bubbled to `capture.rs` for storage emission (keeps storage coupling out of detector module). `CbTransition { detector_id, from_state, to_state, consecutive_failures }` struct. 7 infrastructure tests. |
 | DNS Analyzer | `crates/agent/src/detectors/dns_analyzer.rs` | 493 | `DetectorId::DnsAnalyzer` v1.0.0. 7 sub-detectors: entropy, length, longest label, label count, IP literal, blocklist, suspicious TLDs. **CDN carve-out removed** — CDN-hosted C2 evaluated normally. Allowlist short-circuit. Normalized score [0,1]. 11 unit tests. |
 | CrossFlow Detector | `crates/agent/src/detectors/cross_flow.rs` | 303 | `DetectorId::CrossFlow` v1.0.0. Per-IP cross-flow analytics via `CrossFlowState` (Arc<Mutex>). 2 active sub-detectors (scan connection count, DNS query burst), 2 planned sub-detectors (beaconing, connection diversity — deferred, needs SQLite). Max-of-sub-detectors scoring. 5 unit tests. |
 | Process Correlator | `crates/agent/src/detectors/process_correlator.rs` | 463 | `DetectorId::ProcessCorrelator` v1.0.0. Contextual behavioral scoring: temp dir execution, shell/interpreter network activity, uncommon binary location (with Homebrew/usr/local/app bundle recognition), unresolved process. **Known-safe allowlist** (31 entries: browsers, OS services, common CLI tools) → score 0.0 immediately. NOT rigid process→port mappings. 10 unit tests. |
 | Flow Behavior | `crates/agent/src/detectors/flow_behavior.rs` | 355 | `DetectorId::FlowBehavior` v1.0.0. 6 sub-detectors: packet rate, bytes/packet (standard port exemption for 80/443/8443 using `remote_port` disambiguation), bulk transfer, scan pattern, burst, protocol/port mismatch. 8 unit tests. |
 | IP Reputation | `crates/agent/src/detectors/ip_reputation.rs` | 366 | `DetectorId::IpReputation` v1.0.0. Blocklist/allowlist/RFC1918 awareness (checks **both** IPs) + enrichment reputation score. Allowlisted IPs reduce score. **Expanded blocklist (20 entries).** 7 unit tests. |
 | DNS Tunnel Detector | `crates/agent/src/detectors/dns_tunnel.rs` | 387 | `DetectorId::DnsTunnelDetector` v1.0.0. Only triggers on DNS flows (UDP/53). DNS-over-HTTPS (port 443) returns early with 0.0. 4 sub-detectors: subdomain entropy, longest label, query frequency, payload size. 7 unit tests. |
-| Decision engine | `crates/agent/src/decision/mod.rs` | 522 | `DecisionEngine` with weighted scoring, `Verdict` enum, `FlowFeatures` extraction, `DecisionConfig` (block=0.7, alert=0.3, `min_detectors_for_block: 2`, **`override_threshold: 0.85`**, severity→TTL map). **override_threshold allows single high-confidence detector to block.** 15 unit tests. Wired into capture loop — Block verdicts send `EnforcementCommand::Block` via IPC |
+| Decision engine | `crates/agent/src/decision/mod.rs` | 531 | `DecisionEngine` with weighted scoring, `Verdict` enum, `FlowFeatures` extraction, `DecisionConfig` (block=0.7, alert=0.3, `min_detectors_for_block: 2`, **`override_threshold: 0.85`**, severity→TTL map). **override_threshold allows single high-confidence detector to block.** `evaluate()` returns `(Verdict, f32)` — verdict plus composite score. 15 unit tests. Wired into capture loop — Block verdicts send `EnforcementCommand::Block` via IPC |
 | Enrichment pool | `crates/agent/src/enrichment/mod.rs` | 715 | Configurable worker count (`std::thread` + `mpsc`), DNS reverse via `getnameinfo`, process attribution via libproc, **GeoIP via maxminddb 0.30** (`GeoIpDb` wrapper over `Arc<Reader<Vec<u8>>>`, `lookup()` returns `(country_code, asn)`, `is_public_ip()` free fn skips RFC1918/loopback/CGNAT/link-local), reputation store |
 | Flow tracker | `crates/agent/src/flow/mod.rs` | 1045 | In-memory session window with configurable tick interval via `FlowConfig`. Direction-agnostic canonicalization, configurable `max_flows` eviction with O(log n) `BinaryHeap`, local_port + PID stored per-flow, enrichment attachment, `last_evaluated` per-flow. `tick()` returns `(expired, due_for_re_evaluate)` tuple. O(k) VecDeque-based re-evaluation scheduling with wall-clock due check. |
 | IPC protocol | `crates/platform-macos/src/protocol.rs` | 164 | `send_fd`/`recv_fd` (SCM_RIGHTS), `send_message`/`recv_message` (bincode, length-prefixed), stream split via `try_clone()` |
+| Storage worker | `crates/agent/src/storage/` (5 files) | 1140 | `StorageWorker` + `StorageEvent` enum (`EnforcementRequested`, `VerdictDecided`, `CircuitBreakerTransition`). Crash-safe spool (`CriticalSpool` — separate DB, `synchronous=FULL`). Idempotent replay via `INSERT OR IGNORE` + stable event IDs (`boot_id XOR fib_hash(pid)` prefix). Binary IP storage (16-byte BLOB + TEXT, always both). SQLite hardening PRAGMAs. V1 schema via `PRAGMA user_version`. Retention: enforcement_log 90d, verdicts+findings (CASCADE) 7d, CB events 7d. `StorageReader` (read-only connection, `query_only=ON`) with `recent_verdicts`, `verdict_findings`, `recent_enforcement`, `detector_health`, `kpi_since`. `#![allow(dead_code)]` on models/reader until Tauri IPC is wired. 3 tests. |
 
-**Total:** 10,119 lines across 20 files. 151 tests (130 agent + 15 common + 6 platform-macos).
+**Total:** 11,561 lines across 25 files. 157 tests (135 agent + 16 common + 6 platform-macos).
 
 **Verified end-to-end (2026-07-22):** Helper sends PortPidCache (49–51 entries, ~483 PIDs, ~6675 fds, 62–64 probe_ok, ~7–8ms root scan). Agent receives cache, looks up src_port on each packet, resolves to correct PID + executable path. Live test: Brave Browser connection to 142.251.142.74:443 resolved to pid=743 → `Brave Browser Helper`.
 
@@ -145,7 +165,6 @@
 
 ## Not built
 
-- Storage (SQLite WAL single-writer worker)
 - Tauri UI dashboard
 - AI post-analysis (UI layer only — event summarization, KPI explanations, report generation, recommendations)
 - Windows/Linux support (intentionally excluded — §1b)
@@ -168,4 +187,4 @@
 
 | 10 | Helper reconnect loop (accept→enforce→accept) with per-connection cache-push cancellation via `Arc<AtomicBool>` | `platform-macos/helper/main.rs` | Verified |
 
-All 151 tests pass. clippy clean. fmt clean.
+All 157 tests pass. clippy clean. fmt clean.

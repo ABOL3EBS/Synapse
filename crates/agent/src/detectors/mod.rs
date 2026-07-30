@@ -96,16 +96,27 @@ impl CircuitState {
 ///                                            ▼
 ///                                          Open (reset timer)
 /// ```
+/// A circuit breaker state transition that occurred during `run_detectors`.
+/// Collected and returned to the caller so storage concerns stay out of this module.
+#[derive(Debug)]
+pub struct CbTransition {
+    pub detector_id: DetectorId,
+    pub from_state: String,
+    pub to_state: String,
+    pub consecutive_failures: u32,
+}
+
 pub fn run_detectors(
     detectors: &[Arc<dyn Detector>],
     flow: Arc<FlowRecord>,
     timeout: Duration,
     circuit_breaker: &mut HashMap<DetectorId, CircuitState>,
     cb_config: &CircuitBreakerConfig,
-) -> Vec<DetectorFinding> {
+) -> (Vec<DetectorFinding>, Vec<CbTransition>) {
     let now = Instant::now();
+    let mut transitions: Vec<CbTransition> = Vec::new();
 
-    detectors
+    let findings = detectors
         .iter()
         .map(|d| {
             let id = d.id();
@@ -117,6 +128,12 @@ pub fn run_detectors(
                 Some(CircuitState::Open { .. }) => {
                     // Cooldown expired — transition to HalfOpen, allow probe.
                     debug!("detector {:?} cooldown expired → HalfOpen", id);
+                    transitions.push(CbTransition {
+                        detector_id: id,
+                        from_state: "Open".to_string(),
+                        to_state: "HalfOpen".to_string(),
+                        consecutive_failures: 0,
+                    });
                     circuit_breaker.insert(id, CircuitState::HalfOpen);
                     false
                 }
@@ -148,7 +165,15 @@ pub fn run_detectors(
             match finding.status {
                 DetectorStatus::Completed => {
                     // Success — any state → Closed (reset).
-                    circuit_breaker.remove(&id);
+                    if let Some(prev) = circuit_breaker.remove(&id) {
+                        let from = state_name(&prev);
+                        transitions.push(CbTransition {
+                            detector_id: id,
+                            from_state: from,
+                            to_state: "Closed".to_string(),
+                            consecutive_failures: 0,
+                        });
+                    }
                 }
                 DetectorStatus::TimedOut | DetectorStatus::Errored => {
                     let reason = if finding.status == DetectorStatus::TimedOut {
@@ -174,6 +199,12 @@ pub fn run_detectors(
                                     "detector {:?} circuit open ({} consecutive failures)",
                                     id, new_failures
                                 );
+                                transitions.push(CbTransition {
+                                    detector_id: id,
+                                    from_state: "Closed".to_string(),
+                                    to_state: "Open".to_string(),
+                                    consecutive_failures: new_failures,
+                                });
                                 circuit_breaker.insert(
                                     id,
                                     CircuitState::Open {
@@ -193,6 +224,12 @@ pub fn run_detectors(
                         Some(CircuitState::HalfOpen) => {
                             // Probe failed → back to Open.
                             debug!("detector {:?} probe failed → Open", id);
+                            transitions.push(CbTransition {
+                                detector_id: id,
+                                from_state: "HalfOpen".to_string(),
+                                to_state: "Open".to_string(),
+                                consecutive_failures: 1,
+                            });
                             circuit_breaker.insert(
                                 id,
                                 CircuitState::Open {
@@ -218,7 +255,17 @@ pub fn run_detectors(
             );
             finding
         })
-        .collect()
+        .collect();
+
+    (findings, transitions)
+}
+
+fn state_name(s: &CircuitState) -> String {
+    match s {
+        CircuitState::Closed { .. } => "Closed".to_string(),
+        CircuitState::Open { .. } => "Open".to_string(),
+        CircuitState::HalfOpen => "HalfOpen".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -384,7 +431,7 @@ mod tests {
         let timeout = Duration::from_millis(50);
         let mut cb = HashMap::new();
 
-        let findings = run_detectors(
+        let (findings, _) = run_detectors(
             &detectors,
             flow,
             timeout,
@@ -419,7 +466,7 @@ mod tests {
 
         // Fail max_failures times.
         for _ in 0..cb_config.max_failures {
-            let findings =
+            let (findings, _) =
                 run_detectors(&detectors, Arc::clone(&flow), timeout, &mut cb, &cb_config);
             assert_eq!(findings[0].status, DetectorStatus::TimedOut);
         }
@@ -443,12 +490,12 @@ mod tests {
 
         // Trip the circuit.
         for _ in 0..cb_config.max_failures {
-            run_detectors(&detectors, Arc::clone(&flow), timeout, &mut cb, &cb_config);
+            let _ = run_detectors(&detectors, Arc::clone(&flow), timeout, &mut cb, &cb_config);
         }
 
         // Should skip — returns instantly with zero latency.
         let start = Instant::now();
-        let findings = run_detectors(&detectors, flow, timeout, &mut cb, &cb_config);
+        let (findings, _) = run_detectors(&detectors, flow, timeout, &mut cb, &cb_config);
         let elapsed = start.elapsed();
 
         assert_eq!(findings[0].status, DetectorStatus::TimedOut);
@@ -472,7 +519,7 @@ mod tests {
 
         // Trip the circuit.
         for _ in 0..cb_config.max_failures {
-            run_detectors(&detectors, Arc::clone(&flow), timeout, &mut cb, &cb_config);
+            let _ = run_detectors(&detectors, Arc::clone(&flow), timeout, &mut cb, &cb_config);
         }
         assert!(matches!(
             cb.get(&DetectorId::Custom(999)),
@@ -488,7 +535,7 @@ mod tests {
         }
 
         // Next run should transition to HalfOpen and allow execution.
-        let findings = run_detectors(&detectors, flow, timeout, &mut cb, &cb_config);
+        let (findings, _) = run_detectors(&detectors, flow, timeout, &mut cb, &cb_config);
         // SlowDetector will timeout again → should transition back to Open.
         assert_eq!(findings[0].status, DetectorStatus::TimedOut);
         // Should be Open again (probe failed).
@@ -512,7 +559,7 @@ mod tests {
 
         // Trip the circuit (5 failures).
         for _ in 0..cb_config.max_failures {
-            run_detectors(&detectors, Arc::clone(&flow), timeout, &mut cb, &cb_config);
+            let _ = run_detectors(&detectors, Arc::clone(&flow), timeout, &mut cb, &cb_config);
         }
         assert!(matches!(
             cb.get(&DetectorId::Custom(997)),
@@ -531,7 +578,7 @@ mod tests {
         should_fail.store(false, std::sync::atomic::Ordering::Relaxed);
 
         // Half-open probe should succeed → circuit closes.
-        let findings = run_detectors(&detectors, flow, timeout, &mut cb, &cb_config);
+        let (findings, _) = run_detectors(&detectors, flow, timeout, &mut cb, &cb_config);
         assert_eq!(findings[0].status, DetectorStatus::Completed);
         // Circuit should be cleared (Closed state removed = no entry).
         assert!(
@@ -553,7 +600,7 @@ mod tests {
 
         // Trip the circuit.
         for _ in 0..cb_config.max_failures {
-            run_detectors(&detectors, Arc::clone(&flow), timeout, &mut cb, &cb_config);
+            let _ = run_detectors(&detectors, Arc::clone(&flow), timeout, &mut cb, &cb_config);
         }
 
         // Expire the cooldown.
@@ -565,7 +612,7 @@ mod tests {
         }
 
         // Probe attempt — SlowDetector will timeout again.
-        let findings = run_detectors(&detectors, flow, timeout, &mut cb, &cb_config);
+        let (findings, _) = run_detectors(&detectors, flow, timeout, &mut cb, &cb_config);
         assert_eq!(findings[0].status, DetectorStatus::TimedOut);
 
         // Should be back to Open with a fresh timer.
@@ -597,7 +644,7 @@ mod tests {
 
         // Run until SlowDetector trips (5 timeouts).
         for _ in 0..cb_config.max_failures {
-            run_detectors(&detectors, Arc::clone(&flow), timeout, &mut cb, &cb_config);
+            let _ = run_detectors(&detectors, Arc::clone(&flow), timeout, &mut cb, &cb_config);
         }
 
         // SlowDetector should be Open.
@@ -622,7 +669,7 @@ mod tests {
 
         // Run again — SlowDetector gets a probe (will timeout → back to Open),
         // ErrorDetector trips to Open.
-        run_detectors(&detectors, flow, timeout, &mut cb, &cb_config);
+        let _ = run_detectors(&detectors, flow, timeout, &mut cb, &cb_config);
 
         // Both should be Open now.
         assert!(matches!(
@@ -648,7 +695,7 @@ mod tests {
 
         // Fail 3 times (below threshold).
         for _ in 0..3 {
-            run_detectors(&detectors, Arc::clone(&flow), timeout, &mut cb, &cb_config);
+            let _ = run_detectors(&detectors, Arc::clone(&flow), timeout, &mut cb, &cb_config);
         }
         assert!(matches!(
             cb.get(&DetectorId::Custom(999)),
@@ -657,7 +704,7 @@ mod tests {
 
         // Now use a detector that completes instantly.
         let fast: Vec<Arc<dyn Detector>> = vec![Arc::new(dns_analyzer::DnsAnalyzer::new())];
-        let findings = run_detectors(&fast, flow, timeout, &mut cb, &cb_config);
+        let (findings, _) = run_detectors(&fast, flow, timeout, &mut cb, &cb_config);
         assert_eq!(findings[0].status, DetectorStatus::Completed);
 
         // DnsAnalyzer should have no entry (clean reset — no failures).

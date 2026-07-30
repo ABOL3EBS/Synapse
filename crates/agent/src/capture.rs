@@ -27,6 +27,7 @@ use crate::detectors;
 use crate::detectors::cross_flow::CrossFlowState;
 use crate::enrichment::EnrichmentPool;
 use crate::flow::{self, FlowTracker};
+use crate::storage::StorageEvent;
 use synapse_platform_macos::protocol;
 
 // ---------------------------------------------------------------------------
@@ -274,28 +275,161 @@ pub fn detect_local_ip() -> Option<IpAddr> {
     result
 }
 
-/// Detect the default gateway IP by parsing `route -n get default`.
-/// Returns the gateway IP if found, None on failure.
+/// Detect the default gateway IP via the macOS/BSD routing socket sysctl.
+///
+/// Calls sysctl(CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_FLAGS, RTF_GATEWAY)
+/// which returns a packed buffer of rt_msghdr messages — one per gateway
+/// route. We walk them and return the gateway address from the first entry
+/// that has both RTF_GATEWAY and RTF_UP set and a non-loopback destination.
+///
+/// No subprocess is spawned; all work is done via libc.
 pub fn detect_default_gateway() -> Option<IpAddr> {
-    use std::process::Command;
+    // sysctl mib: net.route.0.inet.flags.gateway
+    // These are standard BSD/Darwin values; defined locally to avoid
+    // relying on libc re-exporting every platform-specific routing constant.
+    const NET_RT_FLAGS: libc::c_int = 2;
 
-    let output = Command::new("route")
-        .args(["-n", "get", "default"])
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let line = line.trim();
-        if let Some(gw) = line.strip_prefix("gateway: ") {
-            let gw = gw.trim();
-            if let Ok(ip) = gw.parse::<IpAddr>() {
-                debug!("detected default gateway: {ip}");
-                return Some(ip);
+    let mib: [libc::c_int; 6] = [
+        libc::CTL_NET,
+        libc::PF_ROUTE,
+        0,
+        libc::AF_INET,
+        NET_RT_FLAGS,
+        libc::RTF_GATEWAY,
+    ];
+
+    // First call: determine required buffer size.
+    let mut needed: libc::size_t = 0;
+    let ret = unsafe {
+        libc::sysctl(
+            mib.as_ptr() as *mut _,
+            6,
+            std::ptr::null_mut(),
+            &mut needed,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret < 0 || needed == 0 {
+        warn!("sysctl route size query failed: {}", std::io::Error::last_os_error());
+        return None;
+    }
+
+    // Second call: fill buffer. Kernel may return a slightly smaller value
+    // than `needed` if routes changed between calls — truncate to actual.
+    let mut buf = vec![0u8; needed];
+    let ret = unsafe {
+        libc::sysctl(
+            mib.as_ptr() as *mut _,
+            6,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut needed,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret < 0 {
+        warn!("sysctl route fill failed: {}", std::io::Error::last_os_error());
+        return None;
+    }
+    buf.truncate(needed);
+
+    rt_buf_find_gateway(&buf)
+}
+
+/// Walk a sysctl routing table buffer and return the gateway address from
+/// the first entry with RTF_GATEWAY | RTF_UP. Helper for detect_default_gateway.
+fn rt_buf_find_gateway(buf: &[u8]) -> Option<IpAddr> {
+    let hdr_size = std::mem::size_of::<libc::rt_msghdr>();
+    let mut offset = 0usize;
+
+    while offset + hdr_size <= buf.len() {
+        // SAFETY: buf is kernel-provided, bounds-checked above.
+        let rtm: libc::rt_msghdr = unsafe {
+            std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const libc::rt_msghdr)
+        };
+        let msg_len = rtm.rtm_msglen as usize;
+        if msg_len < hdr_size || offset + msg_len > buf.len() {
+            break;
+        }
+
+        if rtm.rtm_flags & (libc::RTF_GATEWAY | libc::RTF_UP) == (libc::RTF_GATEWAY | libc::RTF_UP) {
+            let msg = &buf[offset..offset + msg_len];
+            if let Some(gw) = rt_msg_gateway(msg, &rtm) {
+                if !gw.is_loopback() && !gw.is_unspecified() {
+                    debug!("detected default gateway via sysctl: {gw}");
+                    return Some(gw);
+                }
             }
         }
+        offset += msg_len;
     }
-    warn!("could not detect default gateway from route output");
+
+    warn!("could not detect default gateway from routing table");
     None
+}
+
+/// Extract the RTA_GATEWAY sockaddr from a single rt_msghdr message.
+fn rt_msg_gateway(msg: &[u8], rtm: &libc::rt_msghdr) -> Option<IpAddr> {
+    let hdr_size = std::mem::size_of::<libc::rt_msghdr>();
+    let sa_buf = msg.get(hdr_size..)?;
+
+    // Walk sockaddrs in RTA bit order (bit 0 = RTA_DST, bit 1 = RTA_GATEWAY, …).
+    // Each sockaddr is padded to the next sizeof(long) boundary (8 bytes on Darwin).
+    let mut pos = 0usize;
+    for bit in 0..32i32 {
+        let rta = 1 << bit;
+        if rtm.rtm_addrs & rta == 0 {
+            continue;
+        }
+        if pos >= sa_buf.len() {
+            break;
+        }
+        let sa_len = sa_buf[pos] as usize;
+        let actual = if sa_len == 0 { std::mem::size_of::<libc::sockaddr>() } else { sa_len };
+        let rounded = rt_roundup(actual);
+
+        if rta == libc::RTA_GATEWAY {
+            return rt_parse_sockaddr(sa_buf.get(pos..pos + actual)?);
+        }
+        pos += rounded;
+    }
+    None
+}
+
+/// BSD RT_ROUNDUP: align to sizeof(long) (8 bytes on 64-bit Darwin).
+fn rt_roundup(n: usize) -> usize {
+    const ALIGN: usize = std::mem::size_of::<libc::c_long>();
+    if n == 0 { ALIGN } else { (n + ALIGN - 1) & !(ALIGN - 1) }
+}
+
+/// Parse an IpAddr from a raw sockaddr slice (AF_INET or AF_INET6).
+fn rt_parse_sockaddr(buf: &[u8]) -> Option<IpAddr> {
+    if buf.len() < 2 {
+        return None;
+    }
+    match buf[1] as libc::c_int {
+        libc::AF_INET => {
+            if buf.len() < std::mem::size_of::<libc::sockaddr_in>() {
+                return None;
+            }
+            // SAFETY: bounds checked above.
+            let sin: libc::sockaddr_in = unsafe {
+                std::ptr::read_unaligned(buf.as_ptr() as *const libc::sockaddr_in)
+            };
+            Some(IpAddr::V4(std::net::Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes())))
+        }
+        libc::AF_INET6 => {
+            if buf.len() < std::mem::size_of::<libc::sockaddr_in6>() {
+                return None;
+            }
+            let sin6: libc::sockaddr_in6 = unsafe {
+                std::ptr::read_unaligned(buf.as_ptr() as *const libc::sockaddr_in6)
+            };
+            Some(IpAddr::V6(std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr)))
+        }
+        _ => None,
+    }
 }
 
 /// Detect ALL local IPs (IPv4 + IPv6) and subnet broadcast addresses.
@@ -380,75 +514,85 @@ fn sockaddr_to_ip(addr: *const libc::sockaddr) -> Option<IpAddr> {
 }
 
 // ---------------------------------------------------------------------------
+// CaptureEngine configuration and shared-state bundles
+// ---------------------------------------------------------------------------
+
+/// Runtime tuning parameters — sourced from AgentConfig at startup.
+/// Grouped to reduce CaptureEngine::new() argument count.
+pub struct CaptureConfig {
+    pub poll_timeout_ms: i32,
+    pub detector_timeout: std::time::Duration,
+    pub cb_config: detectors::CircuitBreakerConfig,
+    pub gateway_ip: Option<IpAddr>,
+}
+
+/// Lock-free shared state updated by background threads (own-IPs refresh,
+/// local-IP refresh, IPC port→PID cache). All reads on the hot path are
+/// lock-free via ArcSwap::load().
+pub struct NetworkCaches {
+    pub local_ip: Arc<ArcSwap<Option<IpAddr>>>,
+    pub own_ips: Arc<ArcSwap<HashSet<IpAddr>>>,
+    pub port_pid: Arc<ArcSwap<HashMap<(u16, u8), u32>>>,
+}
+
+// ---------------------------------------------------------------------------
 // CaptureEngine
 // ---------------------------------------------------------------------------
 
 pub struct CaptureEngine {
     bpf_fd: RawFd,
     buf: Vec<u8>,
-    local_ip_cache: Arc<ArcSwap<Option<IpAddr>>>,
-    own_ips: Arc<ArcSwap<HashSet<IpAddr>>>,
-    port_pid_cache: Arc<ArcSwap<HashMap<(u16, u8), u32>>>,
+    caches: NetworkCaches,
     enrich_pool: EnrichmentPool,
     tracker: FlowTracker,
     decision_engine: crate::decision::DecisionEngine,
     detectors: Vec<Arc<dyn synapse_common::Detector>>,
-    detector_timeout: std::time::Duration,
+    config: CaptureConfig,
     circuit_breaker: HashMap<synapse_common::DetectorId, detectors::CircuitState>,
-    cb_config: detectors::CircuitBreakerConfig,
     block_cooldown: HashMap<IpAddr, Instant>,
-    gateway_ip: Option<IpAddr>,
     write_half: UnixStream,
     pkt_count: u64,
-    poll_timeout_ms: i32,
     /// Consecutive IPC send failures. Reset on success. Agent exits at threshold.
     ipc_failures: u32,
     /// Cross-flow state shared with CrossFlowDetector.
     cross_flow_state: Arc<std::sync::Mutex<CrossFlowState>>,
+    /// Event sender for SQLite enforcement_log (None if storage unavailable).
+    storage_tx: Option<crossbeam_channel::Sender<StorageEvent>>,
 }
 
 /// Consecutive IPC failures before the agent exits for launchd/systemd restart.
 const MAX_IPC_FAILURES: u32 = 5;
 
 impl CaptureEngine {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         bpf_fd: RawFd,
         buf: Vec<u8>,
-        local_ip_cache: Arc<ArcSwap<Option<IpAddr>>>,
-        own_ips: Arc<ArcSwap<HashSet<IpAddr>>>,
-        port_pid_cache: Arc<ArcSwap<HashMap<(u16, u8), u32>>>,
+        caches: NetworkCaches,
         enrich_pool: EnrichmentPool,
         tracker: FlowTracker,
         decision_engine: crate::decision::DecisionEngine,
         detectors: Vec<Arc<dyn synapse_common::Detector>>,
-        detector_timeout: std::time::Duration,
         write_half: UnixStream,
-        cb_config: detectors::CircuitBreakerConfig,
-        poll_timeout_ms: i32,
-        gateway_ip: Option<IpAddr>,
+        config: CaptureConfig,
         cross_flow_state: Arc<std::sync::Mutex<CrossFlowState>>,
+        storage_tx: Option<crossbeam_channel::Sender<StorageEvent>>,
     ) -> Self {
         Self {
             bpf_fd,
             buf,
-            local_ip_cache,
-            own_ips,
-            port_pid_cache,
+            caches,
             enrich_pool,
             tracker,
             decision_engine,
             detectors,
-            detector_timeout,
+            config,
             circuit_breaker: HashMap::new(),
-            cb_config,
             block_cooldown: HashMap::new(),
-            gateway_ip,
             write_half,
             pkt_count: 0,
-            poll_timeout_ms,
             ipc_failures: 0,
             cross_flow_state,
+            storage_tx,
         }
     }
 
@@ -484,7 +628,7 @@ impl CaptureEngine {
             events: libc::POLLIN,
             revents: 0,
         };
-        let poll_ret = unsafe { libc::poll(&mut pollfd, 1, self.poll_timeout_ms) };
+        let poll_ret = unsafe { libc::poll(&mut pollfd, 1, self.config.poll_timeout_ms) };
 
         if poll_ret < 0 {
             let err = io::Error::last_os_error();
@@ -498,7 +642,7 @@ impl CaptureEngine {
         // Always tick on every iteration — even on timeout.
         // Expires stale flows and reclaims memory.
         let (expired, re_evaluate) = self.tracker.tick();
-        info!(
+        debug!(
             "poll_ret={} expired={} re_evaluate={} flows={}",
             poll_ret,
             expired.len(),
@@ -548,7 +692,7 @@ impl CaptureEngine {
         // P1: Lock-free snapshot via arc_swap — no mutex contention on hot path.
         // R10: If local_ip is unknown, skip all expired flow processing —
         // direction resolution requires a known local IP.
-        let local_ip = match **self.local_ip_cache.load() {
+        let local_ip = match **self.caches.local_ip.load() {
             Some(ip) => ip,
             None => {
                 warn!(
@@ -563,16 +707,17 @@ impl CaptureEngine {
             if let Some(flow_ref) = self.tracker.get(flow_id) {
                 let common_flow: synapse_common::FlowRecord = flow_ref.clone().into();
                 let common_flow = std::sync::Arc::new(common_flow);
-                let findings = detectors::run_detectors(
+                let (findings, cb_transitions) = detectors::run_detectors(
                     &self.detectors,
                     std::sync::Arc::clone(&common_flow),
-                    self.detector_timeout,
+                    self.config.detector_timeout,
                     &mut self.circuit_breaker,
-                    &self.cb_config,
+                    &self.config.cb_config,
                 );
+                self.emit_cb_transitions(cb_transitions);
                 let features = synapse_common::FlowFeatures::from_flow(&common_flow);
-                let verdict = self.decision_engine.evaluate(&features, &findings);
-                self.handle_verdict(flow_id, verdict, local_ip);
+                let (verdict, score) = self.decision_engine.evaluate(&features, &findings);
+                self.handle_verdict(flow_id, &common_flow, &findings, score, verdict, local_ip);
             }
         }
     }
@@ -585,7 +730,7 @@ impl CaptureEngine {
         // P1: Lock-free snapshot via arc_swap.
         // R10: If local_ip is unknown, skip all re-evaluation —
         // direction resolution requires a known local IP.
-        let local_ip = match **self.local_ip_cache.load() {
+        let local_ip = match **self.caches.local_ip.load() {
             Some(ip) => ip,
             None => {
                 warn!(
@@ -600,28 +745,38 @@ impl CaptureEngine {
             if let Some(flow_ref) = self.tracker.get(flow_id) {
                 let common_flow: synapse_common::FlowRecord = flow_ref.clone().into();
                 let common_flow = std::sync::Arc::new(common_flow);
-                let findings = detectors::run_detectors(
+                let (findings, cb_transitions) = detectors::run_detectors(
                     &self.detectors,
                     std::sync::Arc::clone(&common_flow),
-                    self.detector_timeout,
+                    self.config.detector_timeout,
                     &mut self.circuit_breaker,
-                    &self.cb_config,
+                    &self.config.cb_config,
                 );
+                self.emit_cb_transitions(cb_transitions);
                 let features = synapse_common::FlowFeatures::from_flow(&common_flow);
-                let verdict = self.decision_engine.evaluate(&features, &findings);
-                self.handle_verdict(flow_id, verdict, local_ip);
+                let (verdict, score) = self.decision_engine.evaluate(&features, &findings);
+                self.handle_verdict(flow_id, &common_flow, &findings, score, verdict, local_ip);
                 self.tracker.mark_evaluated(flow_id);
             }
         }
     }
 
-    /// Handle a verdict — enforcement via IPC.
-    fn handle_verdict(&mut self, flow_id: u64, verdict: synapse_common::Verdict, local_ip: IpAddr) {
-        let (a_ip, b_ip) = if let Some(flow_ref) = self.tracker.get(flow_id) {
-            (flow_ref.key.a_ip, flow_ref.key.b_ip)
-        } else {
-            return;
-        };
+    /// Handle a verdict — persist it, then enforce via IPC if Block.
+    ///
+    /// `flow` and `findings` are passed in (already available at every call
+    /// site) so we can emit VerdictDecided without a second tracker lookup.
+    /// `composite_score` is the raw weighted sum from the decision engine.
+    fn handle_verdict(
+        &mut self,
+        flow_id: u64,
+        flow: &synapse_common::FlowRecord,
+        findings: &[synapse_common::DetectorFinding],
+        composite_score: f32,
+        verdict: synapse_common::Verdict,
+        local_ip: IpAddr,
+    ) {
+        let a_ip = flow.a_ip;
+        let b_ip = flow.b_ip;
 
         match verdict {
             synapse_common::Verdict::Allow => {
@@ -630,6 +785,16 @@ impl CaptureEngine {
             synapse_common::Verdict::Alert { ref reason } => {
                 let remote = determine_remote_ip(a_ip, b_ip, local_ip);
                 info!("[ALERT] flow={} remote={} {}", flow_id, remote, reason);
+                if let Some(ref tx) = self.storage_tx {
+                    let _ = tx.send(StorageEvent::VerdictDecided {
+                        flow: flow.clone(),
+                        verdict: "Alert".to_string(),
+                        reason: reason.clone(),
+                        composite_score,
+                        ttl_ms: None,
+                        findings: findings.to_vec(),
+                    });
+                }
             }
             synapse_common::Verdict::Block { ttl, ref reason } => {
                 let remote = determine_remote_ip(a_ip, b_ip, local_ip);
@@ -647,6 +812,32 @@ impl CaptureEngine {
                             "[BLOCK] flow={} remote={remote} ttl={ttl:?} {reason}",
                             flow_id,
                         );
+
+                        // Persist the verdict decision before attempting enforcement.
+                        if let Some(ref tx) = self.storage_tx {
+                            let _ = tx.send(StorageEvent::VerdictDecided {
+                                flow: flow.clone(),
+                                verdict: "Block".to_string(),
+                                reason: reason.clone(),
+                                composite_score,
+                                ttl_ms: Some(ttl.as_millis() as u64),
+                                findings: findings.to_vec(),
+                            });
+                        }
+
+                        // Pick the top-scoring Completed detector for the enforcement log.
+                        let top_detector = findings
+                            .iter()
+                            .filter(|f| {
+                                f.status == synapse_common::DetectorStatus::Completed
+                            })
+                            .max_by(|a, b| {
+                                (a.score * a.confidence)
+                                    .partial_cmp(&(b.score * b.confidence))
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .map(|f| format!("{:?}", f.detector_id));
+
                         let cmd = EnforcementCommand::Block { ip: remote, ttl };
                         if let Err(e) = protocol::send_message(&mut self.write_half, &cmd) {
                             self.ipc_failures += 1;
@@ -655,14 +846,50 @@ impl CaptureEngine {
                                  consecutive failures: {}/{}",
                                 self.ipc_failures, MAX_IPC_FAILURES,
                             );
+                            if let Some(ref tx) = self.storage_tx {
+                                let _ = tx.send(StorageEvent::EnforcementRequested {
+                                    ip: remote,
+                                    ttl_ms: ttl.as_millis() as u64,
+                                    reason: reason.clone(),
+                                    top_detector,
+                                    composite_score,
+                                    send_error: Some(format!("{e}")),
+                                });
+                            }
                         } else {
                             self.ipc_failures = 0;
                             info!("[ENFORCE] command sent: Block {remote} ttl={ttl:?}");
                             self.block_cooldown.insert(remote, Instant::now() + ttl);
+                            if let Some(ref tx) = self.storage_tx {
+                                let _ = tx.send(StorageEvent::EnforcementRequested {
+                                    ip: remote,
+                                    ttl_ms: ttl.as_millis() as u64,
+                                    reason: reason.clone(),
+                                    top_detector,
+                                    composite_score,
+                                    send_error: None,
+                                });
+                            }
                         }
                     }
                 }
             }
+        }
+    }
+
+    /// Forward circuit breaker transitions to storage (health dashboard data).
+    fn emit_cb_transitions(&self, transitions: Vec<detectors::CbTransition>) {
+        if transitions.is_empty() {
+            return;
+        }
+        let Some(ref tx) = self.storage_tx else { return };
+        for t in transitions {
+            let _ = tx.send(StorageEvent::CircuitBreakerTransition {
+                detector_id: format!("{:?}", t.detector_id),
+                from_state: t.from_state,
+                to_state: t.to_state,
+                consecutive_failures: t.consecutive_failures,
+            });
         }
     }
 
@@ -671,12 +898,12 @@ impl CaptureEngine {
     fn should_skip_block(&self, remote: IpAddr) -> Option<&'static str> {
         // Own IPs (all address families — v4 and v6).
         // P1: Lock-free snapshot via arc_swap.
-        let own = self.own_ips.load();
+        let own = self.caches.own_ips.load();
         if own.contains(&remote) {
             return Some("remote is own IP");
         }
         // Default gateway.
-        if Some(remote) == self.gateway_ip {
+        if Some(remote) == self.config.gateway_ip {
             return Some("remote is default gateway");
         }
         match remote {
@@ -781,14 +1008,14 @@ impl CaptureEngine {
 
                 let (local_port, pid) = {
                     // P1: Lock-free snapshot via arc_swap — no mutex on hot path.
-                    let cache = self.port_pid_cache.load();
+                    let cache = self.caches.port_pid.load();
                     let lookup = |port: u16, proto: u8| -> Option<(u16, u32)> {
                         let key = (port, proto);
                         cache.get(&key).map(|&pid| (port, pid))
                     };
                     // P1 + R10: Lock-free snapshot. If local_ip unknown,
                     // skip direction resolution rather than misclassifying.
-                    let current_local_ip = match **self.local_ip_cache.load() {
+                    let current_local_ip = match **self.caches.local_ip.load() {
                         Some(ip) => ip,
                         None => {
                             debug!("local_ip unknown — skipping packet (direction unknown)");
@@ -827,7 +1054,7 @@ impl CaptureEngine {
                     // Record cross-flow state (no IPC or blocking, just in-memory stats).
                     // Re-compute local IP for direction resolution (current_local_ip
                     // is scoped inside the pid lookup block above).
-                    let cf_local_ip = match **self.local_ip_cache.load() {
+                    let cf_local_ip = match **self.caches.local_ip.load() {
                         Some(ip) => ip,
                         None => {
                             debug!("cross-flow: local_ip unknown — skipping record");

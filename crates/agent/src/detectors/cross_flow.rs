@@ -103,31 +103,42 @@ impl Detector for CrossFlowDetector {
     fn evaluate(&self, flow: &FlowRecord) -> DetectorFinding {
         let start = Instant::now();
 
-        let state = match self.cross_flow_state.lock() {
-            Ok(s) => s,
-            Err(_) => {
-                return DetectorFinding::errored(
-                    DetectorId::CrossFlow,
-                    "1.0.0",
-                    "cross-flow state lock poisoned",
-                    0,
-                );
-            }
+        // Hold the lock only long enough to copy out the stats we need.
+        // Scoring runs outside the lock so record_connection() on the hot
+        // path is never blocked by a slow or timed-out detector evaluation.
+        let (stats_a, stats_b, cfg) = {
+            let state = match self.cross_flow_state.lock() {
+                Ok(s) => s,
+                Err(_) => {
+                    return DetectorFinding::errored(
+                        DetectorId::CrossFlow,
+                        "1.0.0",
+                        "cross-flow state lock poisoned",
+                        0,
+                    );
+                }
+            };
+            (
+                state.get_stats(&flow.a_ip),
+                state.get_stats(&flow.b_ip),
+                state.config().clone(),
+            )
+            // MutexGuard drops here.
         };
 
         let mut evidence = Vec::new();
         let mut max_score = 0.0_f32;
         let mut max_conf = 0.0_f32;
 
-        for &ip in &[flow.a_ip, flow.b_ip] {
-            let (conn_count, dns_count) = match state.get_stats(&ip) {
+        for (ip, stats_opt) in [(flow.a_ip, stats_a), (flow.b_ip, stats_b)] {
+            let (conn_count, dns_count) = match stats_opt {
                 Some(stats) => stats,
                 None => continue,
             };
 
-            let window = state.config().window_secs;
+            let window = cfg.window_secs;
 
-            if conn_count > state.config().scan_connection_threshold_high {
+            if conn_count > cfg.scan_connection_threshold_high {
                 max_score = max_score.max(0.9);
                 max_conf = max_conf.max(0.95);
                 evidence.push(Evidence {
@@ -137,7 +148,7 @@ impl Detector for CrossFlowDetector {
                     ),
                     detail: Some(ip.to_string()),
                 });
-            } else if conn_count > state.config().scan_connection_threshold_medium {
+            } else if conn_count > cfg.scan_connection_threshold_medium {
                 max_score = max_score.max(0.7);
                 max_conf = max_conf.max(0.8);
                 evidence.push(Evidence {
@@ -149,7 +160,7 @@ impl Detector for CrossFlowDetector {
                 });
             }
 
-            if dns_count > state.config().dns_burst_threshold_high {
+            if dns_count > cfg.dns_burst_threshold_high {
                 max_score = max_score.max(0.8);
                 max_conf = max_conf.max(0.7);
                 evidence.push(Evidence {
@@ -159,7 +170,7 @@ impl Detector for CrossFlowDetector {
                     ),
                     detail: Some(ip.to_string()),
                 });
-            } else if dns_count > state.config().dns_burst_threshold_medium {
+            } else if dns_count > cfg.dns_burst_threshold_medium {
                 max_score = max_score.max(0.5);
                 max_conf = max_conf.max(0.5);
                 evidence.push(Evidence {

@@ -111,7 +111,6 @@ impl AgentConfig {
     }
 
     /// Storage database path. Env var SYNAPSE_DB_PATH overrides config.
-    #[expect(dead_code, reason = "storage module deferred — see STATUS.md")]
     pub fn storage_db_path(&self) -> std::path::PathBuf {
         if let Ok(path) = std::env::var("SYNAPSE_DB_PATH") {
             if !path.is_empty() {

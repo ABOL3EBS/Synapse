@@ -65,7 +65,10 @@ impl DecisionEngine {
     /// - Find the most severe Completed finding
     /// - Look up TTL from `ttl_by_severity` config
     /// - Clamp to [min_ttl, max_ttl]
-    pub fn evaluate(&self, features: &FlowFeatures, findings: &[DetectorFinding]) -> Verdict {
+    /// Evaluate all detector findings and produce a verdict plus the raw
+    /// composite score. The score is returned so callers (storage, logging)
+    /// can record it without re-computing.
+    pub fn evaluate(&self, features: &FlowFeatures, findings: &[DetectorFinding]) -> (Verdict, f32) {
         let mut total_score = 0.0_f32;
         let mut most_severe: Option<Severity> = None;
         let mut evidence_summary = Vec::new();
@@ -147,7 +150,7 @@ impl DecisionEngine {
             if has_override && detectors_with_score < self.config.min_detectors_for_block {
                 reason.push_str(" (override)");
             }
-            Verdict::Block { ttl, reason }
+            (Verdict::Block { ttl, reason }, total_score)
         } else if total_score >= self.config.alert_threshold {
             let reason = if evidence_summary.is_empty() {
                 format!("score {:.2} exceeds alert threshold", total_score)
@@ -158,9 +161,9 @@ impl DecisionEngine {
                     evidence_summary.join("; ")
                 )
             };
-            Verdict::Alert { reason }
+            (Verdict::Alert { reason }, total_score)
         } else {
-            Verdict::Allow
+            (Verdict::Allow, total_score)
         }
     }
 
@@ -236,7 +239,7 @@ mod tests {
     fn test_no_findings_produces_allow() {
         let engine = DecisionEngine::new(DecisionConfig::default());
         let features = make_features(1);
-        let verdict = engine.evaluate(&features, &[]);
+        let (verdict, _) = engine.evaluate(&features, &[]);
         assert!(
             matches!(verdict, Verdict::Allow),
             "no findings should produce Allow"
@@ -253,7 +256,7 @@ mod tests {
             Severity::Low,
             DetectorStatus::Completed,
         )];
-        let verdict = engine.evaluate(&features, &findings);
+        let (verdict, _) = engine.evaluate(&features, &findings);
         assert!(
             matches!(verdict, Verdict::Allow),
             "score 0.04 (0.05 * 0.8) below alert threshold 0.2"
@@ -271,7 +274,7 @@ mod tests {
             Severity::Low,
             DetectorStatus::Completed,
         )];
-        let verdict = engine.evaluate(&features, &findings);
+        let (verdict, _) = engine.evaluate(&features, &findings);
         assert!(
             matches!(verdict, Verdict::Alert { .. }),
             "adjusted score 0.40 should trigger Alert"
@@ -287,7 +290,7 @@ mod tests {
             make_finding(0.5, 0.8, Severity::High, DetectorStatus::Completed),
             make_finding(0.5, 0.8, Severity::High, DetectorStatus::Completed),
         ];
-        let verdict = engine.evaluate(&features, &findings);
+        let (verdict, _) = engine.evaluate(&features, &findings);
         match verdict {
             Verdict::Block { ttl, reason } => {
                 assert_eq!(
@@ -312,7 +315,7 @@ mod tests {
             Severity::High,
             DetectorStatus::TimedOut,
         )];
-        let verdict = engine.evaluate(&features, &findings);
+        let (verdict, _) = engine.evaluate(&features, &findings);
         assert!(
             matches!(verdict, Verdict::Allow),
             "TimedOut finding should be down-weighted below alert threshold"
@@ -330,7 +333,7 @@ mod tests {
             Severity::High,
             DetectorStatus::Errored,
         )];
-        let verdict = engine.evaluate(&features, &findings);
+        let (verdict, _) = engine.evaluate(&features, &findings);
         assert!(
             matches!(verdict, Verdict::Allow),
             "Errored finding should be zeroed"
@@ -347,7 +350,7 @@ mod tests {
             make_finding(0.8, 0.9, Severity::Critical, DetectorStatus::Completed),
             make_finding(0.5, 0.8, Severity::High, DetectorStatus::TimedOut),
         ];
-        let verdict = engine.evaluate(&features, &findings);
+        let (verdict, _) = engine.evaluate(&features, &findings);
         match verdict {
             Verdict::Block { ttl, .. } => {
                 assert_eq!(
@@ -373,7 +376,7 @@ mod tests {
             make_finding(0.8, 0.8, Severity::Low, DetectorStatus::Completed),
             make_finding(0.5, 0.8, Severity::Low, DetectorStatus::Completed),
         ];
-        let verdict = engine.evaluate(&features, &findings);
+        let (verdict, _) = engine.evaluate(&features, &findings);
         match verdict {
             Verdict::Block { ttl, .. } => {
                 assert_eq!(
@@ -399,7 +402,7 @@ mod tests {
             make_finding(0.8, 0.8, Severity::Critical, DetectorStatus::Completed),
             make_finding(0.5, 0.8, Severity::Critical, DetectorStatus::Completed),
         ];
-        let verdict = engine.evaluate(&features, &findings);
+        let (verdict, _) = engine.evaluate(&features, &findings);
         match verdict {
             Verdict::Block { ttl, .. } => {
                 assert_eq!(
@@ -423,7 +426,7 @@ mod tests {
             make_finding(0.3, 0.8, Severity::Low, DetectorStatus::Completed),
             make_finding(0.3, 0.8, Severity::Low, DetectorStatus::Completed),
         ];
-        let verdict = engine.evaluate(&features, &findings);
+        let (verdict, _) = engine.evaluate(&features, &findings);
         assert!(
             matches!(verdict, Verdict::Block { .. }),
             "cumulative 0.72 with 3 detectors should trigger Block"
@@ -441,7 +444,7 @@ mod tests {
             Severity::Critical,
             DetectorStatus::Completed,
         )];
-        let verdict = engine.evaluate(&features, &findings);
+        let (verdict, _) = engine.evaluate(&features, &findings);
         match verdict {
             Verdict::Block { reason, .. } => {
                 assert!(
@@ -464,7 +467,7 @@ mod tests {
             Severity::Critical,
             DetectorStatus::Completed,
         )];
-        let verdict = engine.evaluate(&features, &findings);
+        let (verdict, _) = engine.evaluate(&features, &findings);
         assert!(
             !matches!(verdict, Verdict::Block { .. }),
             "product 0.80 below override 0.85, single detector should NOT block"
@@ -487,7 +490,7 @@ mod tests {
             Severity::Critical,
             DetectorStatus::TimedOut,
         )];
-        let verdict = engine.evaluate(&features, &findings);
+        let (verdict, _) = engine.evaluate(&features, &findings);
         assert!(
             matches!(verdict, Verdict::Allow),
             "TimedOut finding (product 0.855) should NOT trigger override — \
@@ -519,7 +522,7 @@ mod tests {
             Severity::Critical,
             DetectorStatus::Completed,
         )];
-        let verdict = engine.evaluate(&features, &findings);
+        let (verdict, _) = engine.evaluate(&features, &findings);
         assert!(
             !matches!(verdict, Verdict::Block { .. }),
             "single detector should not trigger Block even with high score"

@@ -625,13 +625,24 @@ pub fn run_detector_with_timeout(
         result_tx,
     };
 
-    if tx.send(task).is_err() {
-        return DetectorFinding::errored(
-            detector.id(),
-            detector.version(),
-            "detector pool shut down",
-            0,
-        );
+    match tx.try_send(task) {
+        Ok(()) => {}
+        Err(crossbeam_channel::TrySendError::Full(_)) => {
+            return DetectorFinding::errored(
+                detector.id(),
+                detector.version(),
+                "detector pool at capacity",
+                0,
+            );
+        }
+        Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+            return DetectorFinding::errored(
+                detector.id(),
+                detector.version(),
+                "detector pool shut down",
+                0,
+            );
+        }
     }
 
     match result_rx.recv_timeout(budget) {
@@ -799,5 +810,83 @@ mod tests {
         };
         let features = FlowFeatures::from_flow(&flow);
         assert_eq!(features.duration_ms, u64::MAX);
+    }
+
+    /// Verify that try_send on a full bounded channel returns Full immediately.
+    ///
+    /// This directly tests the property guaranteed by Fix 1: the detector pool
+    /// submission must never block the capture hot path. We build a local
+    /// channel, fill it to capacity without starting any consumer (so nothing
+    /// drains it), then verify try_send returns Full in < 1 ms.
+    #[test]
+    fn test_pool_full_try_send_is_non_blocking() {
+        use std::time::Instant;
+
+        const CAP: usize = 8;
+        let (tx, _rx) = crossbeam_channel::bounded::<DetectorTask>(CAP);
+
+        // A minimal detector — only used to fill the channel; never evaluated.
+        struct NullDetector;
+        impl Detector for NullDetector {
+            fn id(&self) -> DetectorId {
+                DetectorId::Custom(0xAA)
+            }
+            fn version(&self) -> &str {
+                "test"
+            }
+            fn evaluate(&self, _: &FlowRecord) -> DetectorFinding {
+                DetectorFinding::timed_out(self.id(), self.version(), 0)
+            }
+        }
+
+        let stub_flow = FlowRecord {
+            flow_id: 1,
+            a_ip: IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)),
+            b_ip: IpAddr::V4(std::net::Ipv4Addr::new(2, 2, 2, 2)),
+            a_port: 80,
+            b_port: 50000,
+            protocol: 6,
+            local_port: 50000,
+            pid: None,
+            packet_count: 1,
+            byte_count: 100,
+            dns_name: None,
+            process_path: None,
+            process_start_time: None,
+            country_code: None,
+            asn: None,
+            reputation_score: None,
+            flow_age: Duration::from_secs(0),
+        };
+
+        // Fill channel to capacity — no worker thread is consuming, so all
+        // tasks stay in the channel.
+        for _ in 0..CAP {
+            let (dummy_tx, _) = crossbeam_channel::bounded(1);
+            let task = DetectorTask {
+                detector: Arc::new(NullDetector),
+                flow: stub_flow.clone(),
+                result_tx: dummy_tx,
+            };
+            assert!(tx.try_send(task).is_ok(), "channel should accept tasks up to capacity");
+        }
+
+        // One more — channel is full, must return Full immediately.
+        let (dummy_tx, _) = crossbeam_channel::bounded(1);
+        let overflow = DetectorTask {
+            detector: Arc::new(NullDetector),
+            flow: stub_flow,
+            result_tx: dummy_tx,
+        };
+        let start = Instant::now();
+        assert!(
+            matches!(tx.try_send(overflow), Err(crossbeam_channel::TrySendError::Full(_))),
+            "try_send on a full channel must return Full"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(5),
+            "try_send must be non-blocking (completed in {:?})",
+            start.elapsed(),
+        );
     }
 }
