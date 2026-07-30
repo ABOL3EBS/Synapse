@@ -237,6 +237,7 @@ fn main() -> io::Result<()> {
     let cross_flow_state = Arc::new(std::sync::Mutex::new(
         detectors::cross_flow::CrossFlowState::new(
             detectors::cross_flow::CrossFlowConfig::default(),
+            gateway_ip,
         ),
     ));
 

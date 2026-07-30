@@ -135,6 +135,20 @@ impl ProcessCorrelator {
             return 0.0;
         }
 
+        // DNS and mDNS flows (UDP port 53 / 5353) structurally produce
+        // attribution failures: the response arrives on the client's ephemeral
+        // port which may not be in the port→PID cache by the time the flow
+        // expires. This is not suspicious — any process can resolve DNS.
+        // Regular DNS (53) and mDNS (5353) both apply.
+        let is_dns = flow.protocol == 17
+            && (flow.a_port == 53
+                || flow.b_port == 53
+                || flow.a_port == 5353
+                || flow.b_port == 5353);
+        if is_dns {
+            return 0.0;
+        }
+
         // Check if destination is external (not RFC1918).
         let b_ip = flow.b_ip;
         let is_external = match b_ip {
@@ -372,6 +386,56 @@ mod tests {
         );
         let finding = detector.evaluate(&flow);
         assert_eq!(finding.score, 0.0, "Standard path process should score 0");
+    }
+
+    #[test]
+    fn test_dns_flow_unresolved_process_scores_zero() {
+        let detector = ProcessCorrelator;
+        // DNS response: gateway:53 → local:ephemeral — pid unknown, process unknown.
+        // This is the false-positive case: structurally unreliable attribution
+        // for DNS flows must not contribute score.
+        let mut flow = make_flow_with_process(None, None, "8.8.8.8".parse().unwrap());
+        flow.protocol = 17;
+        flow.a_port = 53;
+        flow.b_port = 58502;
+        let finding = detector.evaluate(&flow);
+        assert_eq!(
+            finding.score, 0.0,
+            "DNS flow with unknown process must score 0, got {}",
+            finding.score
+        );
+    }
+
+    #[test]
+    fn test_mdns_flow_unresolved_process_scores_zero() {
+        let detector = ProcessCorrelator;
+        let mut flow =
+            make_flow_with_process(None, None, "224.0.0.251".parse().unwrap());
+        flow.protocol = 17;
+        flow.a_port = 5353;
+        flow.b_port = 5353;
+        let finding = detector.evaluate(&flow);
+        assert_eq!(
+            finding.score, 0.0,
+            "mDNS flow with unknown process must score 0, got {}",
+            finding.score
+        );
+    }
+
+    #[test]
+    fn test_non_dns_unresolved_process_still_scores() {
+        let detector = ProcessCorrelator;
+        // Non-DNS UDP flow with unknown process — should still score.
+        let mut flow = make_flow_with_process(None, None, "8.8.8.8".parse().unwrap());
+        flow.protocol = 17;
+        flow.a_port = 1234;
+        flow.b_port = 9999;
+        let finding = detector.evaluate(&flow);
+        assert!(
+            finding.score > 0.0,
+            "Non-DNS unknown process to external should score > 0, got {}",
+            finding.score
+        );
     }
 
     #[test]
