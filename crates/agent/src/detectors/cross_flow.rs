@@ -39,20 +39,20 @@ struct IpFlowStats {
 pub struct CrossFlowState {
     ip_stats: HashMap<IpAddr, IpFlowStats>,
     config: CrossFlowConfig,
-    // IPs excluded from per-IP counting. Populated with the default gateway so
-    // that normal transit traffic (every packet legitimately routes through the
-    // gateway) does not inflate connection/DNS counts. This is intentionally
-    // narrow — RFC1918 as a whole is NOT excluded, so lateral movement against
-    // other LAN hosts remains visible.
+    // IPs excluded from per-destination counting. Caller populates this with
+    // the default gateway and the own_ips snapshot (which already includes
+    // subnet-directed broadcasts computed from interface netmasks). This is
+    // intentionally narrow: RFC1918 as a whole is NOT excluded, so lateral
+    // movement against other LAN hosts remains visible.
+    //
+    // Protocol-level infrastructure addresses (255.255.255.255, 224.0.0.0/4,
+    // ff00::/8) are caught by is_infrastructure_destination() rather than this
+    // set, since they're address-pattern checks that need no configuration.
     excluded_ips: HashSet<IpAddr>,
 }
 
 impl CrossFlowState {
-    pub fn new(config: CrossFlowConfig, gateway_ip: Option<IpAddr>) -> Self {
-        let mut excluded_ips = HashSet::new();
-        if let Some(gw) = gateway_ip {
-            excluded_ips.insert(gw);
-        }
+    pub fn new(config: CrossFlowConfig, excluded_ips: HashSet<IpAddr>) -> Self {
         Self {
             ip_stats: HashMap::new(),
             config,
@@ -60,8 +60,12 @@ impl CrossFlowState {
         }
     }
 
+    fn is_excluded(&self, ip: IpAddr) -> bool {
+        self.excluded_ips.contains(&ip) || crate::capture::is_infrastructure_destination(ip)
+    }
+
     pub fn record_connection(&mut self, remote_ip: IpAddr, protocol: u8, dst_port: u16) {
-        if self.excluded_ips.contains(&remote_ip) {
+        if self.is_excluded(remote_ip) {
             return;
         }
         let now = Instant::now();
@@ -132,8 +136,16 @@ impl Detector for CrossFlowDetector {
                     );
                 }
             };
-            let a = if state.excluded_ips.contains(&flow.a_ip) { None } else { state.get_stats(&flow.a_ip) };
-            let b = if state.excluded_ips.contains(&flow.b_ip) { None } else { state.get_stats(&flow.b_ip) };
+            let a = if state.is_excluded(flow.a_ip) {
+                None
+            } else {
+                state.get_stats(&flow.a_ip)
+            };
+            let b = if state.is_excluded(flow.b_ip) {
+                None
+            } else {
+                state.get_stats(&flow.b_ip)
+            };
             (a, b, state.config().clone())
             // MutexGuard drops here.
         };
@@ -245,7 +257,10 @@ mod tests {
 
     #[test]
     fn test_detector_score_zero_when_no_state() {
-        let state = Arc::new(Mutex::new(CrossFlowState::new(CrossFlowConfig::default(), None)));
+        let state = Arc::new(Mutex::new(CrossFlowState::new(
+            CrossFlowConfig::default(),
+            HashSet::new(),
+        )));
         let detector = CrossFlowDetector::new(state);
         let flow = make_flow(
             IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
@@ -258,7 +273,10 @@ mod tests {
 
     #[test]
     fn test_scan_detection_high_connection_count() {
-        let state = Arc::new(Mutex::new(CrossFlowState::new(CrossFlowConfig::default(), None)));
+        let state = Arc::new(Mutex::new(CrossFlowState::new(
+            CrossFlowConfig::default(),
+            HashSet::new(),
+        )));
         let remote: IpAddr = IpAddr::V4(Ipv4Addr::new(52, 73, 240, 202));
         // Simulate 201 connections to the remote IP.
         for _ in 0..201 {
@@ -277,7 +295,10 @@ mod tests {
 
     #[test]
     fn test_scan_medium_connection_count() {
-        let state = Arc::new(Mutex::new(CrossFlowState::new(CrossFlowConfig::default(), None)));
+        let state = Arc::new(Mutex::new(CrossFlowState::new(
+            CrossFlowConfig::default(),
+            HashSet::new(),
+        )));
         let remote: IpAddr = IpAddr::V4(Ipv4Addr::new(52, 73, 240, 202));
         for _ in 0..150 {
             state.lock().unwrap().record_connection(remote, 6, 443);
@@ -291,7 +312,10 @@ mod tests {
 
     #[test]
     fn test_dns_burst_detection() {
-        let state = Arc::new(Mutex::new(CrossFlowState::new(CrossFlowConfig::default(), None)));
+        let state = Arc::new(Mutex::new(CrossFlowState::new(
+            CrossFlowConfig::default(),
+            HashSet::new(),
+        )));
         let remote: IpAddr = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
         // Simulate 85 DNS queries — high threshold.
         for _ in 0..85 {
@@ -312,7 +336,7 @@ mod tests {
         let gateway: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
         let state = Arc::new(Mutex::new(CrossFlowState::new(
             CrossFlowConfig::default(),
-            Some(gateway),
+            [gateway].into_iter().collect(),
         )));
         // Record many connections through the gateway — should not count.
         for _ in 0..250 {
@@ -321,7 +345,10 @@ mod tests {
         let detector = CrossFlowDetector::new(state);
         let flow = make_flow(gateway, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)));
         let finding = detector.evaluate(&flow);
-        assert_eq!(finding.score, 0.0, "Gateway IP must not contribute to score");
+        assert_eq!(
+            finding.score, 0.0,
+            "Gateway IP must not contribute to score"
+        );
         assert!(finding.evidence.is_empty());
     }
 
@@ -331,7 +358,7 @@ mod tests {
         let lan_host: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
         let state = Arc::new(Mutex::new(CrossFlowState::new(
             CrossFlowConfig::default(),
-            Some(gateway),
+            [gateway].into_iter().collect(),
         )));
         for _ in 0..250 {
             state.lock().unwrap().record_connection(lan_host, 6, 445);
@@ -347,8 +374,55 @@ mod tests {
     }
 
     #[test]
+    fn test_multicast_destination_not_counted() {
+        let state = Arc::new(Mutex::new(CrossFlowState::new(
+            CrossFlowConfig::default(),
+            HashSet::new(),
+        )));
+        let mdns_multicast: IpAddr = IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251));
+        for _ in 0..250 {
+            state
+                .lock()
+                .unwrap()
+                .record_connection(mdns_multicast, 17, 5353);
+        }
+        let detector = CrossFlowDetector::new(state);
+        let flow = make_flow(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 43)), mdns_multicast);
+        let finding = detector.evaluate(&flow);
+        assert_eq!(
+            finding.score, 0.0,
+            "Multicast destination must not contribute to score"
+        );
+    }
+
+    #[test]
+    fn test_subnet_broadcast_not_counted() {
+        let subnet_bcast: IpAddr = IpAddr::V4(Ipv4Addr::new(172, 18, 22, 255));
+        let state = Arc::new(Mutex::new(CrossFlowState::new(
+            CrossFlowConfig::default(),
+            [subnet_bcast].into_iter().collect(), // own_ips snapshot includes this
+        )));
+        for _ in 0..250 {
+            state
+                .lock()
+                .unwrap()
+                .record_connection(subnet_bcast, 17, 137);
+        }
+        let detector = CrossFlowDetector::new(state);
+        let flow = make_flow(IpAddr::V4(Ipv4Addr::new(172, 18, 22, 43)), subnet_bcast);
+        let finding = detector.evaluate(&flow);
+        assert_eq!(
+            finding.score, 0.0,
+            "Subnet broadcast destination must not contribute to score"
+        );
+    }
+
+    #[test]
     fn test_both_ips_checked() {
-        let state = Arc::new(Mutex::new(CrossFlowState::new(CrossFlowConfig::default(), None)));
+        let state = Arc::new(Mutex::new(CrossFlowState::new(
+            CrossFlowConfig::default(),
+            HashSet::new(),
+        )));
         let remote: IpAddr = IpAddr::V4(Ipv4Addr::new(52, 73, 240, 202));
         for _ in 0..250 {
             state.lock().unwrap().record_connection(remote, 6, 443);

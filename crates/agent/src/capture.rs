@@ -311,7 +311,10 @@ pub fn detect_default_gateway() -> Option<IpAddr> {
         )
     };
     if ret < 0 || needed == 0 {
-        warn!("sysctl route size query failed: {}", std::io::Error::last_os_error());
+        warn!(
+            "sysctl route size query failed: {}",
+            std::io::Error::last_os_error()
+        );
         return None;
     }
 
@@ -329,7 +332,10 @@ pub fn detect_default_gateway() -> Option<IpAddr> {
         )
     };
     if ret < 0 {
-        warn!("sysctl route fill failed: {}", std::io::Error::last_os_error());
+        warn!(
+            "sysctl route fill failed: {}",
+            std::io::Error::last_os_error()
+        );
         return None;
     }
     buf.truncate(needed);
@@ -345,15 +351,15 @@ fn rt_buf_find_gateway(buf: &[u8]) -> Option<IpAddr> {
 
     while offset + hdr_size <= buf.len() {
         // SAFETY: buf is kernel-provided, bounds-checked above.
-        let rtm: libc::rt_msghdr = unsafe {
-            std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const libc::rt_msghdr)
-        };
+        let rtm: libc::rt_msghdr =
+            unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const libc::rt_msghdr) };
         let msg_len = rtm.rtm_msglen as usize;
         if msg_len < hdr_size || offset + msg_len > buf.len() {
             break;
         }
 
-        if rtm.rtm_flags & (libc::RTF_GATEWAY | libc::RTF_UP) == (libc::RTF_GATEWAY | libc::RTF_UP) {
+        if rtm.rtm_flags & (libc::RTF_GATEWAY | libc::RTF_UP) == (libc::RTF_GATEWAY | libc::RTF_UP)
+        {
             let msg = &buf[offset..offset + msg_len];
             if let Some(gw) = rt_msg_gateway(msg, &rtm) {
                 if !gw.is_loopback() && !gw.is_unspecified() {
@@ -386,7 +392,11 @@ fn rt_msg_gateway(msg: &[u8], rtm: &libc::rt_msghdr) -> Option<IpAddr> {
             break;
         }
         let sa_len = sa_buf[pos] as usize;
-        let actual = if sa_len == 0 { std::mem::size_of::<libc::sockaddr>() } else { sa_len };
+        let actual = if sa_len == 0 {
+            std::mem::size_of::<libc::sockaddr>()
+        } else {
+            sa_len
+        };
         let rounded = rt_roundup(actual);
 
         if rta == libc::RTA_GATEWAY {
@@ -400,7 +410,11 @@ fn rt_msg_gateway(msg: &[u8], rtm: &libc::rt_msghdr) -> Option<IpAddr> {
 /// BSD RT_ROUNDUP: align to sizeof(long) (8 bytes on 64-bit Darwin).
 fn rt_roundup(n: usize) -> usize {
     const ALIGN: usize = std::mem::size_of::<libc::c_long>();
-    if n == 0 { ALIGN } else { (n + ALIGN - 1) & !(ALIGN - 1) }
+    if n == 0 {
+        ALIGN
+    } else {
+        (n + ALIGN - 1) & !(ALIGN - 1)
+    }
 }
 
 /// Parse an IpAddr from a raw sockaddr slice (AF_INET or AF_INET6).
@@ -414,18 +428,18 @@ fn rt_parse_sockaddr(buf: &[u8]) -> Option<IpAddr> {
                 return None;
             }
             // SAFETY: bounds checked above.
-            let sin: libc::sockaddr_in = unsafe {
-                std::ptr::read_unaligned(buf.as_ptr() as *const libc::sockaddr_in)
-            };
-            Some(IpAddr::V4(std::net::Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes())))
+            let sin: libc::sockaddr_in =
+                unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const libc::sockaddr_in) };
+            Some(IpAddr::V4(std::net::Ipv4Addr::from(
+                sin.sin_addr.s_addr.to_ne_bytes(),
+            )))
         }
         libc::AF_INET6 => {
             if buf.len() < std::mem::size_of::<libc::sockaddr_in6>() {
                 return None;
             }
-            let sin6: libc::sockaddr_in6 = unsafe {
-                std::ptr::read_unaligned(buf.as_ptr() as *const libc::sockaddr_in6)
-            };
+            let sin6: libc::sockaddr_in6 =
+                unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const libc::sockaddr_in6) };
             Some(IpAddr::V6(std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr)))
         }
         _ => None,
@@ -562,6 +576,24 @@ pub struct CaptureEngine {
 
 /// Consecutive IPC failures before the agent exits for launchd/systemd restart.
 const MAX_IPC_FAILURES: u32 = 5;
+
+/// Returns true if `ip` is a protocol-level infrastructure address that no
+/// real host ever originates: the IPv4 limited broadcast (255.255.255.255),
+/// any IPv4 multicast (224.0.0.0/4), or any IPv6 multicast (ff00::/8).
+///
+/// Subnet-directed broadcasts (e.g. 172.18.22.255) are NOT matched here —
+/// they depend on the local subnet mask and are excluded via the own_ips
+/// snapshot passed to CrossFlowState at startup.
+///
+/// Used by both should_skip_block() (enforcement guard) and
+/// CrossFlowState::record_connection() (scan-detection counting), so both
+/// sites share one definition and can't drift apart.
+pub(crate) fn is_infrastructure_destination(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_broadcast() || v4.is_multicast(),
+        IpAddr::V6(_) => ip.is_multicast(),
+    }
+}
 
 impl CaptureEngine {
     pub fn new(
@@ -828,9 +860,7 @@ impl CaptureEngine {
                         // Pick the top-scoring Completed detector for the enforcement log.
                         let top_detector = findings
                             .iter()
-                            .filter(|f| {
-                                f.status == synapse_common::DetectorStatus::Completed
-                            })
+                            .filter(|f| f.status == synapse_common::DetectorStatus::Completed)
                             .max_by(|a, b| {
                                 (a.score * a.confidence)
                                     .partial_cmp(&(b.score * b.confidence))
@@ -882,7 +912,9 @@ impl CaptureEngine {
         if transitions.is_empty() {
             return;
         }
-        let Some(ref tx) = self.storage_tx else { return };
+        let Some(ref tx) = self.storage_tx else {
+            return;
+        };
         for t in transitions {
             let _ = tx.send(StorageEvent::CircuitBreakerTransition {
                 detector_id: format!("{:?}", t.detector_id),
@@ -906,11 +938,11 @@ impl CaptureEngine {
         if Some(remote) == self.config.gateway_ip {
             return Some("remote is default gateway");
         }
+        if is_infrastructure_destination(remote) {
+            return Some("remote is broadcast/multicast");
+        }
         match remote {
             IpAddr::V4(v4) => {
-                if v4.is_broadcast() {
-                    return Some("remote is broadcast");
-                }
                 if v4.is_link_local() {
                     return Some("remote is link-local");
                 }
@@ -924,10 +956,6 @@ impl CaptureEngine {
                     return Some("remote is IPv6 link-local");
                 }
             }
-        }
-        // Multicast — protocol-level group addresses, not attacker-controlled hosts.
-        if remote.is_multicast() {
-            return Some("remote is multicast");
         }
         None
     }

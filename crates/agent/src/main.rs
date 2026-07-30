@@ -234,10 +234,20 @@ fn main() -> io::Result<()> {
     synapse_common::init_detector_pool(8);
     info!("detector worker pool initialized (8 workers)");
 
+    // CrossFlow exclusion set: gateway + own_ips snapshot.
+    // own_ips already contains subnet-directed broadcasts (e.g. 172.18.22.255)
+    // computed from interface netmasks by detect_own_ips(). Protocol-level
+    // infrastructure addresses (multicast, 255.255.255.255) are handled by
+    // is_infrastructure_destination() inside CrossFlowState, not this set.
+    let mut cf_excluded: std::collections::HashSet<std::net::IpAddr> =
+        own_ips.load().as_ref().clone();
+    if let Some(gw) = gateway_ip {
+        cf_excluded.insert(gw);
+    }
     let cross_flow_state = Arc::new(std::sync::Mutex::new(
         detectors::cross_flow::CrossFlowState::new(
             detectors::cross_flow::CrossFlowConfig::default(),
-            gateway_ip,
+            cf_excluded,
         ),
     ));
 
