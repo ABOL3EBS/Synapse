@@ -65,10 +65,15 @@ impl DecisionEngine {
     /// - Find the most severe Completed finding
     /// - Look up TTL from `ttl_by_severity` config
     /// - Clamp to [min_ttl, max_ttl]
-    /// Evaluate all detector findings and produce a verdict plus the raw
-    /// composite score. The score is returned so callers (storage, logging)
-    /// can record it without re-computing.
-    pub fn evaluate(&self, features: &FlowFeatures, findings: &[DetectorFinding]) -> (Verdict, f32) {
+    ///
+    /// Evaluate all detector findings and produce a verdict plus the raw composite
+    /// score. The score is returned so callers (storage, logging) can record it
+    /// without re-computing.
+    pub fn evaluate(
+        &self,
+        features: &FlowFeatures,
+        findings: &[DetectorFinding],
+    ) -> (Verdict, f32) {
         let mut total_score = 0.0_f32;
         let mut most_severe: Option<Severity> = None;
         let mut evidence_summary = Vec::new();

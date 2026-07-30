@@ -409,8 +409,7 @@ mod tests {
     #[test]
     fn test_mdns_flow_unresolved_process_scores_zero() {
         let detector = ProcessCorrelator;
-        let mut flow =
-            make_flow_with_process(None, None, "224.0.0.251".parse().unwrap());
+        let mut flow = make_flow_with_process(None, None, "224.0.0.251".parse().unwrap());
         flow.protocol = 17;
         flow.a_port = 5353;
         flow.b_port = 5353;

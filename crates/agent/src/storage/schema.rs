@@ -1,7 +1,7 @@
 use log::info;
 use rusqlite::Connection;
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Apply the schema to an open connection. Idempotent — safe to call on
 /// every startup. Uses PRAGMA user_version for lightweight migration tracking.
@@ -13,13 +13,36 @@ pub fn apply_schema(conn: &Connection) -> Result<(), String> {
         .map_err(|e| format!("read user_version: {e}"))?;
 
     if version == 0 {
+        // Pre-v1 databases have an enforcement_log with a different column set
+        // (timestamp/ip/success/message instead of event_id/ip_blob/ip_text/…).
+        // Drop it so V1_DDL can recreate it with the correct schema.
+        let old_schema: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('enforcement_log') \
+                 WHERE name = 'event_id'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            == 0;
+        if old_schema {
+            conn.execute_batch("DROP TABLE IF EXISTS enforcement_log;")
+                .map_err(|e| format!("drop legacy enforcement_log: {e}"))?;
+            info!("storage: dropped legacy enforcement_log (pre-v1 schema)");
+        }
+
         conn.execute_batch(V1_DDL)
             .map_err(|e| format!("schema v1: {e}"))?;
+        info!("storage: schema v1 applied");
+    }
+
+    if version < 2 {
+        conn.execute_batch(V2_DDL)
+            .map_err(|e| format!("schema v2: {e}"))?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|e| format!("set user_version: {e}"))?;
-        info!("storage: schema v{SCHEMA_VERSION} applied");
+        info!("storage: schema v2 applied (metadata table)");
     }
-    // Future: else if version < N { apply_vN_migration(conn)?; }
 
     Ok(())
 }
@@ -130,4 +153,19 @@ CREATE TABLE IF NOT EXISTS circuit_breaker_events (
 );
 CREATE INDEX IF NOT EXISTS cb_ts       ON circuit_breaker_events(ts_ms DESC);
 CREATE INDEX IF NOT EXISTS cb_detector ON circuit_breaker_events(detector_id, ts_ms DESC);
+";
+
+// ---------------------------------------------------------------------------
+// V2 DDL — metadata table for durable worker state
+// ---------------------------------------------------------------------------
+
+const V2_DDL: &str = "
+-- Durable worker state: survives agent restarts.
+-- Initial row inserted once; updated in-place by the storage worker.
+CREATE TABLE IF NOT EXISTS metadata (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+INSERT OR IGNORE INTO metadata (key, value)
+    VALUES ('last_retention_run_ms', '0');
 ";

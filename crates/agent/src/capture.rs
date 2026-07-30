@@ -596,6 +596,7 @@ pub(crate) fn is_infrastructure_destination(ip: IpAddr) -> bool {
 }
 
 impl CaptureEngine {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         bpf_fd: RawFd,
         buf: Vec<u8>,

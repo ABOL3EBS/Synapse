@@ -868,7 +868,10 @@ mod tests {
                 flow: stub_flow.clone(),
                 result_tx: dummy_tx,
             };
-            assert!(tx.try_send(task).is_ok(), "channel should accept tasks up to capacity");
+            assert!(
+                tx.try_send(task).is_ok(),
+                "channel should accept tasks up to capacity"
+            );
         }
 
         // One more — channel is full, must return Full immediately.
@@ -880,7 +883,10 @@ mod tests {
         };
         let start = Instant::now();
         assert!(
-            matches!(tx.try_send(overflow), Err(crossbeam_channel::TrySendError::Full(_))),
+            matches!(
+                tx.try_send(overflow),
+                Err(crossbeam_channel::TrySendError::Full(_))
+            ),
             "try_send on a full channel must return Full"
         );
         assert!(

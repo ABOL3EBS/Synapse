@@ -28,8 +28,8 @@ pub struct CriticalSpool {
 
 impl CriticalSpool {
     pub fn open(path: &Path) -> Result<Self, String> {
-        let conn = Connection::open(path)
-            .map_err(|e| format!("spool open {}: {e}", path.display()))?;
+        let conn =
+            Connection::open(path).map_err(|e| format!("spool open {}: {e}", path.display()))?;
         conn.execute_batch(
             "PRAGMA journal_mode = DELETE;
              PRAGMA synchronous  = FULL;
@@ -49,7 +49,13 @@ impl CriticalSpool {
 
     /// Append a Critical event. Blocks until the OS has acknowledged the write
     /// (PRAGMA synchronous=FULL). Returns Err only if the spool itself is broken.
-    pub fn append(&mut self, event_id: &str, ts_ms: i64, kind: &str, payload: &str) -> Result<(), String> {
+    pub fn append(
+        &mut self,
+        event_id: &str,
+        ts_ms: i64,
+        kind: &str,
+        payload: &str,
+    ) -> Result<(), String> {
         self.conn
             .execute(
                 "INSERT OR IGNORE INTO spool (event_id, ts_ms, kind, payload) \
@@ -98,7 +104,8 @@ impl CriticalSpool {
             tx.execute("UPDATE spool SET done = 1 WHERE event_id = ?1", params![id])
                 .map_err(|e| format!("spool confirm {id}: {e}"))?;
         }
-        tx.commit().map_err(|e| format!("spool confirm commit: {e}"))
+        tx.commit()
+            .map_err(|e| format!("spool confirm commit: {e}"))
     }
 
     /// Delete confirmed entries older than `before_ts_ms`. Called periodically

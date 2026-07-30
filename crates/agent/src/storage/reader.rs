@@ -174,22 +174,14 @@ impl StorageReader {
                 .unwrap_or(0)
         };
         KpiSummary {
-            blocks_24h: q(
-                "SELECT count(*) FROM verdicts \
-                 WHERE verdict='Block' AND ts_ms >= ?1",
-            ),
-            alerts_24h: q(
-                "SELECT count(*) FROM verdicts \
-                 WHERE verdict='Alert' AND ts_ms >= ?1",
-            ),
-            unique_ips_blocked: q(
-                "SELECT count(DISTINCT ip_text) FROM enforcement_log \
-                 WHERE ts_ms >= ?1 AND confirmed = 0 AND error IS NULL",
-            ),
-            enforcement_failures: q(
-                "SELECT count(*) FROM enforcement_log \
-                 WHERE ts_ms >= ?1 AND error IS NOT NULL",
-            ),
+            blocks_24h: q("SELECT count(*) FROM verdicts \
+                 WHERE verdict='Block' AND ts_ms >= ?1"),
+            alerts_24h: q("SELECT count(*) FROM verdicts \
+                 WHERE verdict='Alert' AND ts_ms >= ?1"),
+            unique_ips_blocked: q("SELECT count(DISTINCT ip_text) FROM enforcement_log \
+                 WHERE ts_ms >= ?1 AND confirmed = 0 AND error IS NULL"),
+            enforcement_failures: q("SELECT count(*) FROM enforcement_log \
+                 WHERE ts_ms >= ?1 AND error IS NOT NULL"),
         }
     }
 }

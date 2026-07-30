@@ -66,6 +66,12 @@ impl CrossFlowState {
 
     pub fn record_connection(&mut self, remote_ip: IpAddr, protocol: u8, dst_port: u16) {
         if self.is_excluded(remote_ip) {
+            log::debug!(
+                "CrossFlow: dst={}:{} proto={} EXCLUDED (gateway/own-ip/broadcast/multicast)",
+                remote_ip,
+                dst_port,
+                protocol
+            );
             return;
         }
         let now = Instant::now();
@@ -137,11 +143,13 @@ impl Detector for CrossFlowDetector {
                 }
             };
             let a = if state.is_excluded(flow.a_ip) {
+                log::debug!("CrossFlow eval: a_ip={} EXCLUDED", flow.a_ip);
                 None
             } else {
                 state.get_stats(&flow.a_ip)
             };
             let b = if state.is_excluded(flow.b_ip) {
+                log::debug!("CrossFlow eval: b_ip={} EXCLUDED", flow.b_ip);
                 None
             } else {
                 state.get_stats(&flow.b_ip)
@@ -156,7 +164,15 @@ impl Detector for CrossFlowDetector {
 
         for (ip, stats_opt) in [(flow.a_ip, stats_a), (flow.b_ip, stats_b)] {
             let (conn_count, dns_count) = match stats_opt {
-                Some(stats) => stats,
+                Some(stats) => {
+                    log::debug!(
+                        "CrossFlow eval: ip={} conn_count={} dns_count={}",
+                        ip,
+                        stats.0,
+                        stats.1
+                    );
+                    stats
+                }
                 None => continue,
             };
 
@@ -206,6 +222,15 @@ impl Detector for CrossFlowDetector {
                 });
             }
         }
+
+        log::debug!(
+            "CrossFlow: flow={} a_ip={} b_ip={} score={:.2} conf={:.2}",
+            flow.flow_id,
+            flow.a_ip,
+            flow.b_ip,
+            max_score,
+            max_conf
+        );
 
         let severity = if max_score > 0.7 {
             Severity::Critical
