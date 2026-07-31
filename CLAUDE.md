@@ -158,7 +158,7 @@ crates/
 
 - **Never commit unless explicitly asked.** After completing a step, show the diff and wait for the user to say "commit" or "ship it".
 - **Never start a build unless explicitly asked or unless you just edited code.** If you edited code, run `cargo build` to verify it compiles. If it fails, fix it before proceeding.
-- **After every successful step, update the md files** — `doc/STATUS.md` and this file's status section. Show what changed.
+- **After every successful step, update all three doc files** — `doc/STATUS.md` (line counts, test counts, component descriptions), `doc/Synapse-IPS-Architecture.md` (§5 file-tree line counts, §changelog entry), and this file's status section. All three must stay in sync. Stale line counts in the architecture doc were found and corrected multiple times — check all three before committing, not just STATUS.md.
 - **Verify with real terminal output.** Don't say "this should work" — show the actual output. If the user needs to run sudo, give exact commands and wait for their output.
 - **User runs sudo manually.** The agent session cannot run sudo. Give copy-paste command blocks.
 - **When testing pfctl:** always show before/after `pfctl -s state -vv` output. `killed 0 states` is a silent failure — find a real active state first.
