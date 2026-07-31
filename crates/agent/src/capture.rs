@@ -1124,6 +1124,9 @@ impl CaptureEngine {
                     );
                     if let Ok(mut state) = self.cross_flow_state.lock() {
                         state.record_connection(remote_ip, info_pkt.protocol, remote_port);
+                        if pid != 0 {
+                            state.record_pid_connection(pid, remote_ip);
+                        }
                     }
 
                     let request = EnrichmentRequest {

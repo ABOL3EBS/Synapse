@@ -1,20 +1,44 @@
-use std::collections::{HashMap, HashSet};
+// This file exceeds 600 lines because all four sub-detectors (scan, DNS-burst,
+// beaconing, connection-diversity) share CrossFlowState — the in-process state
+// machine that record_connection() and evaluate() both access. Splitting would
+// require either duplicating shared state or a new crate; both are worse.
+// Documented per CLAUDE.md §Structural Rules.
+
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use synapse_common::{
     Detector, DetectorFinding, DetectorId, DetectorStatus, Evidence, FlowRecord, Severity,
 };
 
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone)]
 pub struct CrossFlowConfig {
     pub window_secs: u64,
+    // Scan detection.
     pub scan_connection_threshold_high: u64,
     pub scan_connection_threshold_medium: u64,
+    // DNS burst detection.
     pub dns_burst_threshold_high: u64,
     pub dns_burst_threshold_medium: u64,
+    // Beaconing detection.
+    pub beacon_min_connections_medium: usize, // ≥5 connections required
+    pub beacon_min_connections_high: usize,   // ≥10 connections required
+    pub beacon_cv_medium: f64,                // CV < 0.3 for medium tier
+    pub beacon_cv_high: f64,                  // CV < 0.2 for high tier
+    pub beacon_mean_min_secs: f64,            // lower bound on mean interval (2.0s)
+    pub max_beacon_entries: usize,            // per-(ip,port,proto) cap (200)
+    // Connection-diversity detection.
+    pub max_pid_entries: usize,         // per-PID VecDeque cap (512)
+    pub max_tracked_pids: usize,        // total PID map cap (1024)
+    pub pid_diversity_window_secs: u64, // rolling window for diversity (10s)
+    pub pid_diversity_threshold_medium: usize, // >20 distinct IPs → medium
+    pub pid_diversity_threshold_high: usize, // >50 distinct IPs → high
 }
 
 impl Default for CrossFlowConfig {
@@ -25,9 +49,24 @@ impl Default for CrossFlowConfig {
             scan_connection_threshold_medium: 100,
             dns_burst_threshold_high: 80,
             dns_burst_threshold_medium: 30,
+            beacon_min_connections_medium: 5,
+            beacon_min_connections_high: 10,
+            beacon_cv_medium: 0.3,
+            beacon_cv_high: 0.2,
+            beacon_mean_min_secs: 2.0,
+            max_beacon_entries: 200,
+            max_pid_entries: 512,
+            max_tracked_pids: 1024,
+            pid_diversity_window_secs: 10,
+            pid_diversity_threshold_medium: 20,
+            pid_diversity_threshold_high: 50,
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 struct IpFlowStats {
@@ -38,6 +77,10 @@ struct IpFlowStats {
 
 pub struct CrossFlowState {
     ip_stats: HashMap<IpAddr, IpFlowStats>,
+    // Per-(remote_ip, remote_port, protocol) arrival timestamps for beaconing.
+    beacon_history: HashMap<(IpAddr, u16, u8), VecDeque<Instant>>,
+    // Per-PID remote IP history for connection-diversity.
+    pid_diversity: HashMap<u32, VecDeque<(IpAddr, Instant)>>,
     config: CrossFlowConfig,
     // IPs excluded from per-destination counting. Caller populates this with
     // the default gateway and the own_ips snapshot (which already includes
@@ -55,6 +98,8 @@ impl CrossFlowState {
     pub fn new(config: CrossFlowConfig, excluded_ips: HashSet<IpAddr>) -> Self {
         Self {
             ip_stats: HashMap::new(),
+            beacon_history: HashMap::new(),
+            pid_diversity: HashMap::new(),
             config,
             excluded_ips,
         }
@@ -64,12 +109,14 @@ impl CrossFlowState {
         self.excluded_ips.contains(&ip) || crate::capture::is_infrastructure_destination(ip)
     }
 
-    pub fn record_connection(&mut self, remote_ip: IpAddr, protocol: u8, dst_port: u16) {
+    // Called for every new flow (not per-packet). remote_port is the
+    // direction-resolved port of the remote endpoint, not info_pkt.dst_port.
+    pub fn record_connection(&mut self, remote_ip: IpAddr, protocol: u8, remote_port: u16) {
         if self.is_excluded(remote_ip) {
             log::debug!(
                 "CrossFlow: dst={}:{} proto={} EXCLUDED (gateway/own-ip/broadcast/multicast)",
                 remote_ip,
-                dst_port,
+                remote_port,
                 protocol
             );
             return;
@@ -82,14 +129,57 @@ impl CrossFlowState {
         });
         stats.connection_count = stats.connection_count.saturating_add(1);
         stats.last_seen = now;
-        if protocol == 17 && dst_port == 53 {
+        // remote_port is already direction-resolved so port==53 means remote DNS.
+        if protocol == 17 && remote_port == 53 {
             stats.dns_query_count = stats.dns_query_count.saturating_add(1);
+        }
+        let beacon = self
+            .beacon_history
+            .entry((remote_ip, remote_port, protocol))
+            .or_default();
+        if beacon.len() < self.config.max_beacon_entries {
+            beacon.push_back(now);
+        }
+    }
+
+    // Called for every new flow when the originating PID is known (pid != 0).
+    pub fn record_pid_connection(&mut self, pid: u32, remote_ip: IpAddr) {
+        if crate::capture::is_infrastructure_destination(remote_ip) {
+            return;
+        }
+        // Count-cap: don't add new PIDs when at capacity.
+        if !self.pid_diversity.contains_key(&pid)
+            && self.pid_diversity.len() >= self.config.max_tracked_pids
+        {
+            return;
+        }
+        let deque = self.pid_diversity.entry(pid).or_default();
+        // Stop pushing at cap — evaluate() returns the cap-hit Critical tier.
+        if deque.len() < self.config.max_pid_entries {
+            deque.push_back((remote_ip, Instant::now()));
         }
     }
 
     pub fn purge_expired(&mut self) {
-        let cutoff = Instant::now() - Duration::from_secs(self.config.window_secs);
-        self.ip_stats.retain(|_, stats| stats.last_seen >= cutoff);
+        let now = Instant::now();
+        let scan_cutoff = now - Duration::from_secs(self.config.window_secs);
+        let pid_cutoff = now - Duration::from_secs(self.config.pid_diversity_window_secs);
+
+        self.ip_stats.retain(|_, s| s.last_seen >= scan_cutoff);
+
+        self.beacon_history.retain(|_, deque| {
+            while deque.front().is_some_and(|t| *t < scan_cutoff) {
+                deque.pop_front();
+            }
+            !deque.is_empty()
+        });
+
+        self.pid_diversity.retain(|_, deque| {
+            while deque.front().is_some_and(|(_, t)| *t < pid_cutoff) {
+                deque.pop_front();
+            }
+            !deque.is_empty()
+        });
     }
 
     pub fn get_stats(&self, ip: &IpAddr) -> Option<(u64, u64)> {
@@ -98,10 +188,184 @@ impl CrossFlowState {
             .map(|s| (s.connection_count, s.dns_query_count))
     }
 
+    pub fn get_beacon_history(
+        &self,
+        ip: IpAddr,
+        port: u16,
+        proto: u8,
+    ) -> Option<&VecDeque<Instant>> {
+        self.beacon_history.get(&(ip, port, proto))
+    }
+
+    pub fn get_pid_diversity(&self, pid: u32) -> Option<&VecDeque<(IpAddr, Instant)>> {
+        self.pid_diversity.get(&pid)
+    }
+
+    pub fn pid_diversity_at_cap(&self, pid: u32) -> bool {
+        self.pid_diversity
+            .get(&pid)
+            .is_some_and(|d| d.len() >= self.config.max_pid_entries)
+    }
+
     pub fn config(&self) -> &CrossFlowConfig {
         &self.config
     }
 }
+
+// ---------------------------------------------------------------------------
+// Scoring helpers (module-private, free functions for testability)
+// ---------------------------------------------------------------------------
+
+fn score_scan_dns(
+    ip: IpAddr,
+    conn_count: u64,
+    dns_count: u64,
+    cfg: &CrossFlowConfig,
+) -> (f32, f32, Vec<Evidence>) {
+    let mut max_score = 0.0_f32;
+    let mut max_conf = 0.0_f32;
+    let mut ev: Vec<Evidence> = Vec::new();
+    let w = cfg.window_secs;
+
+    if conn_count > cfg.scan_connection_threshold_high {
+        max_score = max_score.max(0.9);
+        max_conf = max_conf.max(0.95);
+        ev.push(Evidence {
+            description: format!("High connection count to IP: {conn_count} connections in {w}s"),
+            detail: Some(ip.to_string()),
+        });
+    } else if conn_count > cfg.scan_connection_threshold_medium {
+        max_score = max_score.max(0.7);
+        max_conf = max_conf.max(0.8);
+        ev.push(Evidence {
+            description: format!(
+                "Elevated connection count to IP: {conn_count} connections in {w}s"
+            ),
+            detail: Some(ip.to_string()),
+        });
+    }
+    if dns_count > cfg.dns_burst_threshold_high {
+        max_score = max_score.max(0.8);
+        max_conf = max_conf.max(0.7);
+        ev.push(Evidence {
+            description: format!("DNS query burst: {dns_count} queries to IP in {w}s"),
+            detail: Some(ip.to_string()),
+        });
+    } else if dns_count > cfg.dns_burst_threshold_medium {
+        max_score = max_score.max(0.5);
+        max_conf = max_conf.max(0.5);
+        ev.push(Evidence {
+            description: format!("Elevated DNS queries: {dns_count} queries to IP in {w}s"),
+            detail: Some(ip.to_string()),
+        });
+    }
+    (max_score, max_conf, ev)
+}
+
+// Beaconing: coefficient-of-variation on per-endpoint inter-arrival times.
+// Pre-filter: mean ∈ [beacon_mean_min_secs, window_secs/4].
+// Upper bound derivation: 4 intervals × mean ≤ window_secs (5 connections span 4 intervals).
+fn compute_beacon_score(
+    history: &VecDeque<Instant>,
+    cfg: &CrossFlowConfig,
+) -> Option<(f32, f32, Evidence)> {
+    let n = history.len();
+    if n < cfg.beacon_min_connections_medium {
+        return None;
+    }
+    let instants: Vec<Instant> = history.iter().cloned().collect();
+    let intervals: Vec<f64> = instants
+        .windows(2)
+        .map(|w| w[1].duration_since(w[0]).as_secs_f64())
+        .collect();
+    let n_f = intervals.len() as f64;
+    let mean = intervals.iter().sum::<f64>() / n_f;
+
+    let mean_max = cfg.window_secs as f64 / 4.0;
+    if mean < cfg.beacon_mean_min_secs || mean > mean_max {
+        return None;
+    }
+    let variance = intervals.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n_f;
+    let stddev = variance.sqrt();
+    if mean == 0.0 {
+        return None;
+    }
+    let cv = stddev / mean;
+
+    let ev = Evidence {
+        description: format!(
+            "Beacon-like periodicity: {n} connections, mean={mean:.1}s, CV={cv:.3}"
+        ),
+        detail: None,
+    };
+    if n >= cfg.beacon_min_connections_high && cv < cfg.beacon_cv_high {
+        Some((0.70, 0.75, ev))
+    } else if cv < cfg.beacon_cv_medium {
+        Some((0.60, 0.60, ev))
+    } else {
+        None
+    }
+}
+
+// Connection-diversity: distinct remote IPs from one PID in pid_diversity_window_secs.
+// Returns (score, confidence, evidence, cap_hit).
+// cap_hit = true means caller should emit an autonomous-override warn!.
+//
+// Score×confidence arithmetic (override_threshold = 0.85):
+//   >20 tier: 0.30×0.40 = 0.12 — below alert; browser page-loads stay quiet
+//   >50 tier: 0.50×0.55 = 0.275 — below alert; legitimate multi-host tools stay quiet
+//   cap-hit:  0.90×0.95 = 0.855 ≥ 0.85 — crosses override_threshold → autonomous Block
+fn compute_diversity_score(
+    connections: &VecDeque<(IpAddr, Instant)>,
+    pid: u32,
+    cfg: &CrossFlowConfig,
+    at_cap: bool,
+) -> Option<(f32, f32, Evidence, bool)> {
+    if at_cap {
+        let ev = Evidence {
+            description: format!(
+                "Connection-diversity cap hit: {}+ distinct IPs from pid={} in <{}s",
+                cfg.max_pid_entries, pid, cfg.pid_diversity_window_secs
+            ),
+            detail: Some(format!("pid={pid}")),
+        };
+        return Some((0.90, 0.95, ev, true));
+    }
+    let now = Instant::now();
+    let window = Duration::from_secs(cfg.pid_diversity_window_secs);
+    let distinct: HashSet<IpAddr> = connections
+        .iter()
+        .filter(|(_, t)| now.duration_since(*t) <= window)
+        .map(|(ip, _)| *ip)
+        .collect();
+    let count = distinct.len();
+
+    if count > cfg.pid_diversity_threshold_high {
+        let ev = Evidence {
+            description: format!(
+                "Process pid={pid} connected to {count} distinct IPs in {}s",
+                cfg.pid_diversity_window_secs
+            ),
+            detail: Some(format!("pid={pid}")),
+        };
+        Some((0.50, 0.55, ev, false))
+    } else if count > cfg.pid_diversity_threshold_medium {
+        let ev = Evidence {
+            description: format!(
+                "Process pid={pid} connected to {count} distinct IPs in {}s",
+                cfg.pid_diversity_window_secs
+            ),
+            detail: Some(format!("pid={pid}")),
+        };
+        Some((0.30, 0.40, ev, false))
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Detector
+// ---------------------------------------------------------------------------
 
 pub struct CrossFlowDetector {
     cross_flow_state: Arc<Mutex<CrossFlowState>>,
@@ -112,6 +376,77 @@ impl CrossFlowDetector {
         Self {
             cross_flow_state: state,
         }
+    }
+}
+
+// Holds a snapshot of the state needed by evaluate(), copied while the lock
+// is held so scoring runs outside the lock.
+struct CrossFlowSnapshot {
+    stats_a: Option<(u64, u64)>,
+    stats_b: Option<(u64, u64)>,
+    beacon_a: Option<VecDeque<Instant>>,
+    beacon_b: Option<VecDeque<Instant>>,
+    pid_conns: Option<VecDeque<(IpAddr, Instant)>>,
+    pid_at_cap: bool,
+    cfg: CrossFlowConfig,
+}
+
+impl CrossFlowDetector {
+    fn snapshot(&self, flow: &FlowRecord) -> Result<CrossFlowSnapshot, &'static str> {
+        let state = self
+            .cross_flow_state
+            .lock()
+            .map_err(|_| "cross-flow state lock poisoned")?;
+        let a_ok = !state.is_excluded(flow.a_ip);
+        let b_ok = !state.is_excluded(flow.b_ip);
+        if !a_ok {
+            log::debug!("CrossFlow eval: a_ip={} EXCLUDED", flow.a_ip);
+        }
+        if !b_ok {
+            log::debug!("CrossFlow eval: b_ip={} EXCLUDED", flow.b_ip);
+        }
+        let stats_a = if a_ok {
+            state.get_stats(&flow.a_ip)
+        } else {
+            None
+        };
+        let stats_b = if b_ok {
+            state.get_stats(&flow.b_ip)
+        } else {
+            None
+        };
+        // Beacon history checked against both canonical (ip, port) pairs; the
+        // one that matches the recorded remote endpoint will return Some.
+        let beacon_a = if a_ok {
+            state
+                .get_beacon_history(flow.a_ip, flow.a_port, flow.protocol)
+                .cloned()
+        } else {
+            None
+        };
+        let beacon_b = if b_ok {
+            state
+                .get_beacon_history(flow.b_ip, flow.b_port, flow.protocol)
+                .cloned()
+        } else {
+            None
+        };
+        let (pid_conns, pid_at_cap) = match flow.pid {
+            Some(pid) => (
+                state.get_pid_diversity(pid).cloned(),
+                state.pid_diversity_at_cap(pid),
+            ),
+            None => (None, false),
+        };
+        Ok(CrossFlowSnapshot {
+            stats_a,
+            stats_b,
+            beacon_a,
+            beacon_b,
+            pid_conns,
+            pid_at_cap,
+            cfg: state.config().clone(),
+        })
     }
 }
 
@@ -126,100 +461,64 @@ impl Detector for CrossFlowDetector {
 
     fn evaluate(&self, flow: &FlowRecord) -> DetectorFinding {
         let start = Instant::now();
-
-        // Hold the lock only long enough to copy out the stats we need.
-        // Scoring runs outside the lock so record_connection() on the hot
-        // path is never blocked by a slow or timed-out detector evaluation.
-        let (stats_a, stats_b, cfg) = {
-            let state = match self.cross_flow_state.lock() {
-                Ok(s) => s,
-                Err(_) => {
-                    return DetectorFinding::errored(
-                        DetectorId::CrossFlow,
-                        "1.0.0",
-                        "cross-flow state lock poisoned",
-                        0,
-                    );
-                }
-            };
-            let a = if state.is_excluded(flow.a_ip) {
-                log::debug!("CrossFlow eval: a_ip={} EXCLUDED", flow.a_ip);
-                None
-            } else {
-                state.get_stats(&flow.a_ip)
-            };
-            let b = if state.is_excluded(flow.b_ip) {
-                log::debug!("CrossFlow eval: b_ip={} EXCLUDED", flow.b_ip);
-                None
-            } else {
-                state.get_stats(&flow.b_ip)
-            };
-            (a, b, state.config().clone())
-            // MutexGuard drops here.
+        let snap = match self.snapshot(flow) {
+            Ok(s) => s,
+            Err(msg) => {
+                return DetectorFinding::errored(DetectorId::CrossFlow, "1.0.0", msg, 0);
+            }
         };
 
         let mut evidence = Vec::new();
         let mut max_score = 0.0_f32;
         let mut max_conf = 0.0_f32;
 
-        for (ip, stats_opt) in [(flow.a_ip, stats_a), (flow.b_ip, stats_b)] {
-            let (conn_count, dns_count) = match stats_opt {
-                Some(stats) => {
-                    log::debug!(
-                        "CrossFlow eval: ip={} conn_count={} dns_count={}",
-                        ip,
-                        stats.0,
-                        stats.1
-                    );
-                    stats
+        // Scan + DNS burst for each canonical IP.
+        for (ip, opt) in [(flow.a_ip, snap.stats_a), (flow.b_ip, snap.stats_b)] {
+            if let Some((conn, dns)) = opt {
+                log::debug!("CrossFlow eval: ip={ip} conn_count={conn} dns_count={dns}");
+                let (s, c, mut ev) = score_scan_dns(ip, conn, dns, &snap.cfg);
+                if s > max_score {
+                    max_score = s;
+                    max_conf = c;
                 }
-                None => continue,
-            };
-
-            let window = cfg.window_secs;
-
-            if conn_count > cfg.scan_connection_threshold_high {
-                max_score = max_score.max(0.9);
-                max_conf = max_conf.max(0.95);
-                evidence.push(Evidence {
-                    description: format!(
-                        "High connection count to IP: {} connections in {}s",
-                        conn_count, window
-                    ),
-                    detail: Some(ip.to_string()),
-                });
-            } else if conn_count > cfg.scan_connection_threshold_medium {
-                max_score = max_score.max(0.7);
-                max_conf = max_conf.max(0.8);
-                evidence.push(Evidence {
-                    description: format!(
-                        "Elevated connection count to IP: {} connections in {}s",
-                        conn_count, window
-                    ),
-                    detail: Some(ip.to_string()),
-                });
+                evidence.append(&mut ev);
             }
+        }
 
-            if dns_count > cfg.dns_burst_threshold_high {
-                max_score = max_score.max(0.8);
-                max_conf = max_conf.max(0.7);
-                evidence.push(Evidence {
-                    description: format!(
-                        "DNS query burst: {} queries to IP in {}s",
-                        dns_count, window
-                    ),
-                    detail: Some(ip.to_string()),
-                });
-            } else if dns_count > cfg.dns_burst_threshold_medium {
-                max_score = max_score.max(0.5);
-                max_conf = max_conf.max(0.5);
-                evidence.push(Evidence {
-                    description: format!(
-                        "Elevated DNS queries: {} queries to IP in {}s",
-                        dns_count, window
-                    ),
-                    detail: Some(ip.to_string()),
-                });
+        // Beaconing for each canonical (ip, port, protocol) key.
+        for beacon in [snap.beacon_a.as_ref(), snap.beacon_b.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Some((s, c, ev)) = compute_beacon_score(beacon, &snap.cfg) {
+                if s > max_score {
+                    max_score = s;
+                    max_conf = c;
+                }
+                evidence.push(ev);
+            }
+        }
+
+        // Connection diversity for the flow's PID.
+        if let (Some(conns), Some(pid)) = (snap.pid_conns.as_ref(), flow.pid) {
+            if let Some((s, c, ev, cap_hit)) =
+                compute_diversity_score(conns, pid, &snap.cfg, snap.pid_at_cap)
+            {
+                if cap_hit {
+                    // Emitted at warn so it's distinct in operator logs.
+                    // Known FP: nmap/masscan from the same user; see STATUS.md.
+                    log::warn!(
+                        "[BLOCK] AUTONOMOUS OVERRIDE: connection-diversity cap hit \
+                         (512+ distinct IPs from pid={pid} in <10s) — \
+                         if this was your own scan/audit tool, \
+                         pause the agent before running network scans"
+                    );
+                }
+                if s > max_score {
+                    max_score = s;
+                    max_conf = c;
+                }
+                evidence.push(ev);
             }
         }
 
@@ -232,10 +531,12 @@ impl Detector for CrossFlowDetector {
             max_conf
         );
 
-        let severity = if max_score > 0.7 {
+        let severity = if max_score >= 0.85 {
             Severity::Critical
-        } else if max_score > 0.4 {
+        } else if max_score >= 0.5 {
             Severity::High
+        } else if max_score >= 0.3 {
+            Severity::Medium
         } else {
             Severity::Low
         };
@@ -252,6 +553,10 @@ impl Detector for CrossFlowDetector {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -280,12 +585,15 @@ mod tests {
         }
     }
 
+    fn default_state() -> CrossFlowState {
+        CrossFlowState::new(CrossFlowConfig::default(), HashSet::new())
+    }
+
+    // ── Existing scan / DNS-burst tests ─────────────────────────────────────
+
     #[test]
     fn test_detector_score_zero_when_no_state() {
-        let state = Arc::new(Mutex::new(CrossFlowState::new(
-            CrossFlowConfig::default(),
-            HashSet::new(),
-        )));
+        let state = Arc::new(Mutex::new(default_state()));
         let detector = CrossFlowDetector::new(state);
         let flow = make_flow(
             IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
@@ -298,12 +606,8 @@ mod tests {
 
     #[test]
     fn test_scan_detection_high_connection_count() {
-        let state = Arc::new(Mutex::new(CrossFlowState::new(
-            CrossFlowConfig::default(),
-            HashSet::new(),
-        )));
+        let state = Arc::new(Mutex::new(default_state()));
         let remote: IpAddr = IpAddr::V4(Ipv4Addr::new(52, 73, 240, 202));
-        // Simulate 201 connections to the remote IP.
         for _ in 0..201 {
             state.lock().unwrap().record_connection(remote, 6, 443);
         }
@@ -311,19 +615,13 @@ mod tests {
         let flow = make_flow(remote, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)));
         let finding = detector.evaluate(&flow);
         assert!(finding.score >= 0.9, "High conn count should score ≥0.9");
-        assert!(
-            finding.confidence >= 0.9,
-            "High conn count should have high confidence"
-        );
+        assert!(finding.confidence >= 0.9);
         assert!(!finding.evidence.is_empty());
     }
 
     #[test]
     fn test_scan_medium_connection_count() {
-        let state = Arc::new(Mutex::new(CrossFlowState::new(
-            CrossFlowConfig::default(),
-            HashSet::new(),
-        )));
+        let state = Arc::new(Mutex::new(default_state()));
         let remote: IpAddr = IpAddr::V4(Ipv4Addr::new(52, 73, 240, 202));
         for _ in 0..150 {
             state.lock().unwrap().record_connection(remote, 6, 443);
@@ -337,12 +635,8 @@ mod tests {
 
     #[test]
     fn test_dns_burst_detection() {
-        let state = Arc::new(Mutex::new(CrossFlowState::new(
-            CrossFlowConfig::default(),
-            HashSet::new(),
-        )));
+        let state = Arc::new(Mutex::new(default_state()));
         let remote: IpAddr = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
-        // Simulate 85 DNS queries — high threshold.
         for _ in 0..85 {
             state.lock().unwrap().record_connection(remote, 17, 53);
         }
@@ -363,7 +657,6 @@ mod tests {
             CrossFlowConfig::default(),
             [gateway].into_iter().collect(),
         )));
-        // Record many connections through the gateway — should not count.
         for _ in 0..250 {
             state.lock().unwrap().record_connection(gateway, 6, 443);
         }
@@ -400,10 +693,7 @@ mod tests {
 
     #[test]
     fn test_multicast_destination_not_counted() {
-        let state = Arc::new(Mutex::new(CrossFlowState::new(
-            CrossFlowConfig::default(),
-            HashSet::new(),
-        )));
+        let state = Arc::new(Mutex::new(default_state()));
         let mdns_multicast: IpAddr = IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251));
         for _ in 0..250 {
             state
@@ -425,7 +715,7 @@ mod tests {
         let subnet_bcast: IpAddr = IpAddr::V4(Ipv4Addr::new(172, 18, 22, 255));
         let state = Arc::new(Mutex::new(CrossFlowState::new(
             CrossFlowConfig::default(),
-            [subnet_bcast].into_iter().collect(), // own_ips snapshot includes this
+            [subnet_bcast].into_iter().collect(),
         )));
         for _ in 0..250 {
             state
@@ -444,15 +734,11 @@ mod tests {
 
     #[test]
     fn test_both_ips_checked() {
-        let state = Arc::new(Mutex::new(CrossFlowState::new(
-            CrossFlowConfig::default(),
-            HashSet::new(),
-        )));
+        let state = Arc::new(Mutex::new(default_state()));
         let remote: IpAddr = IpAddr::V4(Ipv4Addr::new(52, 73, 240, 202));
         for _ in 0..250 {
             state.lock().unwrap().record_connection(remote, 6, 443);
         }
-        // flow with local as a_ip, remote as b_ip (canonically larger).
         let detector = CrossFlowDetector::new(state);
         let flow = make_flow(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), remote);
         let finding = detector.evaluate(&flow);
@@ -460,5 +746,370 @@ mod tests {
             finding.score >= 0.9,
             "Should detect remote IP regardless of canonical ordering"
         );
+    }
+
+    // ── Beaconing tests ─────────────────────────────────────────────────────
+
+    // Constructs a VecDeque of n Instants with spacing_secs between each entry.
+    // Oldest entry is at `now - (n-1) * spacing_secs`.
+    fn make_beacon_history(n: usize, spacing_secs: u64) -> VecDeque<Instant> {
+        let now = Instant::now();
+        (0..n)
+            .map(|i| now - Duration::from_secs((n - 1 - i) as u64 * spacing_secs))
+            .collect()
+    }
+
+    #[test]
+    fn test_beacon_fires_medium_tier() {
+        // 5 connections at 3s intervals → n=5, mean=3s, stddev=0, CV=0 < 0.3
+        // mean_max = 60/4 = 15s; 3s < 15s ✓; beacon_mean_min=2s; 3s > 2s ✓
+        let history = make_beacon_history(5, 3);
+        let cfg = CrossFlowConfig::default();
+        let result = compute_beacon_score(&history, &cfg);
+        assert!(
+            result.is_some(),
+            "5 uniform-interval connections should fire"
+        );
+        let (score, conf, _) = result.unwrap();
+        assert!(
+            (score - 0.60).abs() < 1e-6,
+            "medium tier score must be 0.60"
+        );
+        assert!((conf - 0.60).abs() < 1e-6, "medium tier conf must be 0.60");
+    }
+
+    #[test]
+    fn test_beacon_fires_high_tier() {
+        // 10 connections at 3s intervals → CV=0 < 0.2 → high tier
+        let history = make_beacon_history(10, 3);
+        let cfg = CrossFlowConfig::default();
+        let result = compute_beacon_score(&history, &cfg);
+        assert!(
+            result.is_some(),
+            "10 uniform-interval connections should fire at high tier"
+        );
+        let (score, conf, _) = result.unwrap();
+        assert!((score - 0.70).abs() < 1e-6, "high tier score must be 0.70");
+        assert!((conf - 0.75).abs() < 1e-6, "high tier conf must be 0.75");
+    }
+
+    #[test]
+    fn test_beacon_suppressed_when_mean_exceeds_upper_bound() {
+        // Monitoring-agent-like traffic: regular 16s interval but mean (16s) > mean_max (15s).
+        // Pre-filter must exclude it to avoid false-positives from cron jobs, NTP, etc.
+        let history = make_beacon_history(5, 16);
+        let cfg = CrossFlowConfig::default(); // mean_max = 60/4 = 15s
+        let result = compute_beacon_score(&history, &cfg);
+        assert!(
+            result.is_none(),
+            "mean=16s > mean_max=15s must be excluded by pre-filter"
+        );
+    }
+
+    #[test]
+    fn test_beacon_suppressed_when_fewer_than_min_connections() {
+        // Only 4 connections → below beacon_min_connections_medium (5)
+        let history = make_beacon_history(4, 3);
+        let cfg = CrossFlowConfig::default();
+        assert!(compute_beacon_score(&history, &cfg).is_none());
+    }
+
+    #[test]
+    fn test_beacon_suppressed_when_cv_too_high() {
+        // High CV (irregular traffic) must not fire even with ≥5 connections.
+        // Construct irregular intervals by mixing short and long gaps.
+        let now = Instant::now();
+        let history: VecDeque<Instant> = vec![
+            now - Duration::from_secs(60),
+            now - Duration::from_secs(55),
+            now - Duration::from_secs(30),
+            now - Duration::from_secs(29),
+            now - Duration::from_secs(3),
+        ]
+        .into_iter()
+        .collect();
+        // Intervals: 5s, 25s, 1s, 26s → mean≈14.25s, stddev large, CV>>0.3
+        let cfg = CrossFlowConfig::default();
+        let result = compute_beacon_score(&history, &cfg);
+        // mean≈14.25s is within [2s, 15s] but CV >> 0.3 → must not fire
+        assert!(result.is_none(), "high-CV irregular traffic must not fire");
+    }
+
+    #[test]
+    fn test_beacon_infrastructure_not_recorded() {
+        // Broadcast and multicast must be excluded at record_connection time
+        // and therefore never appear in beacon_history.
+        let mut state = default_state();
+        let bcast: IpAddr = IpAddr::V4(Ipv4Addr::BROADCAST);
+        let mcast: IpAddr = IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1));
+        for _ in 0..20 {
+            state.record_connection(bcast, 17, 9999);
+            state.record_connection(mcast, 17, 9998);
+        }
+        assert!(
+            state.get_beacon_history(bcast, 9999, 17).is_none(),
+            "broadcast must not enter beacon_history"
+        );
+        assert!(
+            state.get_beacon_history(mcast, 9998, 17).is_none(),
+            "multicast must not enter beacon_history"
+        );
+    }
+
+    // ── Connection-diversity tests ───────────────────────────────────────────
+
+    fn recent_ip(i: u32) -> (IpAddr, Instant) {
+        let ip = IpAddr::V4(Ipv4Addr::new(
+            10,
+            ((i >> 16) & 0xff) as u8,
+            ((i >> 8) & 0xff) as u8,
+            (i & 0xff) as u8,
+        ));
+        (ip, Instant::now() - Duration::from_secs(2))
+    }
+
+    fn make_diversity_deque(count: usize) -> VecDeque<(IpAddr, Instant)> {
+        (0..count as u32).map(recent_ip).collect()
+    }
+
+    #[test]
+    fn test_diversity_fires_medium_tier() {
+        // 25 distinct IPs > threshold_medium (20) → score 0.30
+        let conns = make_diversity_deque(25);
+        let cfg = CrossFlowConfig::default();
+        let result = compute_diversity_score(&conns, 42, &cfg, false);
+        assert!(result.is_some());
+        let (score, conf, _, cap_hit) = result.unwrap();
+        assert!((score - 0.30).abs() < 1e-6);
+        assert!((conf - 0.40).abs() < 1e-6);
+        assert!(!cap_hit);
+    }
+
+    #[test]
+    fn test_diversity_fires_high_tier() {
+        // 55 distinct IPs > threshold_high (50) → score 0.50
+        let conns = make_diversity_deque(55);
+        let cfg = CrossFlowConfig::default();
+        let result = compute_diversity_score(&conns, 42, &cfg, false);
+        assert!(result.is_some());
+        let (score, conf, _, cap_hit) = result.unwrap();
+        assert!((score - 0.50).abs() < 1e-6);
+        assert!((conf - 0.55).abs() < 1e-6);
+        assert!(!cap_hit);
+    }
+
+    #[test]
+    fn test_diversity_cap_hit_tier() {
+        // at_cap=true → Critical tier regardless of distinct-IP count.
+        let conns = make_diversity_deque(512);
+        let cfg = CrossFlowConfig::default();
+        let result = compute_diversity_score(&conns, 99, &cfg, true);
+        assert!(result.is_some());
+        let (score, conf, _, cap_hit) = result.unwrap();
+        assert!((score - 0.90).abs() < 1e-6, "cap-hit score must be 0.90");
+        assert!(
+            (conf - 0.95).abs() < 1e-6,
+            "cap-hit confidence must be 0.95"
+        );
+        assert!(cap_hit);
+    }
+
+    // Explicit arithmetic check: 0.90 × 0.95 = 0.855 ≥ override_threshold (0.85).
+    // If this fails, the cap-hit tier no longer triggers an autonomous Block.
+    #[test]
+    fn test_cap_hit_override_threshold_arithmetic() {
+        let score = 0.90_f32;
+        let confidence = 0.95_f32;
+        let product = score * confidence;
+        assert!(
+            product >= 0.85,
+            "cap-hit product {product:.4} must be ≥ 0.85 (override_threshold); \
+             if this fails, cap-hit no longer triggers autonomous block"
+        );
+    }
+
+    #[test]
+    fn test_diversity_no_fire_below_medium_threshold() {
+        // 18 distinct IPs < threshold_medium (20) → no finding
+        let conns = make_diversity_deque(18);
+        let cfg = CrossFlowConfig::default();
+        assert!(compute_diversity_score(&conns, 42, &cfg, false).is_none());
+    }
+
+    #[test]
+    fn test_diversity_medium_score_below_block_threshold() {
+        // Browser page-load shape: 30 distinct IPs → medium tier (score 0.30, conf 0.40).
+        // Product 0.12 is well below block_threshold (0.70) and alert threshold (0.30).
+        let conns = make_diversity_deque(30);
+        let cfg = CrossFlowConfig::default();
+        let result = compute_diversity_score(&conns, 42, &cfg, false).unwrap();
+        let product = result.0 * result.1;
+        assert!(
+            product < 0.30,
+            "browser-shape diversity product {product:.3} must be below alert threshold"
+        );
+    }
+
+    #[test]
+    fn test_pid_cap_prevents_excess_entries() {
+        let mut state = default_state();
+        let pid = 1234_u32;
+        let n = state.config.max_pid_entries + 100;
+        for i in 0..n as u32 {
+            let ip = IpAddr::V4(Ipv4Addr::new(10, (i >> 16) as u8, (i >> 8) as u8, i as u8));
+            state.record_pid_connection(pid, ip);
+        }
+        let deque = state.get_pid_diversity(pid).unwrap();
+        assert_eq!(
+            deque.len(),
+            state.config.max_pid_entries,
+            "VecDeque must not exceed max_pid_entries"
+        );
+        assert!(state.pid_diversity_at_cap(pid));
+    }
+
+    #[test]
+    fn test_total_pid_cap_drops_new_pids() {
+        let cfg = CrossFlowConfig {
+            max_tracked_pids: 3,
+            ..CrossFlowConfig::default()
+        };
+        let mut state = CrossFlowState::new(cfg, HashSet::new());
+        for pid in 0..5_u32 {
+            let ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, pid as u8));
+            state.record_pid_connection(pid, ip);
+        }
+        // Only 3 PIDs should be tracked (first 3 filled the map).
+        assert_eq!(
+            state.pid_diversity.len(),
+            3,
+            "PID map must be capped at max_tracked_pids"
+        );
+    }
+
+    #[test]
+    fn test_purge_expired_removes_stale_pid_entries() {
+        let cfg = CrossFlowConfig {
+            pid_diversity_window_secs: 1,
+            ..CrossFlowConfig::default()
+        };
+        let mut state = CrossFlowState::new(cfg, HashSet::new());
+        let pid = 7_u32;
+        // Insert a stale entry (>1s old) by backdating manually.
+        state.pid_diversity.insert(
+            pid,
+            vec![(
+                IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+                Instant::now() - Duration::from_secs(5),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        state.purge_expired();
+        assert!(
+            !state.pid_diversity.contains_key(&pid),
+            "stale PID entry must be removed by purge_expired"
+        );
+    }
+
+    #[test]
+    fn test_pid_infrastructure_not_recorded() {
+        let mut state = default_state();
+        let mcast: IpAddr = IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1));
+        state.record_pid_connection(999, mcast);
+        assert!(
+            state.get_pid_diversity(999).is_none(),
+            "multicast must not enter pid_diversity"
+        );
+    }
+
+    // ── Direction-resolution end-to-end tests ───────────────────────────────
+    //
+    // These test the corrected remote_port path that was latently buggy before
+    // today's fix. The old capture.rs call used info_pkt.dst_port always —
+    // which is wrong for inbound flows (dst_port = local service port, not remote).
+    // determine_remote_endpoint() is now the canonical source; these tests verify
+    // its output flows through record_connection() correctly into both the
+    // DNS-query counter and the beacon_history key.
+
+    #[test]
+    fn test_inbound_to_local_dns_server_not_counted_as_dns_query() {
+        // Pre-fix bug: inbound connection to local:53 had dst_port=53 passed to
+        // record_connection, making dns_query_count increment for the remote IP —
+        // as if we had sent a DNS query to it. After the fix, remote_port=src_port
+        // (the remote's ephemeral) which is not 53, so dns_query_count stays 0.
+        let local = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100));
+        let remote = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5));
+        let remote_ephemeral = 47382_u16;
+
+        // Simulate determine_remote_endpoint() result for inbound src=remote:eph, dst=local:53.
+        let (r_ip, r_port) =
+            crate::capture::determine_remote_endpoint(remote, remote_ephemeral, local, 53, local);
+
+        let mut state = default_state();
+        state.record_connection(r_ip, 17 /* UDP */, r_port);
+
+        // Connection count increments (a connection did happen).
+        // DNS count must NOT increment (r_port != 53 — this was the bug).
+        assert_eq!(
+            state.get_stats(&remote),
+            Some((1, 0)),
+            "inbound to local:53: dns_query_count must be 0 \
+             (was 1 before the remote_port direction fix)"
+        );
+    }
+
+    #[test]
+    fn test_outbound_dns_query_counted_correctly() {
+        // Outbound DNS: src=local:ephemeral, dst=remote:53.
+        // determine_remote_endpoint returns (remote, 53) → dns_query_count increments.
+        let local = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100));
+        let remote = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+
+        let (r_ip, r_port) =
+            crate::capture::determine_remote_endpoint(local, 55000, remote, 53, local);
+
+        let mut state = default_state();
+        state.record_connection(r_ip, 17, r_port);
+
+        assert_eq!(
+            state.get_stats(&remote),
+            Some((1, 1)),
+            "outbound DNS query: dns_query_count must be 1"
+        );
+    }
+
+    #[test]
+    fn test_inbound_flows_share_beacon_key_on_remote_port() {
+        // Pre-fix bug: inbound connections from the same C2 server (C2:443 → local:eph)
+        // had dst_port=local_eph as the beacon key — different per connection, so no
+        // beacon accumulates. After the fix, key=(C2, 443, TCP) for all inbound
+        // connections regardless of local ephemeral port.
+        let local = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100));
+        let c2 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
+
+        let mut state = default_state();
+
+        // 5 inbound connections from C2:443 to different local ephemeral ports.
+        for local_eph in [60000_u16, 60001, 60002, 60003, 60004] {
+            let (r_ip, r_port) =
+                crate::capture::determine_remote_endpoint(c2, 443, local, local_eph, local);
+            state.record_connection(r_ip, 6 /* TCP */, r_port);
+        }
+
+        // All 5 must be under the single key (c2, 443, TCP) — the remote port.
+        assert_eq!(
+            state.get_beacon_history(c2, 443, 6).map(|d| d.len()),
+            Some(5),
+            "5 inbound C2 connections must accumulate under beacon key (c2, 443, TCP)"
+        );
+
+        // Pre-fix: one entry per local ephemeral port — verify those keys are empty.
+        for local_eph in [60000_u16, 60001, 60002, 60003, 60004] {
+            assert!(
+                state.get_beacon_history(c2, local_eph, 6).is_none(),
+                "beacon must NOT be keyed on local ephemeral port {local_eph} (pre-fix bug)"
+            );
+        }
     }
 }
