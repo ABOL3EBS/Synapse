@@ -11,6 +11,19 @@ use synapse_common::{
     Detector, DetectorFinding, DetectorId, DetectorStatus, Evidence, FlowRecord, Severity,
 };
 
+/// Returns true if `hostname` contains `label` as a standalone component when
+/// split on `.` and `-`. Use this for single-label blocklist/denylist entries
+/// (e.g., `"c2"`, `"malware"`) to prevent substring matches inside larger labels
+/// — `"ec2-server.example.com"` must NOT match an entry for `"c2"`.
+///
+/// `pub(crate)` so other detectors can reuse the same implementation rather
+/// than writing an independent version that may drift.
+pub(crate) fn has_label(hostname: &str, label: &str) -> bool {
+    hostname
+        .split(['.', '-'])
+        .any(|part| part.eq_ignore_ascii_case(label))
+}
+
 /// DNS hostname behavioral analysis detector.
 ///
 /// Evaluates seven sub-detectors on each flow's `dns_name`:
@@ -166,10 +179,25 @@ impl DnsAnalyzer {
         }
     }
 
-    /// Score blocklist match.
+    /// Score blocklist match — label-aware, not substring.
+    ///
+    /// For full-domain entries (containing `.`): matches if the hostname is
+    /// exactly the entry or is a subdomain of it. `"notmalware.example.com"`
+    /// does NOT match an entry for `"malware.example.com"`;
+    /// `"foo.malware.example.com"` does.
+    ///
+    /// For single-label entries (no `.`): delegates to `has_label()` —
+    /// `"ec2-server.example.com"` does NOT match an entry for `"c2"`.
     fn score_blocklist(hostname: &str, blocklist: &HashSet<String>) -> f32 {
         let lower = hostname.to_ascii_lowercase();
-        if blocklist.iter().any(|b| lower.contains(b.as_str())) {
+        let matched = blocklist.iter().any(|b| {
+            if b.contains('.') {
+                lower == b.as_str() || lower.ends_with(&format!(".{b}"))
+            } else {
+                has_label(&lower, b.as_str())
+            }
+        });
+        if matched {
             1.0
         } else {
             0.0
@@ -489,5 +517,87 @@ mod tests {
             finding.score > 0.0,
             "Non-CDN with 7 labels should score > 0"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Blocklist label-aware matching regression tests (score_blocklist fix)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_blocklist_substring_does_not_false_positive_full_domain_entry() {
+        // "notmalware.example.com" contains the substring "malware.example.com"
+        // starting at index 3. The old lower.contains() was true here — fixed.
+        let blocklist: HashSet<String> = ["malware.example.com".to_string()].into();
+        assert_eq!(
+            DnsAnalyzer::score_blocklist("notmalware.example.com", &blocklist),
+            0.0,
+            "notmalware.example.com must not match blocklist entry malware.example.com"
+        );
+    }
+
+    #[test]
+    fn test_blocklist_exact_match_fires() {
+        let blocklist: HashSet<String> = ["malware.example.com".to_string()].into();
+        assert_eq!(
+            DnsAnalyzer::score_blocklist("malware.example.com", &blocklist),
+            1.0,
+            "exact blocklist match must fire"
+        );
+    }
+
+    #[test]
+    fn test_blocklist_subdomain_match_fires() {
+        // A subdomain of a blocked domain is also blocked.
+        let blocklist: HashSet<String> = ["malware.example.com".to_string()].into();
+        assert_eq!(
+            DnsAnalyzer::score_blocklist("foo.malware.example.com", &blocklist),
+            1.0,
+            "subdomain of blocked domain must match"
+        );
+    }
+
+    #[test]
+    fn test_blocklist_single_label_ec2_does_not_match_c2_entry() {
+        // "ec2" split on '-' is just ["ec2"]; "c2" is a separate label.
+        // has_label("ec2.amazonaws.com", "c2") must be false.
+        let blocklist: HashSet<String> = ["c2".to_string()].into();
+        assert_eq!(
+            DnsAnalyzer::score_blocklist("ec2.amazonaws.com", &blocklist),
+            0.0,
+            "ec2.amazonaws.com must not match single-label blocklist entry 'c2'"
+        );
+    }
+
+    #[test]
+    fn test_blocklist_single_label_standalone_fires() {
+        // "c2.evil.com" has a standalone "c2" label — must match.
+        let blocklist: HashSet<String> = ["c2".to_string()].into();
+        assert_eq!(
+            DnsAnalyzer::score_blocklist("c2.evil.com", &blocklist),
+            1.0,
+            "c2.evil.com must match single-label blocklist entry 'c2'"
+        );
+    }
+
+    #[test]
+    fn test_has_label_does_not_match_substring_within_label() {
+        assert!(
+            !has_label("ec2-server.example.com", "c2"),
+            "has_label must not match 'c2' inside 'ec2'"
+        );
+        assert!(
+            !has_label("ec2.amazonaws.com", "c2"),
+            "has_label must not match 'c2' inside 'ec2'"
+        );
+    }
+
+    #[test]
+    fn test_has_label_matches_standalone_label() {
+        assert!(has_label("c2.evil.com", "c2"));
+        assert!(
+            has_label("foo-c2.example.com", "c2"),
+            "dash-separated label"
+        );
+        assert!(has_label("C2.Evil.Com", "c2"), "case-insensitive");
     }
 }
