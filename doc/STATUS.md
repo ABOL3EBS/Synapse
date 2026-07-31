@@ -73,7 +73,7 @@
 | IPC protocol | `crates/platform-macos/src/protocol.rs` | 164 | `send_fd`/`recv_fd` (SCM_RIGHTS), `send_message`/`recv_message` (bincode, length-prefixed), stream split via `try_clone()` |
 | Storage worker | `crates/agent/src/storage/` (5 files) | 1323 | `StorageWorker` + `StorageEvent` enum (`EnforcementRequested`, `VerdictDecided`, `CircuitBreakerTransition`). Crash-safe spool (`CriticalSpool` — separate DB, `synchronous=FULL`). Idempotent replay via `INSERT OR IGNORE` + stable event IDs (`boot_id XOR fib_hash(pid)` prefix). Binary IP storage (16-byte BLOB + TEXT, always both). SQLite hardening PRAGMAs. **V2 schema** via `PRAGMA user_version` — V1: base tables; V2: adds `metadata` table with `last_retention_run_ms` for wall-clock retention persistence across restarts. Retention: enforcement_log 90d, verdicts+findings (CASCADE) 7d, CB events 7d — wall-clock hourly check on every 250ms tick, last-run timestamp persisted in `metadata`. `pending_critical_ids: VecDeque<String>`, `pop_front()` (O(1)) — previously `Vec` + `remove(0)` (O(n)). `StorageReader` (read-only connection, `query_only=ON`) with `recent_verdicts`, `verdict_findings`, `recent_enforcement`, `detector_health`, `kpi_since`. `#![allow(dead_code)]` on models/reader until Tauri IPC is wired. 4 tests: `test_ip_roundtrip_v4`, `test_ip_roundtrip_v6`, `test_spool_append_and_confirm`, `test_write_failure_degrades_gracefully`. |
 
-**Total:** 12,416 lines across 25 files. 172 tests (150 agent + 16 common + 6 platform-macos).
+**Total:** 12,898 lines across 28 files. 174 tests (152 agent + 16 common + 6 platform-macos).
 
 **Verified end-to-end (2026-07-22):** Helper sends PortPidCache (49–51 entries, ~483 PIDs, ~6675 fds, 62–64 probe_ok, ~7–8ms root scan). Agent receives cache, looks up src_port on each packet, resolves to correct PID + executable path. Live test: Brave Browser connection to 142.251.142.74:443 resolved to pid=743 → `Brave Browser Helper`.
 
@@ -203,4 +203,4 @@
 
 | 10 | Helper reconnect loop (accept→enforce→accept) with per-connection cache-push cancellation via `Arc<AtomicBool>` | `platform-macos/helper/main.rs` | Verified |
 
-All 172 tests pass. clippy clean. fmt clean.
+All 174 tests pass. clippy clean. fmt clean.
