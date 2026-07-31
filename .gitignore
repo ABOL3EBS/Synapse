@@ -28,3 +28,4 @@ node_modules/
 dist/
 src-tauri/target/
 src-tauri/gen/
+src-tauri/src/ui/
