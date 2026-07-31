@@ -149,6 +149,14 @@ impl ProcessCorrelator {
             return 0.0;
         }
 
+        // Broadcast and multicast destinations are infrastructure — not suspicious.
+        // Shared classification with CrossFlow and should_skip_block.
+        if crate::capture::is_infrastructure_destination(flow.a_ip)
+            || crate::capture::is_infrastructure_destination(flow.b_ip)
+        {
+            return 0.0;
+        }
+
         // Check if destination is external (not RFC1918).
         let b_ip = flow.b_ip;
         let is_external = match b_ip {
@@ -522,5 +530,59 @@ mod tests {
         let finding = detector.evaluate(&flow);
         assert_eq!(finding.score, 0.0, "Known safe browser should score 0");
         assert_eq!(finding.confidence, 1.0);
+    }
+
+    // --- is_infrastructure_destination guard tests ---
+
+    #[test]
+    fn test_broadcast_destination_scores_zero() {
+        let detector = ProcessCorrelator;
+        let mut flow = make_flow_with_process(None, None, "255.255.255.255".parse().unwrap());
+        flow.protocol = 17;
+        flow.a_port = 0;
+        flow.b_port = 10001;
+        let finding = detector.evaluate(&flow);
+        assert_eq!(
+            finding.score, 0.0,
+            "Broadcast destination must score 0 (infrastructure), got {}",
+            finding.score
+        );
+    }
+
+    #[test]
+    fn test_multicast_destination_scores_zero() {
+        let detector = ProcessCorrelator;
+        let mut flow = make_flow_with_process(None, None, "224.0.0.1".parse().unwrap());
+        flow.protocol = 17;
+        flow.a_port = 0;
+        flow.b_port = 5353;
+        let finding = detector.evaluate(&flow);
+        assert_eq!(
+            finding.score, 0.0,
+            "Multicast destination must score 0 (infrastructure), got {}",
+            finding.score
+        );
+    }
+
+    // Critical negative case: ICMP to an external host produces genuine port=0
+    // from the packet parser (the `_ => (0, 0)` arm in parse_ipv4/parse_ipv6).
+    // This is NOT the "couldn't determine local side" sentinel — it is a real
+    // protocol-driven zero. The is_infrastructure_destination guard must NOT
+    // suppress this flow; the discarded local_port==0 gate would have.
+    #[test]
+    fn test_icmp_external_unresolved_process_still_scores() {
+        let detector = ProcessCorrelator;
+        let mut flow = make_flow_with_process(None, None, "8.8.8.8".parse().unwrap());
+        flow.protocol = 1; // ICMP — ports are always 0
+        flow.a_port = 0;
+        flow.b_port = 0;
+        flow.local_port = 0; // genuine protocol-driven zero, not a sentinel
+        let finding = detector.evaluate(&flow);
+        assert!(
+            finding.score > 0.0,
+            "ICMP to external with pid=None must still score > 0 \
+             (is_infrastructure_destination must not suppress it); got {}",
+            finding.score
+        );
     }
 }
