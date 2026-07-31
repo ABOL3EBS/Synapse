@@ -53,8 +53,14 @@ export default function ActivityScreen() {
           />
         )}
 
-        {items.map((item) => (
-          <ActivityRow key={item.id} item={item} />
+        {items.map((item, i) => (
+          <div
+            key={item.id}
+            className="activity-row"
+            style={{ animationDelay: `${Math.min(i * 40, 400)}ms` }}
+          >
+            <ActivityRow item={item} />
+          </div>
         ))}
       </div>
     </div>

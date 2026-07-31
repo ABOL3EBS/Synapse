@@ -221,6 +221,116 @@ fn get_threat_stats(state: tauri::State<DbState>) -> ThreatStats {
 }
 
 // ---------------------------------------------------------------------------
+// Chart commands
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChartPoint {
+    pub hour: i64,
+    pub count: i64,
+}
+
+#[tauri::command]
+fn get_activity_chart(state: tauri::State<DbState>) -> Vec<ChartPoint> {
+    let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(conn) = guard.as_ref() else { return vec![]; };
+
+    let now = now_ms();
+    let since = now - 24 * 60 * 60 * 1000;
+    let since_bucket = since / 3_600_000;
+
+    let mut stmt = match conn.prepare(
+        "SELECT CAST(ts_ms / 3600000 AS INTEGER) as bucket, COUNT(*) as cnt
+         FROM verdicts WHERE ts_ms >= ?1
+         GROUP BY bucket ORDER BY bucket",
+    ) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+
+    let mut map: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    if let Ok(rows) = stmt.query_map(rusqlite::params![since], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+    }) {
+        for row in rows.flatten() {
+            map.insert(row.0, row.1);
+        }
+    }
+
+    (0..24)
+        .map(|i| ChartPoint {
+            hour: i,
+            count: *map.get(&(since_bucket + i)).unwrap_or(&0),
+        })
+        .collect()
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DetectorStat {
+    pub name: String,
+    pub count: i64,
+}
+
+#[tauri::command]
+fn get_detector_breakdown(state: tauri::State<DbState>) -> Vec<DetectorStat> {
+    let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(conn) = guard.as_ref() else { return vec![]; };
+
+    let mut stmt = match conn.prepare(
+        "SELECT detector_id, COUNT(*) as cnt FROM detector_findings
+         WHERE detector_id IS NOT NULL
+         GROUP BY detector_id ORDER BY cnt DESC LIMIT 6",
+    ) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+
+    stmt.query_map([], |r| {
+        Ok(DetectorStat { name: r.get(0)?, count: r.get(1)? })
+    })
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TopApp {
+    pub app_name: String,
+    pub blocks: i64,
+    pub alerts: i64,
+}
+
+#[tauri::command]
+fn get_top_apps(state: tauri::State<DbState>) -> Vec<TopApp> {
+    let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(conn) = guard.as_ref() else { return vec![]; };
+
+    let mut stmt = match conn.prepare(
+        "SELECT process_path,
+                SUM(CASE WHEN verdict='Block' THEN 1 ELSE 0 END) as blocks,
+                SUM(CASE WHEN verdict='Alert'  THEN 1 ELSE 0 END) as alerts
+         FROM verdicts
+         WHERE process_path IS NOT NULL AND process_path != ''
+         GROUP BY process_path
+         ORDER BY (blocks * 2 + alerts) DESC LIMIT 5",
+    ) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+
+    stmt.query_map([], |r| {
+        let path: String = r.get(0)?;
+        let app_name = std::path::Path::new(&path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("Unknown")
+            .to_string();
+        Ok(TopApp { app_name, blocks: r.get(1)?, alerts: r.get(2)? })
+    })
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
 // App entry point
 // ---------------------------------------------------------------------------
 
@@ -232,6 +342,9 @@ pub fn run() {
             get_protection_status,
             get_activity_feed,
             get_threat_stats,
+            get_activity_chart,
+            get_detector_breakdown,
+            get_top_apps,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Synapse dashboard");

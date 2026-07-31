@@ -1,68 +1,131 @@
 import { useEffect, useState } from "react";
-import { getThreatStats, type ThreatStats } from "../lib/db";
+import {
+  getThreatStats,
+  getActivityChart,
+  getDetectorBreakdown,
+  getTopApps,
+  type ThreatStats,
+  type ChartPoint,
+  type DetectorStat,
+  type TopApp,
+} from "../lib/db";
+import { useCountUp } from "../hooks/useCountUp";
+import Sparkline from "../components/Sparkline";
+import DetectorChart from "../components/DetectorChart";
+import TopApps from "../components/TopApps";
 
 export default function StatsScreen() {
   const [stats, setStats] = useState<ThreatStats | null>(null);
+  const [chart, setChart] = useState<ChartPoint[]>([]);
+  const [detectors, setDetectors] = useState<DetectorStat[]>([]);
+  const [topApps, setTopApps] = useState<TopApp[]>([]);
   const [error, setError] = useState(false);
 
   useEffect(() => {
-    getThreatStats()
-      .then(setStats)
+    Promise.all([
+      getThreatStats(),
+      getActivityChart(),
+      getDetectorBreakdown(),
+      getTopApps(),
+    ])
+      .then(([s, c, d, a]) => {
+        setStats(s);
+        setChart(c);
+        setDetectors(d);
+        setTopApps(a);
+      })
       .catch(() => setError(true));
   }, []);
 
+  if (error) {
+    return (
+      <div className="h-full flex items-center justify-center">
+        <p className="text-sm text-navy/30">Couldn't load stats — Synapse may be starting up.</p>
+      </div>
+    );
+  }
+
   return (
-    <div className="h-full flex flex-col px-8 pt-8 pb-6">
-      <header className="mb-6">
+    <div className="h-full flex flex-col px-7 pt-7 pb-5 overflow-y-auto scroll-area">
+      <header className="shrink-0 mb-5">
         <h2 className="text-xl font-bold text-navy tracking-tight">Threat Report</h2>
         <p className="text-xs text-navy/40 mt-0.5">What Synapse has stopped for you</p>
       </header>
 
-      {error && (
-        <div className="flex-1 flex items-center justify-center">
-          <p className="text-sm text-navy/30">Couldn't load stats — Synapse may be starting up.</p>
-        </div>
-      )}
+      {/* Stat cards */}
+      <div className="grid grid-cols-3 gap-3 shrink-0">
+        <StatCard label="Stopped today" value={stats?.blocks_today ?? 0} accent="emerald" />
+        <StatCard label="This week" value={stats?.blocks_week ?? 0} accent="emerald" />
+        <StatCard label="Blocked IPs" value={stats?.blocked_addresses ?? 0} accent="navy" />
+      </div>
 
-      {!error && (
-        <div className="flex-1 flex flex-col justify-between">
-          {/* Stat cards — horizontal row */}
-          <div className="grid grid-cols-3 gap-4">
-            <StatCard label="Threats stopped today" value={stats?.blocks_today ?? null} accent="emerald" />
-            <StatCard label="This week" value={stats?.blocks_week ?? null} accent="emerald" />
-            <StatCard label="Blocked addresses" value={stats?.blocked_addresses ?? null} accent="navy" />
-          </div>
+      {/* Activity timeline */}
+      <Section title="Activity · last 24 h">
+        <Sparkline points={chart} />
+      </Section>
 
-          {/* Coming soon */}
-          <div className="bg-white rounded-2xl shadow-card border border-black/[0.04] px-5 py-4
-            flex items-start gap-3">
-            <span className="text-xl mt-0.5">✨</span>
-            <div>
-              <p className="text-sm font-semibold text-navy">Explain it to me</p>
-              <p className="text-xs text-navy/40 mt-0.5 leading-relaxed">
-                A weekly plain-English summary of what Synapse found and why it matters. Coming soon.
-              </p>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* Two-column lower section */}
+      <div className="flex gap-4 mt-4 flex-1 min-h-0">
+        <Panel title="Detection breakdown" className="flex-1">
+          <DetectorChart stats={detectors} />
+          {detectors.length === 0 && <Empty text="No findings yet" />}
+        </Panel>
+        <Panel title="Flagged apps" className="flex-1">
+          <TopApps apps={topApps} />
+          {topApps.length === 0 && <Empty text="No apps flagged yet" />}
+        </Panel>
+      </div>
     </div>
   );
 }
 
+// ---------------------------------------------------------------------------
+// Sub-components
+// ---------------------------------------------------------------------------
+
 function StatCard({ label, value, accent }: {
   label: string;
-  value: number | null;
+  value: number;
   accent: "emerald" | "navy";
 }) {
+  const animated = useCountUp(value);
   const numColor = accent === "emerald" ? "text-emerald-dark" : "text-navy";
   return (
-    <div className="bg-white rounded-2xl shadow-card border border-black/[0.04] px-5 py-5
-      flex flex-col gap-2">
-      <span className="text-xs text-navy/40 font-medium leading-snug">{label}</span>
-      <span className={`text-4xl font-bold tabular-nums ${numColor}`}>
-        {value === null ? <span className="text-navy/20 text-3xl">—</span> : value.toLocaleString()}
+    <div className="bg-white rounded-2xl shadow-card border border-black/[0.04] px-4 py-4 flex flex-col gap-1">
+      <span className="text-[10px] text-navy/40 font-medium leading-snug">{label}</span>
+      <span className={`text-3xl font-bold tabular-nums ${numColor}`}>
+        {animated.toLocaleString()}
       </span>
+    </div>
+  );
+}
+
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div className="mt-4 shrink-0">
+      <p className="text-[10px] font-semibold text-navy/30 uppercase tracking-widest mb-2">{title}</p>
+      {children}
+    </div>
+  );
+}
+
+function Panel({ title, children, className = "" }: {
+  title: string;
+  children: React.ReactNode;
+  className?: string;
+}) {
+  return (
+    <div className={`bg-white rounded-2xl shadow-card border border-black/[0.04] px-4 py-3 flex flex-col ${className}`}>
+      <p className="text-[10px] font-semibold text-navy/30 uppercase tracking-widest mb-3">{title}</p>
+      {children}
+    </div>
+  );
+}
+
+function Empty({ text }: { text: string }) {
+  return (
+    <div className="flex-1 flex items-center justify-center">
+      <p className="text-xs text-navy/25">{text}</p>
     </div>
   );
 }

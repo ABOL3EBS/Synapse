@@ -37,7 +37,11 @@ export default function ProtectionScreen() {
       {/* Left — shield hero */}
       <div className="flex-1 flex flex-col items-center justify-center gap-6 px-10">
         <div className={`transition-opacity duration-300 ${shieldState === "inactive" ? "opacity-30 grayscale" : shieldState === "warning" ? "opacity-70" : "opacity-100"}`}>
-          <img src="/icon.png" alt="Synapse" className="w-28 h-28 drop-shadow-xl" />
+          <img
+            src="/icon.png"
+            alt="Synapse"
+            className={`w-28 h-28 drop-shadow-xl${shieldState === "protected" ? " shield-pulse" : ""}`}
+          />
         </div>
         <div className="text-center space-y-2">
           <h1 className={`text-2xl font-bold tracking-tight ${headlineColor}`}>{headline}</h1>

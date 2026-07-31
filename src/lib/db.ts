@@ -27,6 +27,22 @@ export interface ThreatStats {
   blocked_addresses: number;
 }
 
+export interface ChartPoint {
+  hour: number;
+  count: number;
+}
+
+export interface DetectorStat {
+  name: string;
+  count: number;
+}
+
+export interface TopApp {
+  app_name: string;
+  blocks: number;
+  alerts: number;
+}
+
 // ---------------------------------------------------------------------------
 // Tauri context check
 // ---------------------------------------------------------------------------
@@ -51,4 +67,19 @@ export function getActivityFeed(limit = 50): Promise<ActivityItem[]> {
 export function getThreatStats(): Promise<ThreatStats> {
   if (!isTauri()) return Promise.reject(new Error("not-tauri"));
   return invoke<ThreatStats>("get_threat_stats");
+}
+
+export function getActivityChart(): Promise<ChartPoint[]> {
+  if (!isTauri()) return Promise.reject(new Error("not-tauri"));
+  return invoke<ChartPoint[]>("get_activity_chart");
+}
+
+export function getDetectorBreakdown(): Promise<DetectorStat[]> {
+  if (!isTauri()) return Promise.reject(new Error("not-tauri"));
+  return invoke<DetectorStat[]>("get_detector_breakdown");
+}
+
+export function getTopApps(): Promise<TopApp[]> {
+  if (!isTauri()) return Promise.reject(new Error("not-tauri"));
+  return invoke<TopApp[]>("get_top_apps");
 }
