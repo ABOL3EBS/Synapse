@@ -80,7 +80,7 @@ impl AgentConfig {
         }
     }
 
-    /// GeoIP database path. Env var GEOIP_DB_PATH overrides config.
+    /// GeoIP City database path. Env var GEOIP_DB_PATH overrides config.
     pub fn geoip_db_path(&self) -> Option<std::path::PathBuf> {
         if let Ok(path) = std::env::var("GEOIP_DB_PATH") {
             if !path.is_empty() {
@@ -88,6 +88,20 @@ impl AgentConfig {
             }
         }
         self.agent.geoip.db_path.as_ref().map(|p| expand_tilde(p))
+    }
+
+    /// GeoIP ASN database path. Env var GEOIP_ASN_DB_PATH overrides config.
+    pub fn geoip_asn_db_path(&self) -> Option<std::path::PathBuf> {
+        if let Ok(path) = std::env::var("GEOIP_ASN_DB_PATH") {
+            if !path.is_empty() {
+                return Some(std::path::PathBuf::from(path));
+            }
+        }
+        self.agent
+            .geoip
+            .asn_db_path
+            .as_ref()
+            .map(|p| expand_tilde(p))
     }
 
     /// Reputation feeds directory. Env var FEEDS_DIR overrides config.
@@ -233,16 +247,21 @@ impl Default for AgentSection {
 #[serde(default)]
 pub struct GeoIpSection {
     pub db_path: Option<String>,
+    pub asn_db_path: Option<String>,
 }
 
 impl Default for GeoIpSection {
     fn default() -> Self {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let base = std::path::PathBuf::from(home).join(".synapse");
         Self {
             db_path: Some(
-                std::path::PathBuf::from(home)
-                    .join(".synapse")
-                    .join("GeoLite2-City.mmdb")
+                base.join("GeoLite2-City.mmdb")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            asn_db_path: Some(
+                base.join("GeoLite2-ASN.mmdb")
                     .to_string_lossy()
                     .into_owned(),
             ),

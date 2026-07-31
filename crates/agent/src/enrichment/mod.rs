@@ -35,86 +35,92 @@ const LOOKUP_TIMEOUT_MS: u64 = 2000;
 // GeoIP database wrapper
 // ---------------------------------------------------------------------------
 
-/// Thread-safe wrapper around a MaxMind GeoLite2-City database.
+/// Thread-safe wrapper around MaxMind GeoLite2 databases.
 /// Loaded once at startup, shared across enrichment worker threads via Arc.
-/// Provides country code and ASN lookups for public IPs.
+/// City DB provides country code; optional ASN DB provides autonomous system number.
 pub struct GeoIpDb {
-    reader: Arc<Reader<Vec<u8>>>,
+    city_reader: Arc<Reader<Vec<u8>>>,
+    asn_reader: Option<Arc<Reader<Vec<u8>>>>,
 }
 
 impl GeoIpDb {
-    /// Open a MaxMind database file. Returns an error if the file doesn't
-    /// exist or is corrupted — caller decides how to handle (typically log
-    /// and continue without GeoIP).
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, String> {
-        let path = path.as_ref();
-        let reader =
-            Reader::open_readfile(path).map_err(|e| format!("failed to open {:?}: {}", path, e))?;
-
-        let metadata = reader.metadata();
+    /// Open the City database and optionally the ASN database.
+    /// City DB failure is a hard error; ASN DB failure degrades gracefully.
+    pub fn open<C: AsRef<Path>, A: AsRef<Path>>(
+        city_path: C,
+        asn_path: Option<A>,
+    ) -> Result<Self, String> {
+        let city_path = city_path.as_ref();
+        let city_reader = Reader::open_readfile(city_path)
+            .map_err(|e| format!("failed to open {:?}: {}", city_path, e))?;
         info!(
-            "geoip database loaded: {:?} (v{}, {:?})",
-            path, metadata.database_type, metadata.build_epoch,
+            "geoip city database loaded: {:?} ({})",
+            city_path,
+            city_reader.metadata().database_type,
         );
 
+        let asn_reader = asn_path.and_then(|p| {
+            let p = p.as_ref();
+            match Reader::open_readfile(p) {
+                Ok(r) => {
+                    info!(
+                        "geoip ASN database loaded: {:?} ({})",
+                        p,
+                        r.metadata().database_type,
+                    );
+                    Some(Arc::new(r))
+                }
+                Err(e) => {
+                    info!(
+                        "GeoIP ASN database not found at {:?}: {e} — ASN enrichment disabled",
+                        p
+                    );
+                    None
+                }
+            }
+        });
+
         Ok(Self {
-            reader: Arc::new(reader),
+            city_reader: Arc::new(city_reader),
+            asn_reader,
         })
     }
 
     /// Look up country code and ASN for an IP address.
     /// Returns (country_code, asn). Private/RFC1918 IPs return (None, None).
-    /// If the IP is not found in the database, returns (None, None).
     pub fn lookup(&self, ip: IpAddr) -> (Option<String>, Option<u32>) {
         if !is_public_ip(ip) {
             return (None, None);
         }
 
-        let result = match self.reader.lookup(ip) {
-            Ok(r) => r,
+        let country_code = match self.city_reader.lookup(ip) {
+            Ok(result) => match result.decode::<maxminddb::geoip2::City>() {
+                Ok(Some(city)) => city.country.iso_code.map(|s| s.to_string()),
+                Ok(None) => None,
+                Err(e) => {
+                    debug!("geoip city decode failed for {}: {}", ip, e);
+                    None
+                }
+            },
             Err(e) => {
-                debug!("geoip lookup failed for {}: {}", ip, e);
-                return (None, None);
-            }
-        };
-
-        // Try decoding as City record for country code.
-        // GeoLite2-City includes country iso_code.
-        let country_code = match result.decode::<maxminddb::geoip2::City>() {
-            Ok(Some(city)) => city.country.iso_code.map(|s| s.to_string()),
-            Ok(None) => None,
-            Err(e) => {
-                debug!("geoip city decode failed for {}: {}", ip, e);
+                debug!("geoip city lookup failed for {}: {}", ip, e);
                 None
             }
         };
 
-        // Try decoding as ASN (same database may include ASN data).
-        let asn = match result.decode::<maxminddb::geoip2::Asn>() {
-            Ok(Some(asn_data)) => asn_data.autonomous_system_number,
-            Ok(None) => None,
-            Err(_) => None, // City DB may not include ASN — silently skip
-        };
-
-        (country_code, asn)
-    }
-
-    /// Look up ASN separately from an ASN database (if available).
-    /// GeoLite2-City doesn't include ASN — call this with a separate
-    /// GeoLite2-ASN.mmdb reader if one is loaded.
-    #[allow(dead_code)]
-    pub fn lookup_asn(&self, ip: IpAddr) -> Option<u32> {
-        if !is_public_ip(ip) {
-            return None;
-        }
-
-        match self.reader.lookup(ip) {
+        // ASN comes from the dedicated ASN reader — City DB does not include it.
+        let asn = self.asn_reader.as_ref().and_then(|r| match r.lookup(ip) {
             Ok(result) => match result.decode::<maxminddb::geoip2::Asn>() {
                 Ok(Some(asn_data)) => asn_data.autonomous_system_number,
                 _ => None,
             },
-            Err(_) => None,
-        }
+            Err(e) => {
+                debug!("geoip asn lookup failed for {}: {}", ip, e);
+                None
+            }
+        });
+
+        (country_code, asn)
     }
 }
 
@@ -714,5 +720,49 @@ mod tests {
         assert!(is_public_ip(IpAddr::V4(std::net::Ipv4Addr::new(
             1, 1, 1, 1
         ))));
+    }
+
+    // Uses GeoLite2-ASN-Test.mmdb (test IP 1.128.0.123, ASN 1221) -- NOT GeoIP2-ASN-Test.mmdb
+    // (different product line, contains 81.2.69.142/ASN 2856, 404s from the MaxMind-DB repo path).
+    // Easy to conflate the two similarly-named files -- verified against maxminddb crate's own
+    // reader_test.rs upstream.
+    #[test]
+    fn test_geoip_city_and_asn_with_test_fixtures() {
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-data");
+        let db = GeoIpDb::open(
+            base.join("GeoIP2-City-Test.mmdb"),
+            Some(base.join("GeoLite2-ASN-Test.mmdb")),
+        )
+        .expect("test databases must load");
+
+        // 81.2.69.142 is in the City test DB → GB.
+        let (country, _) = db.lookup("81.2.69.142".parse().unwrap());
+        assert_eq!(
+            country.as_deref(),
+            Some("GB"),
+            "expected GB from City test DB"
+        );
+
+        // 1.128.0.123 is in the ASN test DB → ASN 1221 (Telstra).
+        let (_, asn) = db.lookup("1.128.0.123".parse().unwrap());
+        assert_eq!(asn, Some(1221), "expected ASN 1221 from ASN test DB");
+
+        // Private IPs must return (None, None) regardless of loaded DBs.
+        let (c, a) = db.lookup("192.168.1.1".parse().unwrap());
+        assert!(c.is_none() && a.is_none(), "private IP must return no data");
+    }
+
+    #[test]
+    fn test_geoip_asn_none_when_no_asn_reader() {
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-data");
+        let db = GeoIpDb::open(base.join("GeoIP2-City-Test.mmdb"), None::<&std::path::Path>)
+            .expect("city test database must load");
+
+        let (country, asn) = db.lookup("81.2.69.142".parse().unwrap());
+        assert_eq!(country.as_deref(), Some("GB"));
+        assert!(
+            asn.is_none(),
+            "ASN must be None when no ASN reader configured"
+        );
     }
 }
