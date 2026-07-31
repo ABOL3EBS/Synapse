@@ -550,6 +550,30 @@ pub struct NetworkCaches {
 }
 
 // ---------------------------------------------------------------------------
+// CaptureEngine initialisation bundle
+// ---------------------------------------------------------------------------
+
+/// All arguments required to build a CaptureEngine, collected into a single
+/// struct so CaptureEngine::new() stays under the clippy::too_many_arguments
+/// threshold without suppression.
+pub struct CaptureInit {
+    // Capture I/O
+    pub bpf_fd: RawFd,
+    pub buf: Vec<u8>,
+    pub write_half: UnixStream,
+    // Runtime state
+    pub caches: NetworkCaches,
+    pub config: CaptureConfig,
+    // Subsystem handles
+    pub enrich_pool: EnrichmentPool,
+    pub tracker: FlowTracker,
+    pub decision_engine: crate::decision::DecisionEngine,
+    pub detectors: Vec<Arc<dyn synapse_common::Detector>>,
+    pub cross_flow_state: Arc<std::sync::Mutex<CrossFlowState>>,
+    pub storage_tx: Option<crossbeam_channel::Sender<StorageEvent>>,
+}
+
+// ---------------------------------------------------------------------------
 // CaptureEngine
 // ---------------------------------------------------------------------------
 
@@ -596,36 +620,23 @@ pub(crate) fn is_infrastructure_destination(ip: IpAddr) -> bool {
 }
 
 impl CaptureEngine {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        bpf_fd: RawFd,
-        buf: Vec<u8>,
-        caches: NetworkCaches,
-        enrich_pool: EnrichmentPool,
-        tracker: FlowTracker,
-        decision_engine: crate::decision::DecisionEngine,
-        detectors: Vec<Arc<dyn synapse_common::Detector>>,
-        write_half: UnixStream,
-        config: CaptureConfig,
-        cross_flow_state: Arc<std::sync::Mutex<CrossFlowState>>,
-        storage_tx: Option<crossbeam_channel::Sender<StorageEvent>>,
-    ) -> Self {
+    pub fn new(init: CaptureInit) -> Self {
         Self {
-            bpf_fd,
-            buf,
-            caches,
-            enrich_pool,
-            tracker,
-            decision_engine,
-            detectors,
-            config,
+            bpf_fd: init.bpf_fd,
+            buf: init.buf,
+            caches: init.caches,
+            enrich_pool: init.enrich_pool,
+            tracker: init.tracker,
+            decision_engine: init.decision_engine,
+            detectors: init.detectors,
+            config: init.config,
             circuit_breaker: HashMap::new(),
             block_cooldown: HashMap::new(),
-            write_half,
+            write_half: init.write_half,
             pkt_count: 0,
             ipc_failures: 0,
-            cross_flow_state,
-            storage_tx,
+            cross_flow_state: init.cross_flow_state,
+            storage_tx: init.storage_tx,
         }
     }
 

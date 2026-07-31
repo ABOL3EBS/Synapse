@@ -190,21 +190,18 @@ fn main() -> io::Result<()> {
     let read_buf = vec![0u8; buf_len];
     let tracker = flow::FlowTracker::new(cfg.flow_config());
 
-    // Load GeoIP database (optional — graceful degradation if missing).
+    // Load GeoIP databases (optional — graceful degradation if missing).
+    // City DB failure disables all GeoIP; ASN DB failure disables ASN only.
     let geoip_db = match cfg.geoip_db_path() {
-        Some(geoip_path) => match enrichment::GeoIpDb::open(&geoip_path) {
-            Ok(db) => {
-                info!("loaded GeoIP database: {}", geoip_path.display());
-                Some(db)
+        Some(city_path) => {
+            match enrichment::GeoIpDb::open(&city_path, cfg.geoip_asn_db_path().as_deref()) {
+                Ok(db) => Some(db),
+                Err(e) => {
+                    info!("GeoIP City database not found ({e}) — GeoIP enrichment disabled.");
+                    None
+                }
             }
-            Err(e) => {
-                info!(
-                    "GeoIP database not found ({e}). \
-                     GeoIP enrichment disabled."
-                );
-                None
-            }
-        },
+        }
         None => {
             info!("no GeoIP database path configured — GeoIP enrichment disabled");
             None
@@ -291,19 +288,19 @@ fn main() -> io::Result<()> {
         own_ips,
         port_pid: port_pid_cache,
     };
-    let mut engine = capture::CaptureEngine::new(
+    let mut engine = capture::CaptureEngine::new(capture::CaptureInit {
         bpf_fd,
-        read_buf,
-        net_caches,
+        buf: read_buf,
+        write_half,
+        caches: net_caches,
+        config: cap_config,
         enrich_pool,
         tracker,
         decision_engine,
         detectors,
-        write_half,
-        cap_config,
         cross_flow_state,
         storage_tx,
-    );
+    });
 
     info!("capture started — watching for packets on BPF fd");
 
