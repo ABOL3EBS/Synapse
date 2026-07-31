@@ -1,10 +1,12 @@
-# Agent Context — Synapse IPS
+# Synapse IPS — Claude Code Context
+
+> **Auto-load note:** This file is named `CLAUDE.md` (uppercase, exact spelling) so that Claude Code auto-loads it at session start. Claude Code reads `CLAUDE.md` from the repo root automatically — it does NOT read `opencode.md`, `opencode.json`, or any other filename. If you move or rename this file, the auto-load silently stops working.
 
 ## Project Overview
 
 Synapse IPS is a reactive, session-level intrusion prevention system for macOS. It captures network traffic via BPF (no kernel extensions, no paid developer account), detects threats through a pluggable detector framework (rules, behavioral analysis, reputation feeds), and enforces decisions via the native `pf` firewall. The process model splits privileged work (BPF device open, `pf` state manipulation) into a helper daemon running as root, while all untrusted parsing, detection, and decision logic runs unprivileged in the agent.
 
-Stack: Rust, BPF (raw ioctls, no pcap for capture), `pf` via `pfctl`, SCM_RIGHTS fd-passing over Unix sockets, bincode IPC. Future: SQLite (WAL) for storage, Tauri + React for the dashboard, AI post-analysis (UI layer only — event summarization, KPI explanations, report generation). macOS only for v1 — cross-platform, `tokio`, and a centralized control-plane backend are all rejected for v1 (see `doc/Synapse-IPS-Architecture.md` §1b).
+Stack: Rust, BPF (raw ioctls, no pcap for capture), `pf` via `pfctl`, SCM_RIGHTS fd-passing over Unix sockets, bincode IPC, SQLite (WAL, two-database design — crash-safe spool + main audit DB). Tauri + React dashboard and AI post-analysis (UI layer only) not yet built. macOS only for v1 — cross-platform, `tokio`, and a centralized control-plane backend are all rejected for v1 (see `doc/Synapse-IPS-Architecture.md` §1b).
 
 ## Key Commands
 
@@ -136,6 +138,22 @@ crates/
 7. Don't suggest: cross-platform, tokio, control-plane backend, or pre-creating platform crates. All rejected for v1 — see `doc/Synapse-IPS-Architecture.md` §1b.
 8. **FlowRecord fields `a_ip`/`b_ip` are canonical (smaller/larger), NOT directional (src/dst).** Two confirmed bugs from the same root cause: `src_ip`/`dst_ip` naming invited the assumption that `dst_ip` = "remote endpoint." It's not — it's the numerically larger IP. For enforcement, always use `determine_remote_ip(a_ip, b_ip, local_ip)` to resolve the actual remote endpoint. Never assume `a_ip` or `b_ip` means "remote" based on field name.
 
+9. **Before starting `synapse-agent` or `synapsed-helper` for ANY test, check for existing running instances first.**
+   ```bash
+   ps aux | grep -E 'synapse-agent|synapsed-helper' | grep -v grep
+   ```
+   Kill any that appear before starting fresh. A stale process left running with old code and old thresholds caused two real incidents in this project: blocking the operator's own gateway and approximately 70 legitimate service IPs, while the operator believed nothing was running. This check has caught a stale helper on multiple consecutive sessions.
+
+10. **Tests for stateful mechanisms (queues, caches, trackers) must exercise the REAL public call path end-to-end.** Never construct or manipulate internal state directly as a substitute for going through the actual code that produces that state. Two separate silent failures in this project's flow re-evaluation subsystem were invisible specifically because tests bypassed the real mechanism and verified internal mechanics instead of integration — one bug dated to project inception, one was introduced in a later refactor. The test suite passed both times. "Tests pass" only means what the tests actually exercise.
+
+11. **Direction must be resolved explicitly before any directional use of flow fields.** `FlowKey`/`FlowRecord` fields derived from canonical ordering (`a_ip`/`b_ip`, `a_port`/`b_port`) are never "local" or "remote" by virtue of position. Always call `is_local()`/`detect_local_ip()` before using a flow's IPs or ports for enforcement targeting, port→PID lookup, or directional logging. This exact bug shipped twice under different names (`determine_local_port` and `determine_remote_ip`) before the pattern was identified as a class error.
+
+12. **Exemptions for false positives must be scoped to the specific thing causing the problem — never broadened to an entire address category as a shortcut.** The correct scope for a gateway false-positive fix is the detected gateway IP, not all of RFC1918. A blanket private-IP exemption would blind CrossFlow to lateral movement, which is explicitly in-scope per the threat model (§1a). When fixing a false positive, name the smallest possible exclusion that corrects it, document why that scope is correct, and explicitly confirm that the broader category remains visible.
+
+13. **Any value that combines multiple detector findings via addition must have an explicit, documented ceiling.** An uncapped composite score existed in this project — not a design decision, just never noticed — that allowed multiple weak findings to reach block threshold via quantity, bypassing the `override_threshold: 0.85` single-finding safety margin that exists precisely to prevent that. The fix is `.min(1.0)` after the summation loop. Whenever you write or modify an aggregation path, state explicitly what ceiling applies and why.
+
+14. **Verify Claude Code's auto-approval and permission settings before doing anything that touches `git push`, enforcement code, or `pfctl`.** Session-level "always allow" grants in Claude Code are NOT persisted to `~/.claude/settings.json` — they reset between sessions. An untracked auto-approval silently approved commits and pushes without a visible prompt during part of a session in this project. Check `cat ~/.claude/settings.json` and confirm `permissions.allow` contains only what you intend. When in doubt, use a fresh session with no prior approvals.
+
 ## Agent workflow
 
 - **Never commit unless explicitly asked.** After completing a step, show the diff and wait for the user to say "commit" or "ship it".
@@ -158,7 +176,8 @@ crates/
 - **Verified:** ICMP/TCP/UDP over IPv4+IPv6 on en0. pfctl table add/delete/show. KillState kills real states (`killed 1 state`, confirmed gone in `pfctl -s state -vv`). pf enabled, anchor active. Process lookup: `test_lookup_own_pid` passes, resolves own executable path and start time. **Live E2E (2026-07-22):** helper sends PortPidCache (49–51 entries, ~7–8ms), agent receives and resolves Brave Browser connection → pid=743 → `Brave Browser Helper` via `lookup_process`. **Flow tracker (2026-07-22):** poll() timeout drives tick(), flows created for each unique session, enrichment dispatches per-flow, DNS reverse lookups succeed (`ec2-44-203-161-176.compute-1.amazonaws.com`, `abbass-macbook-air.local`). **Design review (07-22):** all 4 items verified — canonicalization swap case, local_port independence, enrichment per-flow (documented), MAX_FLOWS + wall-clock tick. **Bug fix (07-23):** `detect_local_ip()` via getifaddrs() at startup, PID lookup uses `is_local(ip)` direction check instead of src_port-first heuristic. **Test (07-23):** `determine_local_port()` extracted as testable function, 4 new tests exercise real code path with system-detected local IP. **Benchmark (07-23):** `detect_local_ip()` measured at 9.065 us/call (100k iterations). Too expensive for per-packet at >10k pkt/s. Switched to 5s background refresh thread — capture loop reads shared `Arc<Mutex<Option<IpAddr>>>`, zero syscalls per packet. **Detector framework (07-23):** §4b implemented — Detector trait, DetectorFinding with timeout enforcement, RuleDetector (placeholder v1 rules), SlowDetector test proves timeout works (500ms sleeper with 50ms budget returns TimedOut within budget). Wired into flow expiry — log only. **Decision engine (07-24):** DecisionEngine with weighted scoring (score × confidence × status_weight), Verdict enum (Allow/Block/Alert), FlowFeatures, DecisionConfig. Active-flow re-evaluation: last_evaluated per-flow, 1s interval, MAX_RE_EVAL_PER_TICK=100. 47 tests pass. Zero enforcement calls — log-only verdicts. **Helper reconnect (07-25):** Helper is now a persistent daemon with accept→enforce→accept loop. Agent crashes do not take down the helper. Per-connection cache-push thread cancelled via `Arc<AtomicBool>` on disconnect. Verified: kill agent → helper logs `connection torn down` → agent restarts → `incoming connection` → `authenticated` → `enforcement loop active`. BPF opened once, reused across connections.
 - **Stub:** `reconcile()` returns default. Reputation enrichment: `ReputationStore` loads feeds but `lookup()` returns `None` for IPs not in any feed.
 - **Shortcomings:** hardcoded port offsets (268/264) in process_lookup.rs (fragile if Apple changes struct layout), per-flow DNS/GeoIP/Reputation dispatch (redundant lookups for same IP — fix: global IP-keyed cache), decision engine has no uncertainty/findings_summary
-- **Not built:** storage (SQLite WAL), Tauri UI, AI post-analysis (UI layer only), Windows/Linux support (intentionally excluded — §1b)
+- **Not built:** Tauri UI, AI post-analysis (UI layer only), Windows/Linux support (intentionally excluded — §1b)
+- **Note:** This "Current status summary" section is intentionally coarse. For accurate, current state including line counts, test counts, and per-component status, read `doc/STATUS.md` (rule 0).
 
 ## Order of work
 
