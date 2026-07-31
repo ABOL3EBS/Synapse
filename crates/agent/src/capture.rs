@@ -217,6 +217,26 @@ pub fn determine_local_port(
     }
 }
 
+/// Determine the remote (IP, port) from a raw packet using the detected local IP.
+/// Used for CrossFlow recording: using info_pkt.dst_port alone is wrong for inbound
+/// flows where dst_port is the local service port, not the remote port.
+/// Mirrors determine_local_port() — same three-branch logic, opposite side returned.
+pub fn determine_remote_endpoint(
+    src_ip: IpAddr,
+    src_port: u16,
+    dst_ip: IpAddr,
+    dst_port: u16,
+    local_ip: IpAddr,
+) -> (IpAddr, u16) {
+    if src_ip == local_ip {
+        (dst_ip, dst_port) // outbound: we are src, remote is dst
+    } else if dst_ip == local_ip {
+        (src_ip, src_port) // inbound: remote is src
+    } else {
+        (dst_ip, dst_port) // neither matches — outbound default
+    }
+}
+
 /// Determine which IP is the remote endpoint for enforcement.
 /// Mirrors the is_local() pattern from determine_local_port().
 /// Never assume a_ip or b_ip means "remote" — canonical ordering
@@ -1046,6 +1066,16 @@ impl CaptureEngine {
                     );
                 }
 
+                // P1 + R10: Lock-free snapshot. Hoisted so both PID lookup and
+                // CrossFlow recording use the same local_ip without a second ArcSwap read.
+                let current_local_ip = match **self.caches.local_ip.load() {
+                    Some(ip) => ip,
+                    None => {
+                        debug!("local_ip unknown — skipping packet (direction unknown)");
+                        continue;
+                    }
+                };
+
                 let (local_port, pid) = {
                     // P1: Lock-free snapshot via arc_swap — no mutex on hot path.
                     let cache = self.caches.port_pid.load();
@@ -1053,16 +1083,7 @@ impl CaptureEngine {
                         let key = (port, proto);
                         cache.get(&key).map(|&pid| (port, pid))
                     };
-                    // P1 + R10: Lock-free snapshot. If local_ip unknown,
-                    // skip direction resolution rather than misclassifying.
-                    let current_local_ip = match **self.caches.local_ip.load() {
-                        Some(ip) => ip,
-                        None => {
-                            debug!("local_ip unknown — skipping packet (direction unknown)");
-                            continue;
-                        }
-                    };
-                    let (local, _remote) = determine_local_port(
+                    let (local, _) = determine_local_port(
                         info_pkt.src_ip,
                         info_pkt.src_port,
                         info_pkt.dst_ip,
@@ -1092,22 +1113,17 @@ impl CaptureEngine {
                     );
 
                     // Record cross-flow state (no IPC or blocking, just in-memory stats).
-                    // Re-compute local IP for direction resolution (current_local_ip
-                    // is scoped inside the pid lookup block above).
-                    let cf_local_ip = match **self.caches.local_ip.load() {
-                        Some(ip) => ip,
-                        None => {
-                            debug!("cross-flow: local_ip unknown — skipping record");
-                            continue;
-                        }
-                    };
-                    let remote_ip = if info_pkt.src_ip == cf_local_ip {
-                        info_pkt.dst_ip
-                    } else {
-                        info_pkt.src_ip
-                    };
+                    // current_local_ip was hoisted above the pid-lookup block so no
+                    // second ArcSwap load is needed here.
+                    let (remote_ip, remote_port) = determine_remote_endpoint(
+                        info_pkt.src_ip,
+                        info_pkt.src_port,
+                        info_pkt.dst_ip,
+                        info_pkt.dst_port,
+                        current_local_ip,
+                    );
                     if let Ok(mut state) = self.cross_flow_state.lock() {
-                        state.record_connection(remote_ip, info_pkt.protocol, info_pkt.dst_port);
+                        state.record_connection(remote_ip, info_pkt.protocol, remote_port);
                     }
 
                     let request = EnrichmentRequest {
@@ -1353,6 +1369,44 @@ mod tests {
             remote,
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
             "fallback should return b_ip (the larger address)"
+        );
+    }
+
+    // determine_remote_endpoint tests — these exercise the bug that was latent in
+    // record_connection's old dst_port argument: inbound flows have dst_port=local
+    // service port, NOT the remote's port. The old code would have record_connection
+    // receiving 53 for an inbound-to-local:53 connection, incorrectly counting it
+    // as "we sent a DNS query."
+
+    #[test]
+    fn test_remote_endpoint_outbound() {
+        // Outbound DNS query: local:ephemeral → remote:53
+        // remote_port must resolve to 53 (the remote DNS server port).
+        let local = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100));
+        let remote = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        let (r_ip, r_port) = determine_remote_endpoint(local, 55000, remote, 53, local);
+        assert_eq!(r_ip, remote);
+        assert_eq!(
+            r_port, 53,
+            "outbound DNS: remote_port must be 53, not the local ephemeral 55000"
+        );
+    }
+
+    #[test]
+    fn test_remote_endpoint_inbound_dns() {
+        // Inbound connection to local DNS server: remote:random_port → local:53.
+        // remote_port must resolve to random_port (the REMOTE side's port), NOT 53.
+        // Before the fix, record_connection received info_pkt.dst_port = 53 here —
+        // incorrectly counting an inbound connection as "we sent a DNS query."
+        let local = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100));
+        let remote = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5));
+        let remote_ephemeral = 47382_u16;
+        let (r_ip, r_port) = determine_remote_endpoint(remote, remote_ephemeral, local, 53, local);
+        assert_eq!(r_ip, remote);
+        assert_eq!(
+            r_port, remote_ephemeral,
+            "inbound to local:53: remote_port must be the remote's ephemeral port ({remote_ephemeral}), \
+             NOT the local service port 53 — that was the pre-fix bug"
         );
     }
 
