@@ -278,7 +278,7 @@ fn get_detector_breakdown(state: tauri::State<DbState>) -> Vec<DetectorStat> {
 
     let mut stmt = match conn.prepare(
         "SELECT detector_id, COUNT(*) as cnt FROM detector_findings
-         WHERE detector_id IS NOT NULL
+         WHERE detector_id IS NOT NULL AND score > 0
          GROUP BY detector_id ORDER BY cnt DESC LIMIT 6",
     ) {
         Ok(s) => s,
@@ -331,6 +331,40 @@ fn get_top_apps(state: tauri::State<DbState>) -> Vec<TopApp> {
 }
 
 // ---------------------------------------------------------------------------
+// Threat countries (globe)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CountryStat {
+    pub country_code: String,
+    pub count: i64,
+}
+
+#[tauri::command]
+fn get_threat_countries(state: tauri::State<DbState>) -> Vec<CountryStat> {
+    let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(conn) = guard.as_ref() else { return vec![]; };
+
+    let mut stmt = match conn.prepare(
+        "SELECT country_code, COUNT(*) as cnt
+         FROM verdicts
+         WHERE country_code IS NOT NULL
+           AND verdict IN ('Block', 'Alert')
+         GROUP BY country_code
+         ORDER BY cnt DESC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+
+    stmt.query_map([], |r| {
+        Ok(CountryStat { country_code: r.get(0)?, count: r.get(1)? })
+    })
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
 // App entry point
 // ---------------------------------------------------------------------------
 
@@ -345,6 +379,7 @@ pub fn run() {
             get_activity_chart,
             get_detector_breakdown,
             get_top_apps,
+            get_threat_countries,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Synapse dashboard");

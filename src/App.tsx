@@ -3,6 +3,7 @@ import SideNav, { Tab } from "./components/SideNav";
 import ProtectionScreen from "./screens/ProtectionScreen";
 import ActivityScreen from "./screens/ActivityScreen";
 import StatsScreen from "./screens/StatsScreen";
+import GlobeScreen from "./screens/GlobeScreen";
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("protection");
@@ -14,6 +15,7 @@ export default function App() {
         {tab === "protection" && <ProtectionScreen />}
         {tab === "activity" && <ActivityScreen />}
         {tab === "stats" && <StatsScreen />}
+        {tab === "globe" && <GlobeScreen />}
       </main>
     </div>
   );

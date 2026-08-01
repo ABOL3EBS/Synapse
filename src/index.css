@@ -41,16 +41,16 @@ body {
 /* Shield breathing glow */
 @keyframes shield-pulse {
   0%, 100% {
-    filter: drop-shadow(0 8px 24px rgba(185, 28, 28, 0.25));
+    filter: drop-shadow(0 6px 16px rgba(185, 28, 28, 0.20));
     transform: scale(1);
   }
   50% {
-    filter: drop-shadow(0 14px 40px rgba(185, 28, 28, 0.55));
-    transform: scale(1.03);
+    filter: drop-shadow(0 16px 56px rgba(185, 28, 28, 0.75));
+    transform: scale(1.07);
   }
 }
 .shield-pulse {
-  animation: shield-pulse 3.5s ease-in-out infinite;
+  animation: shield-pulse 3s ease-in-out infinite;
   transform-origin: center;
 }
 

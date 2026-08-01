@@ -1,6 +1,6 @@
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 
-export type Tab = "protection" | "activity" | "stats";
+export type Tab = "protection" | "activity" | "stats" | "globe";
 
 interface Props {
   active: Tab;
@@ -41,6 +41,18 @@ const TABS: { id: Tab; label: string; icon: (active: boolean) => JSX.Element }[]
         <rect x="18" y="3" width="3" height="18" rx="1" />
         <rect x="10.5" y="9" width="3" height="12" rx="1" />
         <rect x="3" y="13" width="3" height="8" rx="1" />
+      </svg>
+    ),
+  },
+  {
+    id: "globe",
+    label: "Threat Map",
+    icon: (active) => (
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+        strokeWidth={active ? 2.2 : 1.8} strokeLinecap="round" strokeLinejoin="round">
+        <circle cx="12" cy="12" r="10" />
+        <line x1="2" y1="12" x2="22" y2="12" />
+        <path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z" />
       </svg>
     ),
   },

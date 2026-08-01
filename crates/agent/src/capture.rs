@@ -363,11 +363,21 @@ pub fn detect_default_gateway() -> Option<IpAddr> {
     rt_buf_find_gateway(&buf)
 }
 
-/// Walk a sysctl routing table buffer and return the gateway address from
-/// the first entry with RTF_GATEWAY | RTF_UP. Helper for detect_default_gateway.
+/// Walk a sysctl routing table buffer and return the gateway address from the
+/// true default route (dst = 0.0.0.0).
+///
+/// On macOS with VPN tunnels, more-specific VPN gateway routes (e.g. split-tunnel
+/// /1 routes) appear before the LAN default route in the kernel's dump. The old
+/// "first RTF_GATEWAY|RTF_UP wins" logic therefore returned the VPN gateway
+/// instead of the LAN gateway, so the LAN gateway was never added to
+/// CrossFlowState::excluded_ips and triggered false-positive DNS-burst alerts.
+///
+/// Fix: prefer the entry whose RTA_DST is 0.0.0.0 (the true default). Fall back
+/// to the first non-loopback, non-unspecified gateway only if no such entry exists.
 fn rt_buf_find_gateway(buf: &[u8]) -> Option<IpAddr> {
     let hdr_size = std::mem::size_of::<libc::rt_msghdr>();
     let mut offset = 0usize;
+    let mut fallback: Option<IpAddr> = None;
 
     while offset + hdr_size <= buf.len() {
         // SAFETY: buf is kernel-provided, bounds-checked above.
@@ -381,28 +391,43 @@ fn rt_buf_find_gateway(buf: &[u8]) -> Option<IpAddr> {
         if rtm.rtm_flags & (libc::RTF_GATEWAY | libc::RTF_UP) == (libc::RTF_GATEWAY | libc::RTF_UP)
         {
             let msg = &buf[offset..offset + msg_len];
-            if let Some(gw) = rt_msg_gateway(msg, &rtm) {
+            if let Some((dst, gw)) = rt_msg_dst_and_gateway(msg, &rtm) {
                 if !gw.is_loopback() && !gw.is_unspecified() {
-                    debug!("detected default gateway via sysctl: {gw}");
-                    return Some(gw);
+                    if dst.is_unspecified() {
+                        // Exact match: this is the 0.0.0.0 default route.
+                        debug!("detected default gateway via sysctl: {gw}");
+                        return Some(gw);
+                    }
+                    if fallback.is_none() {
+                        fallback = Some(gw);
+                    }
                 }
             }
         }
         offset += msg_len;
     }
 
+    if let Some(gw) = fallback {
+        debug!("detected default gateway via sysctl (fallback): {gw}");
+        return Some(gw);
+    }
     warn!("could not detect default gateway from routing table");
     None
 }
 
-/// Extract the RTA_GATEWAY sockaddr from a single rt_msghdr message.
-fn rt_msg_gateway(msg: &[u8], rtm: &libc::rt_msghdr) -> Option<IpAddr> {
+/// Extract RTA_DST and RTA_GATEWAY sockaddrs from a single rt_msghdr message.
+/// Returns (dst, gateway). Either may be None if the sockaddr is absent or
+/// of an unrecognised address family.
+fn rt_msg_dst_and_gateway(msg: &[u8], rtm: &libc::rt_msghdr) -> Option<(IpAddr, IpAddr)> {
     let hdr_size = std::mem::size_of::<libc::rt_msghdr>();
     let sa_buf = msg.get(hdr_size..)?;
 
     // Walk sockaddrs in RTA bit order (bit 0 = RTA_DST, bit 1 = RTA_GATEWAY, …).
     // Each sockaddr is padded to the next sizeof(long) boundary (8 bytes on Darwin).
     let mut pos = 0usize;
+    let mut dst: Option<IpAddr> = None;
+    let mut gw: Option<IpAddr> = None;
+
     for bit in 0..32i32 {
         let rta = 1 << bit;
         if rtm.rtm_addrs & rta == 0 {
@@ -419,12 +444,22 @@ fn rt_msg_gateway(msg: &[u8], rtm: &libc::rt_msghdr) -> Option<IpAddr> {
         };
         let rounded = rt_roundup(actual);
 
-        if rta == libc::RTA_GATEWAY {
-            return rt_parse_sockaddr(sa_buf.get(pos..pos + actual)?);
+        if rta == libc::RTA_DST {
+            dst = rt_parse_sockaddr(sa_buf.get(pos..pos + actual)?);
+        } else if rta == libc::RTA_GATEWAY {
+            gw = rt_parse_sockaddr(sa_buf.get(pos..pos + actual)?);
+        }
+
+        if dst.is_some() && gw.is_some() {
+            break;
         }
         pos += rounded;
     }
-    None
+
+    match (dst, gw) {
+        (Some(d), Some(g)) => Some((d, g)),
+        _ => None,
+    }
 }
 
 /// BSD RT_ROUNDUP: align to sizeof(long) (8 bytes on 64-bit Darwin).
@@ -1596,6 +1631,125 @@ mod tests {
         // Gateway must not be unspecified or loopback.
         assert!(!ip.is_unspecified(), "gateway must not be 0.0.0.0");
         assert!(!ip.is_loopback(), "gateway must not be loopback");
+    }
+
+    // Build a minimal rt_msghdr + two sockaddr_in entries (dst, gateway) into a
+    // buffer that rt_buf_find_gateway can parse. Both addresses are AF_INET.
+    fn make_route_entry(
+        flags: libc::c_int,
+        dst_addr: std::net::Ipv4Addr,
+        gw_addr: std::net::Ipv4Addr,
+    ) -> Vec<u8> {
+        use std::mem::size_of;
+
+        let hdr_size = size_of::<libc::rt_msghdr>();
+        let sin_size = size_of::<libc::sockaddr_in>();
+        let rounded_sin = rt_roundup(sin_size); // 16 on Darwin
+        let total = hdr_size + rounded_sin * 2;
+
+        let mut buf = vec![0u8; total];
+
+        // Write the rt_msghdr.
+        let rtm = libc::rt_msghdr {
+            rtm_msglen: total as u16,
+            rtm_version: libc::RTM_VERSION as u8,
+            rtm_type: libc::RTM_GET as u8,
+            rtm_index: 0,
+            rtm_flags: flags,
+            rtm_addrs: libc::RTA_DST | libc::RTA_GATEWAY, // bits 0 and 1
+            rtm_pid: 0,
+            rtm_seq: 0,
+            rtm_errno: 0,
+            rtm_use: 0,
+            rtm_inits: 0,
+            rtm_rmx: unsafe { std::mem::zeroed() },
+        };
+        unsafe {
+            std::ptr::write_unaligned(buf.as_mut_ptr() as *mut libc::rt_msghdr, rtm);
+        }
+
+        // Write dst sockaddr_in at hdr_size.
+        let dst_sin = libc::sockaddr_in {
+            sin_len: sin_size as u8,
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: 0,
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes(dst_addr.octets()),
+            },
+            sin_zero: [0; 8],
+        };
+        unsafe {
+            std::ptr::write_unaligned(
+                buf.as_mut_ptr().add(hdr_size) as *mut libc::sockaddr_in,
+                dst_sin,
+            );
+        }
+
+        // Write gateway sockaddr_in at hdr_size + rounded_sin.
+        let gw_sin = libc::sockaddr_in {
+            sin_len: sin_size as u8,
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: 0,
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes(gw_addr.octets()),
+            },
+            sin_zero: [0; 8],
+        };
+        unsafe {
+            std::ptr::write_unaligned(
+                buf.as_mut_ptr().add(hdr_size + rounded_sin) as *mut libc::sockaddr_in,
+                gw_sin,
+            );
+        }
+
+        buf
+    }
+
+    #[test]
+    fn test_rt_buf_find_gateway_prefers_default_route_over_vpn_route() {
+        // Simulate a routing table where a VPN-specific gateway route (dst=10.0.0.0)
+        // appears BEFORE the true default route (dst=0.0.0.0) — the scenario that
+        // caused the 172.18.22.1 false-positive. The fix must return the 0.0.0.0
+        // entry's gateway, not the VPN entry's gateway.
+        let vpn_gw = std::net::Ipv4Addr::new(10, 8, 0, 1);
+        let lan_gw = std::net::Ipv4Addr::new(172, 18, 22, 1);
+        let flags = libc::RTF_GATEWAY | libc::RTF_UP;
+
+        let mut buf = Vec::new();
+        // VPN route comes first: dst=10.0.0.0, gw=10.8.0.1
+        buf.extend_from_slice(&make_route_entry(
+            flags,
+            std::net::Ipv4Addr::new(10, 0, 0, 0),
+            vpn_gw,
+        ));
+        // Default route comes second: dst=0.0.0.0, gw=172.18.22.1
+        buf.extend_from_slice(&make_route_entry(
+            flags,
+            std::net::Ipv4Addr::UNSPECIFIED,
+            lan_gw,
+        ));
+
+        let result = rt_buf_find_gateway(&buf);
+        assert_eq!(
+            result,
+            Some(IpAddr::V4(lan_gw)),
+            "must return the 0.0.0.0 default route's gateway, not the VPN gateway"
+        );
+    }
+
+    #[test]
+    fn test_rt_buf_find_gateway_fallback_when_no_default_route() {
+        // If no entry has dst=0.0.0.0, fall back to the first RTF_GATEWAY|RTF_UP entry.
+        let only_gw = std::net::Ipv4Addr::new(192, 168, 1, 1);
+        let flags = libc::RTF_GATEWAY | libc::RTF_UP;
+        let buf = make_route_entry(flags, std::net::Ipv4Addr::new(8, 8, 8, 0), only_gw);
+
+        let result = rt_buf_find_gateway(&buf);
+        assert_eq!(
+            result,
+            Some(IpAddr::V4(only_gw)),
+            "fallback must return the only RTF_GATEWAY|RTF_UP entry when no 0.0.0.0 route exists"
+        );
     }
 
     #[test]

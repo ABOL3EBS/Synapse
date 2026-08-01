@@ -43,6 +43,11 @@ export interface TopApp {
   alerts: number;
 }
 
+export interface CountryStat {
+  country_code: string;
+  count: number;
+}
+
 // ---------------------------------------------------------------------------
 // Tauri context check
 // ---------------------------------------------------------------------------
@@ -82,4 +87,9 @@ export function getDetectorBreakdown(): Promise<DetectorStat[]> {
 export function getTopApps(): Promise<TopApp[]> {
   if (!isTauri()) return Promise.reject(new Error("not-tauri"));
   return invoke<TopApp[]>("get_top_apps");
+}
+
+export function getThreatCountries(): Promise<CountryStat[]> {
+  if (!isTauri()) return Promise.reject(new Error("not-tauri"));
+  return invoke<CountryStat[]>("get_threat_countries");
 }
