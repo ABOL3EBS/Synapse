@@ -114,7 +114,7 @@ impl CrossFlowState {
     pub fn record_connection(&mut self, remote_ip: IpAddr, protocol: u8, remote_port: u16) {
         if self.is_excluded(remote_ip) {
             log::debug!(
-                "CrossFlow: dst={}:{} proto={} EXCLUDED (gateway/own-ip/broadcast/multicast)",
+                "CrossFlow: dst={}:{} proto={} EXCLUDED (gateway/own-ip/api-endpoint/broadcast/multicast)",
                 remote_ip,
                 remote_port,
                 protocol
@@ -144,7 +144,7 @@ impl CrossFlowState {
 
     // Called for every new flow when the originating PID is known (pid != 0).
     pub fn record_pid_connection(&mut self, pid: u32, remote_ip: IpAddr) {
-        if crate::capture::is_infrastructure_destination(remote_ip) {
+        if self.is_excluded(remote_ip) {
             return;
         }
         // Count-cap: don't add new PIDs when at capacity.
