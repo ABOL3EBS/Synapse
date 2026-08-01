@@ -67,8 +67,27 @@ pub struct ActivityItem {
     pub detector_ids: Vec<String>,
     pub a_ip_text: String,
     pub b_ip_text: String,
+    pub remote_ip_text: String,  // direction-resolved: the non-local endpoint
     pub country_code: Option<String>,
     pub dns_name: Option<String>,
+}
+
+// Pick the remote (non-private) IP from canonical a/b pair.
+// If one is private and one public, the public one is always remote.
+// If both are private (LAN flows), fall back to b_ip_text (larger IP).
+fn pick_remote(a: &str, b: &str) -> String {
+    use std::net::IpAddr;
+    let parse_private = |s: &str| -> bool {
+        s.parse::<IpAddr>().map(|ip| match ip {
+            IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+            IpAddr::V6(v6) => v6.is_loopback(),
+        }).unwrap_or(false)
+    };
+    match (parse_private(a), parse_private(b)) {
+        (true, false) => b.to_string(),
+        (false, true) => a.to_string(),
+        _ => b.to_string(), // both private or both public: canonical fallback
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -139,14 +158,18 @@ fn get_activity_feed(limit: i64, state: tauri::State<DbState>) -> Vec<ActivityIt
                 .unwrap_or("Unknown app")
                 .to_string();
 
+            let a_ip_text: String = r.get(4)?;
+            let b_ip_text: String = r.get(5)?;
+            let remote_ip_text = pick_remote(&a_ip_text, &b_ip_text);
             Ok(ActivityItem {
                 id: r.get(0)?,
                 ts_ms: r.get(1)?,
                 app_name,
                 verdict: r.get(3)?,
                 detector_ids: vec![],   // filled below
-                a_ip_text: r.get(4)?,
-                b_ip_text: r.get(5)?,
+                a_ip_text,
+                b_ip_text,
+                remote_ip_text,
                 country_code: r.get(6)?,
                 dns_name: r.get(7)?,
             })
@@ -268,7 +291,8 @@ fn get_activity_chart(state: tauri::State<DbState>) -> Vec<ChartPoint> {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DetectorStat {
     pub name: String,
-    pub count: i64,
+    pub count: i64,       // findings with score > 0
+    pub has_runs: bool,   // true if detector ran at all (even with 0 findings)
 }
 
 #[tauri::command]
@@ -276,17 +300,28 @@ fn get_detector_breakdown(state: tauri::State<DbState>) -> Vec<DetectorStat> {
     let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
     let Some(conn) = guard.as_ref() else { return vec![]; };
 
+    // Return all detectors that ran, with finding count (score > 0) per detector.
+    // Detectors that ran but had zero signal appear with count=0, has_runs=true —
+    // distinct from "never ran" (absent from table entirely).
     let mut stmt = match conn.prepare(
-        "SELECT detector_id, COUNT(*) as cnt FROM detector_findings
-         WHERE detector_id IS NOT NULL AND score > 0
-         GROUP BY detector_id ORDER BY cnt DESC LIMIT 6",
+        "SELECT detector_id,
+                COUNT(CASE WHEN score > 0 THEN 1 END) as findings,
+                COUNT(*) as runs
+         FROM detector_findings
+         WHERE detector_id IS NOT NULL
+         GROUP BY detector_id
+         ORDER BY findings DESC",
     ) {
         Ok(s) => s,
         Err(_) => return vec![],
     };
 
     stmt.query_map([], |r| {
-        Ok(DetectorStat { name: r.get(0)?, count: r.get(1)? })
+        Ok(DetectorStat {
+            name: r.get(0)?,
+            count: r.get(1)?,
+            has_runs: r.get::<_, i64>(2)? > 0,
+        })
     })
     .map(|rows| rows.filter_map(|r| r.ok()).collect())
     .unwrap_or_default()

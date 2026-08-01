@@ -4,6 +4,8 @@ import { getThreatCountries, type CountryStat } from "../lib/db";
 import { COUNTRY_COORDS } from "../lib/countries";
 import { countryName } from "../lib/translate";
 
+const REFRESH_MS = 30_000;
+
 interface RingPoint {
   lat: number;
   lng: number;
@@ -63,9 +65,14 @@ export default function GlobeScreen() {
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
-    getThreatCountries()
-      .then(setStats)
-      .catch(() => setError(true));
+    const load = () =>
+      getThreatCountries()
+        .then(setStats)
+        .catch(() => setError(true));
+
+    load();
+    const id = setInterval(load, REFRESH_MS);
+    return () => clearInterval(id);
   }, []);
 
   // Auto-rotate; stop on user interaction

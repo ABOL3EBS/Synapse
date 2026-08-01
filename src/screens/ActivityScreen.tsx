@@ -2,21 +2,22 @@ import { useEffect, useState } from "react";
 import ActivityRow from "../components/ActivityRow";
 import { getActivityFeed, isTauri, type ActivityItem } from "../lib/db";
 
+const REFRESH_MS = 30_000;
+
 export default function ActivityScreen() {
   const [items, setItems] = useState<ActivityItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
 
   useEffect(() => {
-    getActivityFeed(50)
-      .then((data) => {
-        setItems(data);
-        setLoading(false);
-      })
-      .catch(() => {
-        setError(true);
-        setLoading(false);
-      });
+    const load = () =>
+      getActivityFeed(50)
+        .then((data) => { setItems(data); setLoading(false); })
+        .catch(() => { setError(true); setLoading(false); });
+
+    load();
+    const id = setInterval(load, REFRESH_MS);
+    return () => clearInterval(id);
   }, []);
 
   return (
@@ -31,11 +32,7 @@ export default function ActivityScreen() {
 
       {/* Feed */}
       <div className="flex-1 scroll-area px-4 pb-4 space-y-2.5">
-        {loading && (
-          <div className="flex justify-center items-center h-32">
-            <span className="text-sm text-navy/30">Loading…</span>
-          </div>
-        )}
+        {loading && <SkeletonFeed />}
 
         {error && (
           <EmptyState
@@ -63,6 +60,23 @@ export default function ActivityScreen() {
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+function SkeletonFeed() {
+  return (
+    <div className="space-y-2.5">
+      {[72, 56, 64].map((w) => (
+        <div key={w} className="bg-white rounded-2xl shadow-card border border-black/[0.04] px-4 py-3.5 flex items-start gap-3 animate-pulse">
+          <div className="mt-1.5 w-2 h-2 rounded-full bg-navy/10 shrink-0" />
+          <div className="flex-1 space-y-2 min-w-0">
+            <div className={`h-3 bg-navy/10 rounded w-${w}/100`} style={{ width: `${w}%` }} />
+            <div className="h-2.5 bg-navy/[0.06] rounded w-24" />
+          </div>
+          <div className="h-5 w-14 bg-navy/10 rounded-full shrink-0" />
+        </div>
+      ))}
     </div>
   );
 }

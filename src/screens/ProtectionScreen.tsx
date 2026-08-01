@@ -1,14 +1,22 @@
 import { useEffect, useState } from "react";
 import { getProtectionStatus, type ProtectionStatus } from "../lib/db";
 
+const REFRESH_MS = 30_000;
+
 export default function ProtectionScreen() {
   const [status, setStatus] = useState<ProtectionStatus | null>(null);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
 
   useEffect(() => {
-    getProtectionStatus()
-      .then(setStatus)
-      .catch(() => setError(true));
+    const load = () =>
+      getProtectionStatus()
+        .then((s) => { setStatus(s); setLoading(false); })
+        .catch(() => { setError(true); setLoading(false); });
+
+    load();
+    const id = setInterval(load, REFRESH_MS);
+    return () => clearInterval(id);
   }, []);
 
   const shieldState = error ? "inactive" : status?.is_protected ? "protected" : "warning";
@@ -57,21 +65,22 @@ export default function ProtectionScreen() {
         <p className="text-xs font-semibold text-navy/30 uppercase tracking-widest mb-2">
           Status
         </p>
-        <StatusRow
-          icon={<MonitorIcon />}
-          label="Monitoring your network"
-          active={!error}
-        />
-        <StatusRow
-          icon={<ShieldSmallIcon />}
-          label="Protection is on"
-          active={!error}
-        />
-        <StatusRow
-          icon={<LockIcon />}
-          label="pf firewall active"
-          active={!error}
-        />
+        {loading ? (
+          <div className="space-y-4 animate-pulse">
+            {[48, 40, 44].map((w) => (
+              <div key={w} className="flex items-center gap-3">
+                <div className="w-4 h-4 rounded bg-navy/10 shrink-0" />
+                <div className="h-3 bg-navy/10 rounded" style={{ width: `${w}%` }} />
+              </div>
+            ))}
+          </div>
+        ) : (
+          <>
+            <StatusRow icon={<MonitorIcon />} label="Monitoring your network" active={!error} />
+            <StatusRow icon={<ShieldSmallIcon />} label="Protection is on" active={!error} />
+            <StatusRow icon={<LockIcon />} label="pf firewall active" active={!error} />
+          </>
+        )}
 
         {/* Threat count callout */}
         {status && status.blocks_week > 0 && (

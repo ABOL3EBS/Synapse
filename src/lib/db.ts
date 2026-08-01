@@ -17,6 +17,7 @@ export interface ActivityItem {
   detector_ids: string[];
   a_ip_text: string;
   b_ip_text: string;
+  remote_ip_text: string;
   country_code: string | null;
   dns_name: string | null;
 }
@@ -35,6 +36,7 @@ export interface ChartPoint {
 export interface DetectorStat {
   name: string;
   count: number;
+  has_runs: boolean;
 }
 
 export interface TopApp {

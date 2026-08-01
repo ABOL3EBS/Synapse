@@ -14,27 +14,33 @@ import Sparkline from "../components/Sparkline";
 import DetectorChart from "../components/DetectorChart";
 import TopApps from "../components/TopApps";
 
+const REFRESH_MS = 30_000;
+
 export default function StatsScreen() {
   const [stats, setStats] = useState<ThreatStats | null>(null);
   const [chart, setChart] = useState<ChartPoint[]>([]);
   const [detectors, setDetectors] = useState<DetectorStat[]>([]);
   const [topApps, setTopApps] = useState<TopApp[]>([]);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
 
   useEffect(() => {
-    Promise.all([
-      getThreatStats(),
-      getActivityChart(),
-      getDetectorBreakdown(),
-      getTopApps(),
-    ])
-      .then(([s, c, d, a]) => {
-        setStats(s);
-        setChart(c);
-        setDetectors(d);
-        setTopApps(a);
-      })
-      .catch(() => setError(true));
+    const load = () =>
+      Promise.all([
+        getThreatStats(),
+        getActivityChart(),
+        getDetectorBreakdown(),
+        getTopApps(),
+      ])
+        .then(([s, c, d, a]) => {
+          setStats(s); setChart(c); setDetectors(d); setTopApps(a);
+          setLoading(false);
+        })
+        .catch(() => { setError(true); setLoading(false); });
+
+    load();
+    const id = setInterval(load, REFRESH_MS);
+    return () => clearInterval(id);
   }, []);
 
   if (error) {
@@ -54,9 +60,19 @@ export default function StatsScreen() {
 
       {/* Stat cards */}
       <div className="grid grid-cols-3 gap-3 shrink-0">
-        <StatCard label="Stopped today" value={stats?.blocks_today ?? 0} accent="emerald" />
-        <StatCard label="This week" value={stats?.blocks_week ?? 0} accent="emerald" />
-        <StatCard label="Blocked IPs" value={stats?.blocked_addresses ?? 0} accent="navy" />
+        {loading ? (
+          <>
+            <SkeletonCard />
+            <SkeletonCard />
+            <SkeletonCard />
+          </>
+        ) : (
+          <>
+            <StatCard label="Stopped today" value={stats?.blocks_today ?? 0} accent="emerald" />
+            <StatCard label="This week" value={stats?.blocks_week ?? 0} accent="emerald" />
+            <StatCard label="Blocked IPs" value={stats?.blocked_addresses ?? 0} accent="navy" />
+          </>
+        )}
       </div>
 
       {/* Activity timeline */}
@@ -82,6 +98,15 @@ export default function StatsScreen() {
 // ---------------------------------------------------------------------------
 // Sub-components
 // ---------------------------------------------------------------------------
+
+function SkeletonCard() {
+  return (
+    <div className="bg-white rounded-2xl shadow-card border border-black/[0.04] px-4 py-4 animate-pulse">
+      <div className="h-2.5 bg-navy/10 rounded w-20 mb-3" />
+      <div className="h-8 bg-navy/10 rounded w-12" />
+    </div>
+  );
+}
 
 function StatCard({ label, value, accent }: {
   label: string;

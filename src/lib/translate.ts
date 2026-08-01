@@ -28,13 +28,13 @@ export function countryName(code: string): string {
 }
 
 export function toPlainEnglish(item: ActivityItem): string {
-  const app = item.app_name || "An unknown app";
+  const app = item.app_name || "Unknown app";
+  const remote = item.dns_name ?? item.remote_ip_text;
   const phrase = item.detector_ids
     .map((id) => FINDING_PHRASE[id])
     .find(Boolean) ?? "do something suspicious";
 
   if (item.verdict === "Allow") {
-    const remote = item.dns_name ?? item.b_ip_text;
     const loc = item.country_code
       ? ` in ${countryName(item.country_code)}`
       : "";
@@ -43,7 +43,7 @@ export function toPlainEnglish(item: ActivityItem): string {
 
   const suffix =
     item.verdict === "Block" ? "— blocked." : "— flagged for review.";
-  return `${app} tried to ${phrase} ${suffix}`;
+  return `${app} tried to ${phrase} (${remote}) ${suffix}`;
 }
 
 // Brief "Why?" sentence — one step more specific than toPlainEnglish

@@ -31,7 +31,7 @@ export default function ActivityRow({ item }: Props) {
 
   const sentence = toPlainEnglish(item);
   const whySentence = toWhySentence(item);
-  const remoteIp = item.dns_name ?? item.b_ip_text;
+  const remoteIp = item.dns_name ?? item.remote_ip_text;
 
   return (
     <div className="bg-white rounded-2xl shadow-card border border-black/[0.04] overflow-hidden">
