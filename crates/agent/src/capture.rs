@@ -886,7 +886,8 @@ impl CaptureEngine {
                 info!("[ALERT] flow={} remote={} {}", flow_id, remote, reason);
                 if let Some(ref tx) = self.storage_tx {
                     let _ = tx.send(StorageEvent::VerdictDecided {
-                        flow: flow.clone(),
+                        flow: Box::new(flow.clone()),
+                        local_ip,
                         verdict: "Alert".to_string(),
                         reason: reason.clone(),
                         composite_score,
@@ -915,7 +916,8 @@ impl CaptureEngine {
                         // Persist the verdict decision before attempting enforcement.
                         if let Some(ref tx) = self.storage_tx {
                             let _ = tx.send(StorageEvent::VerdictDecided {
-                                flow: flow.clone(),
+                                flow: Box::new(flow.clone()),
+                                local_ip,
                                 verdict: "Block".to_string(),
                                 reason: reason.clone(),
                                 composite_score,

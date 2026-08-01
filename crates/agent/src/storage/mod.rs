@@ -44,7 +44,8 @@ pub enum StorageEvent {
     /// Important: an Alert or Block verdict was reached for a flow.
     /// Not emitted for Allow — benign traffic is not stored.
     VerdictDecided {
-        flow: FlowRecord,
+        flow: Box<FlowRecord>,
+        local_ip: std::net::IpAddr,
         verdict: String,
         reason: String,
         composite_score: f32,
@@ -311,6 +312,7 @@ fn flush(
 
             StorageEvent::VerdictDecided {
                 flow,
+                local_ip,
                 verdict,
                 reason,
                 composite_score,
@@ -319,6 +321,7 @@ fn flush(
             } => {
                 let (a_blob, a_text) = ip_to_parts(flow.a_ip);
                 let (b_blob, b_text) = ip_to_parts(flow.b_ip);
+                let local_ip_text = local_ip.to_string();
                 let flow_age_ms = flow.flow_age.as_millis() as i64;
                 let verdict_id: i64 = match tx.query_row(
                     "INSERT INTO verdicts
@@ -326,9 +329,9 @@ fn flush(
                       a_port, b_port, protocol, pid, process_path, process_start,
                       dns_name, country_code, asn, reputation_score,
                       verdict, reason, composite_score, ttl_ms, flow_age_ms,
-                      pkt_count, byte_count)
+                      pkt_count, byte_count, local_ip_text)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,
-                             ?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)
+                             ?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)
                      RETURNING id",
                     params![
                         ts_ms,
@@ -354,6 +357,7 @@ fn flush(
                         flow_age_ms,
                         flow.packet_count as i64,
                         flow.byte_count as i64,
+                        local_ip_text,
                     ],
                     |r| r.get(0),
                 ) {
@@ -689,7 +693,8 @@ mod tests {
         // Send events that will fail — verdicts table is gone.
         for _ in 0..3 {
             tx.send(StorageEvent::VerdictDecided {
-                flow: make_test_flow(),
+                flow: Box::new(make_test_flow()),
+                local_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
                 verdict: "Alert".to_string(),
                 reason: "failure test".to_string(),
                 composite_score: 0.4,
