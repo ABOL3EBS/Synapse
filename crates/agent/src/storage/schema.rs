@@ -1,7 +1,7 @@
 use log::info;
 use rusqlite::Connection;
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Apply the schema to an open connection. Idempotent — safe to call on
 /// every startup. Uses PRAGMA user_version for lightweight migration tracking.
@@ -39,9 +39,15 @@ pub fn apply_schema(conn: &Connection) -> Result<(), String> {
     if version < 2 {
         conn.execute_batch(V2_DDL)
             .map_err(|e| format!("schema v2: {e}"))?;
+        info!("storage: schema v2 applied (metadata table)");
+    }
+
+    if version < 3 {
+        conn.execute_batch(V3_DDL)
+            .map_err(|e| format!("schema v3: {e}"))?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|e| format!("set user_version: {e}"))?;
-        info!("storage: schema v2 applied (metadata table)");
+        info!("storage: schema v3 applied (verdicts.local_ip_text)");
     }
 
     Ok(())
@@ -168,4 +174,16 @@ CREATE TABLE IF NOT EXISTS metadata (
 );
 INSERT OR IGNORE INTO metadata (key, value)
     VALUES ('last_retention_run_ms', '0');
+";
+
+// ---------------------------------------------------------------------------
+// V3 DDL — add local_ip_text to verdicts for direction-aware UI display
+// ---------------------------------------------------------------------------
+
+const V3_DDL: &str = "
+-- local_ip_text: the agent's local IP at the time the verdict was written.
+-- Stored alongside a_ip_text/b_ip_text so the Tauri backend can resolve
+-- which canonical endpoint is remote without a private/public heuristic.
+-- NULL for existing rows (rows written before V3 — treated as unknown by UI).
+ALTER TABLE verdicts ADD COLUMN local_ip_text TEXT;
 ";

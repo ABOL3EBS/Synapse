@@ -72,22 +72,20 @@ pub struct ActivityItem {
     pub dns_name: Option<String>,
 }
 
-// Pick the remote (non-private) IP from canonical a/b pair.
-// If one is private and one public, the public one is always remote.
-// If both are private (LAN flows), fall back to b_ip_text (larger IP).
-fn pick_remote(a: &str, b: &str) -> String {
-    use std::net::IpAddr;
-    let parse_private = |s: &str| -> bool {
-        s.parse::<IpAddr>().map(|ip| match ip {
-            IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
-            IpAddr::V6(v6) => v6.is_loopback(),
-        }).unwrap_or(false)
-    };
-    match (parse_private(a), parse_private(b)) {
-        (true, false) => b.to_string(),
-        (false, true) => a.to_string(),
-        _ => b.to_string(), // both private or both public: canonical fallback
+// Resolve the remote endpoint using the stored local_ip_text.
+// Mirrors determine_remote_ip() in capture.rs: if a == local → b is remote,
+// if b == local → a is remote, otherwise fall back to b (canonical larger).
+// local_ip is None for rows written before schema V3 — falls back to b.
+fn pick_remote(a: &str, b: &str, local: Option<&str>) -> String {
+    if let Some(local_ip) = local {
+        if a == local_ip {
+            return b.to_string();
+        }
+        if b == local_ip {
+            return a.to_string();
+        }
     }
+    b.to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -139,7 +137,7 @@ fn get_activity_feed(limit: i64, state: tauri::State<DbState>) -> Vec<ActivityIt
     // but the real feed only shows Block/Alert in normal operation.
     let mut stmt = match conn.prepare(
         "SELECT v.id, v.ts_ms, v.process_path, v.verdict,
-                v.a_ip_text, v.b_ip_text, v.country_code, v.dns_name
+                v.a_ip_text, v.b_ip_text, v.local_ip_text, v.country_code, v.dns_name
          FROM verdicts v
          ORDER BY v.ts_ms DESC
          LIMIT ?1",
@@ -160,7 +158,12 @@ fn get_activity_feed(limit: i64, state: tauri::State<DbState>) -> Vec<ActivityIt
 
             let a_ip_text: String = r.get(4)?;
             let b_ip_text: String = r.get(5)?;
-            let remote_ip_text = pick_remote(&a_ip_text, &b_ip_text);
+            let local_ip_text: Option<String> = r.get(6)?;
+            let remote_ip_text = pick_remote(
+                &a_ip_text,
+                &b_ip_text,
+                local_ip_text.as_deref(),
+            );
             Ok(ActivityItem {
                 id: r.get(0)?,
                 ts_ms: r.get(1)?,
@@ -170,8 +173,8 @@ fn get_activity_feed(limit: i64, state: tauri::State<DbState>) -> Vec<ActivityIt
                 a_ip_text,
                 b_ip_text,
                 remote_ip_text,
-                country_code: r.get(6)?,
-                dns_name: r.get(7)?,
+                country_code: r.get(7)?,
+                dns_name: r.get(8)?,
             })
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
