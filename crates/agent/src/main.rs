@@ -231,15 +231,37 @@ fn main() -> io::Result<()> {
     synapse_common::init_detector_pool(8);
     info!("detector worker pool initialized (8 workers)");
 
-    // CrossFlow exclusion set: gateway + own_ips snapshot.
-    // own_ips already contains subnet-directed broadcasts (e.g. 172.18.22.255)
-    // computed from interface netmasks by detect_own_ips(). Protocol-level
-    // infrastructure addresses (multicast, 255.255.255.255) are handled by
-    // is_infrastructure_destination() inside CrossFlowState, not this set.
+    // CrossFlow exclusion set: gateway + own_ips snapshot + known high-volume
+    // API endpoints. own_ips already contains subnet-directed broadcasts (e.g.
+    // 172.18.22.255) computed from interface netmasks by detect_own_ips().
+    // Protocol-level infrastructure addresses (multicast, 255.255.255.255) are
+    // handled by is_infrastructure_destination() inside CrossFlowState, not here.
+    //
+    // Excluded API endpoints are scoped to the SPECIFIC IP only — NOT the full
+    // ASN or CIDR. The Claude desktop app sustains ~156 connections/60s to
+    // 160.79.104.10 (Anthropic API / api.anthropic.com), enough to trigger
+    // CrossFlow's pid_diversity threshold on normal API usage. If Anthropic
+    // changes the IP, update this list. Exclusion applies to CrossFlow only —
+    // all other detectors (reputation, flow_behavior, dns_analyzer) still
+    // evaluate flows to this IP normally.
+    const CROSSFLOW_EXCLUDED_API_IPS: &[&str] = &[
+        "160.79.104.10", // Anthropic API (api.anthropic.com) — Claude desktop false positive
+    ];
     let mut cf_excluded: std::collections::HashSet<std::net::IpAddr> =
         own_ips.load().as_ref().clone();
     if let Some(gw) = gateway_ip {
         cf_excluded.insert(gw);
+    }
+    for &ip_str in CROSSFLOW_EXCLUDED_API_IPS {
+        match ip_str.parse::<std::net::IpAddr>() {
+            Ok(ip) => {
+                cf_excluded.insert(ip);
+            }
+            Err(e) => warn!(
+                "CrossFlow: failed to parse excluded API IP {:?}: {}",
+                ip_str, e
+            ),
+        }
     }
     let cross_flow_state = Arc::new(std::sync::Mutex::new(
         detectors::cross_flow::CrossFlowState::new(
