@@ -94,7 +94,7 @@ export default function GlobeScreen() {
           width={420}
           height={420}
           backgroundColor="#0a0f1e"
-          globeImageUrl="//unpkg.com/three-globe/example/img/earth-dark.jpg"
+          globeImageUrl="/earth-day.jpg"
           atmosphereColor="#1e3a5f"
           atmosphereAltitude={0.12}
           // Pulsing rings

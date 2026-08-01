@@ -1,6 +1,18 @@
 # Implementation Status — Synapse IPS
 
-**Last verified:** 2026-07-31. Ground-truth ledger — if this file and the architecture doc disagree, this file wins.
+**Last verified:** 2026-08-01. Ground-truth ledger — if this file and the architecture doc disagree, this file wins.
+
+## Latest change (2026-08-01) — Tauri dashboard + globe texture fix
+
+- **Globe rendering fixed.** `GlobeScreen.tsx` was using `globeImageUrl="//unpkg.com/three-globe/example/img/earth-dark.jpg"` — a protocol-relative URL. In Tauri's `tauri://localhost` webview context, `//unpkg.com/...` resolves to `tauri://unpkg.com/...` (invalid), so the texture silently failed to load and the globe rendered near-black. Fix: copied `earth-day.jpg` (1600×800, 2:1 equirectangular, 238KB) from `node_modules/three-globe/example/img/` into `public/` and changed `globeImageUrl="/earth-day.jpg"` (local path). Verified in real Tauri window — visible continents, correct proportions, globe auto-rotates. Lighting (AmbientLight + DirectionalLight defaults from globe.gl) is adequate for Three.js r185 physical units — no override needed.
+
+- **`earth-dark.jpg` was wrong texture regardless.** Night-lights texture: intentionally near-black (shows only city lights on black background). `earth-day.jpg` is the day-side texture with colored continents. The URL failure was the primary fix; texture content was also wrong.
+
+- **Tauri dashboard: 4 screens shipped.** Protection (shield + status + active blocks count), Activity (live feed with process paths, alert badges, stagger animation), Report/Stats (sparkline, detector breakdown chart, top apps, animated counters), Threat Map (interactive 3D globe, pulsing red rings per threat country, ranked sidebar). All backed by real SQLite data via Tauri IPC commands in `lib.rs`.
+
+- **Detector breakdown fix.** `get_detector_breakdown` in `lib.rs` added `AND score > 0` — was counting all detector runs per verdict (6 detectors × 10,922 verdicts = 10,922 rows each). Real numbers after fix: CrossFlow 10,720 · FlowBehavior 2,387 · DnsAnalyzer 1,792 · ProcessCorrelator 1,525 · DnsTunnelDetector 0 · IpReputation 0.
+
+- **Gateway detection fix in `capture.rs`.** `rt_buf_find_gateway()` was taking the first `RTF_GATEWAY|RTF_UP` sysctl entry. On macOS with VPN, split-tunnel `/1` routes appear before the LAN default (dst=0.0.0.0) so VPN gateway was returned instead of LAN gateway. Fix: parse both `RTA_DST` and `RTA_GATEWAY` sockaddrs from each `rtm` message via `rt_msg_dst_and_gateway()`; prefer entry where `dst.is_unspecified()` (true default route); fall back to first gateway only when no 0.0.0.0 default exists. Two new tests: `test_rt_buf_find_gateway_prefers_default_route_over_vpn_route` (VPN route first in buf, LAN gateway still returned) and `test_rt_buf_find_gateway_fallback_when_no_default_route` (no 0.0.0.0, fallback to first gateway).
 
 ## Latest change (2026-07-31) — CrossFlow beaconing + connection-diversity sub-detectors
 
@@ -193,9 +205,29 @@
 
 **Status:** Two unexplained crash events. EACCES crash: one occurrence, not reproduced. Helper reconnect crash: one occurrence, not reproduced across 6 cycles post-wrapper. Root causes unknown for both. Treat as low-probability, unresolved risks, not fixed bugs. Will remain in this ledger as open items until either: (a) root cause is identified, or (b) sufficient run-time accumulates without recurrence to justify closing.
 
+## Dashboard (Tauri + React) — built
+
+| File | Lines | Description |
+|---|---|---|
+| `src-tauri/src/lib.rs` | 386 | Tauri IPC commands: `get_threat_stats`, `get_activity_chart`, `get_detector_breakdown`, `get_top_apps`, `get_threat_countries`, `get_recent_activity`. Read-only rusqlite connection, WAL mode. |
+| `src/App.tsx` | 22 | Root shell — SideNav + tab routing. |
+| `src/components/SideNav.tsx` | 107 | Nav tabs: Protection / Activity / Report / Threat Map. `startDragging()` on wordmark for window drag. |
+| `src/screens/ProtectionScreen.tsx` | 134 | Shield icon + status + active blocks count. `shield-pulse` CSS animation when protected. |
+| `src/screens/ActivityScreen.tsx` | 86 | Live feed from `get_recent_activity`. Activity rows with process path, verdict badge, stagger animation. |
+| `src/screens/StatsScreen.tsx` | 131 | Report screen — sparkline, detector breakdown chart, top flagged apps, animated KPI counters (`useCountUp`). |
+| `src/screens/GlobeScreen.tsx` | 173 | Threat Map — react-globe.gl, `earth-day.jpg` local texture (1600×800 equirectangular), pulsing red rings per threat country (log-scale radius), ranked sidebar. |
+| `src/components/Sparkline.tsx` | 58 | SVG path sparkline with gradient fill. |
+| `src/components/DetectorChart.tsx` | 50 | Horizontal bar chart for detector breakdown. |
+| `src/components/TopApps.tsx` | 73 | Top flagged apps with hue-from-name coloring, log-scale bars, B/A badges. |
+| `src/lib/db.ts` | 95 | TypeScript wrappers for all Tauri commands. `isTauri()` guard — all calls no-op in browser preview. |
+| `src/lib/countries.ts` | 196 | 170-entry ISO-2 → `{lat, lng, name}` centroid map for globe ring placement. |
+| `src/index.css` | 81 | Tailwind base + custom animations: `shield-pulse`, `bar-grow`, `activity-row` stagger. |
+| `public/earth-day.jpg` | — | 1600×800 equirectangular day-side texture (238KB), local copy from node_modules to avoid protocol-relative URL failure in Tauri webview. |
+
+**Verified in real Tauri window (2026-08-01):** All 4 screens render with real SQLite data. Globe renders with visible continents, auto-rotates, pulsing rings match real `get_threat_countries` output. Texture URL fix confirmed — switching from `//unpkg.com/...` to `/earth-day.jpg` resolved the near-black globe that appeared only in the Tauri context (not the browser preview).
+
 ## Not built
 
-- Tauri UI dashboard
 - AI post-analysis (UI layer only — event summarization, KPI explanations, report generation, recommendations)
 - Windows/Linux support (intentionally excluded — §1b)
 
