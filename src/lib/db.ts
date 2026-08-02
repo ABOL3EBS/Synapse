@@ -20,6 +20,8 @@ export interface ActivityItem {
   remote_ip_text: string;
   country_code: string | null;
   dns_name: string | null;
+  /** evidence_json from the highest-scoring detector finding; null if none. */
+  top_evidence: string | null;
 }
 
 export interface ThreatStats {

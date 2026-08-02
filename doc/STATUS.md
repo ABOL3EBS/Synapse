@@ -1,6 +1,10 @@
 # Implementation Status — Synapse IPS
 
-**Last verified:** 2026-08-01. Ground-truth ledger — if this file and the architecture doc disagree, this file wins.
+**Last verified:** 2026-08-02. Ground-truth ledger — if this file and the architecture doc disagree, this file wins.
+
+## Latest change (2026-08-02) — Schema V4: verdict deduplication (storage bug present since inception)
+
+- **V4 migration (2026-08-02): fixed a storage-layer defect present since storage was first built — re-evaluation wrote a new verdict row on every tick for any sustained/long-lived flow, with no deduplication. 14,516 of 14,778 total rows (98.2%) were redundant re-fires of the same 262 distinct (5-tuple, verdict) events. Every dashboard metric shown throughout this project's UI work was inflated by 50–300× as a result (e.g. Claude Helper alerts: 1,599 shown, 12 real; US threat count: 3,229 shown, 46 real). Fixed via `UNIQUE INDEX v_5tuple_verdict` on `(a_ip_text, a_port, b_ip_text, b_port, protocol, verdict)` with `ON CONFLICT DO UPDATE SET ts_ms=excluded.ts_ms, composite_score=excluded.composite_score, ...`, enforced at the DB level so the invariant holds regardless of application code correctness. Storage event handler refreshes `detector_findings` (DELETE + re-INSERT) on every upsert so evidence stays current. `flow_id` is session-scoped (resets to 1 on restart) and was not safe as a unique key — correct key is the full 5-tuple + verdict. Historical cleanup migration collapsed 14,516 duplicate rows (`DELETE FROM verdicts WHERE id NOT IN (SELECT MAX(id) ... GROUP BY 5-tuple+verdict)`); backup at `~/.synapse/synapse.db.pre-v4-backup` before destructive step. Verified: live 3-hour run, flow `52.21.153.29:443 ↔ 192.168.0.102:49304` re-evaluated on 5 consecutive 1-second ticks → exactly 1 DB row (id=14779), row count 262→263; full-table invariant scan `SELECT COUNT(*) FROM (...HAVING COUNT(*)>1)` returned **0**; 0 warnings, 0 errors, 0 panics across 4,445 log lines. Two new storage tests: `test_re_evaluation_upserts_not_inserts` (3 ticks → 1 row, reason reflects last tick) and `test_escalation_alert_then_block_produces_two_rows` (different verdict values on same 5-tuple → 2 rows, not 1).**
 
 ## Latest change (2026-08-01) — CrossFlow false positive + pid_diversity exclusion bug
 

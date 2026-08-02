@@ -68,7 +68,15 @@ export default function StatsScreen() {
           </>
         ) : (
           <>
-            <StatCard label="Stopped today" value={stats?.blocks_today ?? 0} accent="emerald" />
+            <StatCard
+              label={
+                stats?.blocks_today === 0 && (stats?.blocks_week ?? 0) > 0
+                  ? "All quiet today"
+                  : "Stopped today"
+              }
+              value={stats?.blocks_today ?? 0}
+              accent="emerald"
+            />
             <StatCard label="This week" value={stats?.blocks_week ?? 0} accent="emerald" />
             <StatCard label="Blocked IPs" value={stats?.blocked_addresses ?? 0} accent="navy" />
           </>

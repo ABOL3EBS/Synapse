@@ -6,55 +6,37 @@ import { countryName } from "../lib/translate";
 
 const REFRESH_MS = 30_000;
 
-interface RingPoint {
-  lat: number;
-  lng: number;
-  maxR: number;
-  color: string;
+// Home location: the machine running Synapse. Arcs originate here.
+const HOME_LAT = 53.35;
+const HOME_LNG = -6.26; // Dublin, Ireland — update to match your actual location
+
+interface ArcPoint {
+  startLat: number;
+  startLng: number;
+  endLat: number;
+  endLng: number;
   country: string;
   count: number;
 }
 
-interface DotPoint {
-  lat: number;
-  lng: number;
-  size: number;
-  color: string;
-  country: string;
-  count: number;
-}
+// Single dot marking the home location so arcs have a visible origin.
+const HOME_DOT = [{ lat: HOME_LAT, lng: HOME_LNG, size: 0.6, color: "#60a5fa" }];
 
-function buildPoints(stats: CountryStat[]): { rings: RingPoint[]; dots: DotPoint[] } {
-  const rings: RingPoint[] = [];
-  const dots: DotPoint[] = [];
-
+function buildArcs(stats: CountryStat[]): ArcPoint[] {
+  const arcs: ArcPoint[] = [];
   for (const s of stats) {
     const coords = COUNTRY_COORDS[s.country_code.toUpperCase()];
     if (!coords) continue;
-
-    // Log-scale ring radius so a country with 1 event and one with 10,000
-    // both show up — neither dwarfs the other.
-    const maxR = Math.log2(s.count + 1) * 3.5;
-
-    rings.push({
-      lat: coords.lat,
-      lng: coords.lng,
-      maxR,
-      color: "rgba(220, 38, 38, 0.8)",
-      country: coords.name,
-      count: s.count,
-    });
-    dots.push({
-      lat: coords.lat,
-      lng: coords.lng,
-      size: 0.4,
-      color: "#dc2626",
+    arcs.push({
+      startLat: HOME_LAT,
+      startLng: HOME_LNG,
+      endLat: coords.lat,
+      endLng: coords.lng,
       country: coords.name,
       count: s.count,
     });
   }
-
-  return { rings, dots };
+  return arcs;
 }
 
 export default function GlobeScreen() {
@@ -84,7 +66,7 @@ export default function GlobeScreen() {
     controls.enableZoom = false;
   }, [ready]);
 
-  const { rings, dots } = buildPoints(stats);
+  const arcs = buildArcs(stats);
 
   // Ranked list for the sidebar panel
   const ranked = [...stats]
@@ -93,9 +75,10 @@ export default function GlobeScreen() {
     .slice(0, 8);
 
   return (
-    <div className="h-full flex" style={{ background: "#0a0f1e" }}>
-      {/* Globe */}
-      <div className="flex-1 flex items-center justify-center relative">
+    <div className="h-full flex bg-canvas">
+      {/* Globe — bg-[#0a0f1e] must match the Globe backgroundColor prop so the
+          area outside the 420×420 canvas blends seamlessly with the space scene. */}
+      <div className="flex-1 flex items-center justify-center relative bg-[#0a0f1e]">
         <Globe
           ref={globeRef}
           width={420}
@@ -104,46 +87,52 @@ export default function GlobeScreen() {
           globeImageUrl="/earth-day.jpg"
           atmosphereColor="#1e3a5f"
           atmosphereAltitude={0.12}
-          // Pulsing rings
-          ringsData={rings}
-          ringColor={() => "rgba(220,38,38,0.7)"}
-          ringMaxRadius="maxR"
-          ringPropagationSpeed={1.8}
-          ringRepeatPeriod={900}
-          // Solid dots
-          pointsData={dots}
+          // Animated arcs flying from home to each threat country
+          arcsData={arcs}
+          arcStartLat="startLat"
+          arcStartLng="startLng"
+          arcEndLat="endLat"
+          arcEndLng="endLng"
+          arcColor={() => ["rgba(255,255,255,0.5)", "rgba(220,38,38,0.95)"]}
+          arcDashLength={0.35}
+          arcDashGap={1.8}
+          arcDashAnimateTime={1400}
+          arcStroke={0.8}
+          onArcHover={(arc) => {
+            if (arc) setTooltip({ country: (arc as ArcPoint).country, count: (arc as ArcPoint).count });
+            else setTooltip(null);
+          }}
+          // Home location marker
+          pointsData={HOME_DOT}
           pointColor="color"
           pointRadius="size"
           pointAltitude={0.01}
-          onPointHover={(pt) => {
-            if (pt) setTooltip({ country: (pt as DotPoint).country, count: (pt as DotPoint).count });
-            else setTooltip(null);
-          }}
           onGlobeReady={() => setReady(true)}
         />
 
         {/* Tooltip */}
         {tooltip && (
-          <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-white/10 backdrop-blur
-            rounded-xl px-3 py-2 text-white text-sm font-medium pointer-events-none">
+          <div className="absolute top-4 left-1/2 -translate-x-1/2
+            bg-white shadow-card border border-black/[0.04]
+            rounded-xl px-3 py-2 text-navy text-sm font-medium pointer-events-none">
             {tooltip.country} — {tooltip.count.toLocaleString()} {tooltip.count === 1 ? "event" : "events"}
           </div>
         )}
       </div>
 
-      {/* Right panel */}
-      <div className="w-48 flex flex-col justify-center px-4 py-6 gap-4">
+      {/* Right panel — light card matching the rest of the app */}
+      <div className="w-52 flex flex-col justify-center px-4 py-6 gap-4 border-l border-black/[0.04]">
         <div>
-          <p className="text-[10px] font-semibold uppercase tracking-widest text-white/30 mb-3">
+          <p className="text-[10px] font-semibold uppercase tracking-widest text-navy/30 mb-3">
             Threat Origins
           </p>
 
           {error && (
-            <p className="text-xs text-white/30">Couldn't load data.</p>
+            <p className="text-xs text-navy/30">Couldn't load data.</p>
           )}
 
           {!error && ranked.length === 0 && (
-            <p className="text-xs text-white/30 leading-relaxed">
+            <p className="text-xs text-navy/30 leading-relaxed">
               No geo-tagged threats yet. Country data appears once Synapse flags traffic to public IPs.
             </p>
           )}
@@ -155,10 +144,10 @@ export default function GlobeScreen() {
             return (
               <div key={s.country_code} className="mb-3">
                 <div className="flex justify-between items-center mb-1">
-                  <span className="text-xs text-white/70 font-medium truncate mr-2">{name}</span>
-                  <span className="text-[10px] text-white/40 tabular-nums shrink-0">{s.count}</span>
+                  <span className="text-xs text-navy/70 font-medium truncate mr-2">{name}</span>
+                  <span className="text-[10px] text-navy/40 tabular-nums shrink-0">{s.count}</span>
                 </div>
-                <div className="h-1 rounded-full bg-white/10 overflow-hidden">
+                <div className="h-1 rounded-full bg-navy/8 overflow-hidden">
                   <div
                     className="h-full rounded-full bg-red-500 bar-grow"
                     style={{ width: `${pct}%`, animationDelay: `${i * 80}ms` }}
@@ -170,8 +159,8 @@ export default function GlobeScreen() {
         </div>
 
         {ranked.length > 0 && (
-          <p className="text-[9px] text-white/20 leading-relaxed mt-auto">
-            Showing countries where Synapse blocked or flagged traffic
+          <p className="text-[9px] text-navy/25 leading-relaxed mt-auto">
+            Countries where Synapse blocked or flagged traffic
           </p>
         )}
       </div>

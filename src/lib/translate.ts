@@ -7,12 +7,37 @@ import type { ActivityItem } from "./db";
 
 const FINDING_PHRASE: Record<string, string> = {
   IpReputation: "reach a known-bad address",
-  CrossFlow: "connect to an unusual number of servers",
+  CrossFlow: "make an unusually high number of connections",
   DnsAnalyzer: "reach a suspicious domain",
-  DnsTunnelDetector: "hide data inside web requests",
-  FlowBehavior: "send an unusual amount of traffic",
+  DnsTunnelDetector: "hide data in DNS requests",
+  FlowBehavior: "send an unusual pattern of traffic",
   ProcessCorrelator: "behave like suspicious software",
 };
+
+// CrossFlow has sub-types (scan, DNS burst, beaconing, diversity) that share
+// the same detector_id. Refine the phrase using the evidence description text.
+function crossFlowPhrase(evidenceDesc: string): string {
+  const d = evidenceDesc.toLowerCase();
+  if (d.includes("beacon") || d.includes("cv="))
+    return "make repeated automated connections at regular intervals";
+  if (d.includes("distinct ip") || d.includes("diversity"))
+    return "connect to an unusually wide variety of servers";
+  if (d.includes("dns query") || d.includes("dns burst"))
+    return "make an unusually high number of DNS lookups";
+  return "make an unusually high number of connections";
+}
+
+// Parse the first evidence description from a raw evidence_json string.
+// evidence_json is an array of {description, detail?} objects.
+function firstEvidenceDesc(json: string | null): string | null {
+  if (!json) return null;
+  try {
+    const arr = JSON.parse(json) as { description?: string }[];
+    return arr[0]?.description ?? null;
+  } catch {
+    return null;
+  }
+}
 
 // Country code → human-readable name (subset; falls back to code)
 const COUNTRY_NAMES: Record<string, string> = {
@@ -30,9 +55,16 @@ export function countryName(code: string): string {
 export function toPlainEnglish(item: ActivityItem): string {
   const app = item.app_name || "Unknown app";
   const remote = item.dns_name ?? item.remote_ip_text;
-  const phrase = item.detector_ids
-    .map((id) => FINDING_PHRASE[id])
-    .find(Boolean) ?? "do something suspicious";
+  const topDetector = item.detector_ids[0];
+
+  // For CrossFlow, refine the generic phrase using the evidence description.
+  let phrase: string;
+  if (topDetector === "CrossFlow") {
+    const desc = firstEvidenceDesc(item.top_evidence);
+    phrase = desc ? crossFlowPhrase(desc) : FINDING_PHRASE.CrossFlow;
+  } else {
+    phrase = (topDetector && FINDING_PHRASE[topDetector]) ?? "do something suspicious";
+  }
 
   if (item.verdict === "Allow") {
     const loc = item.country_code

@@ -332,6 +332,24 @@ fn flush(
                       pkt_count, byte_count, local_ip_text)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,
                              ?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)
+                     ON CONFLICT(a_ip_text, a_port, b_ip_text, b_port, protocol, verdict)
+                     DO UPDATE SET
+                       ts_ms            = excluded.ts_ms,
+                       flow_id          = excluded.flow_id,
+                       composite_score  = excluded.composite_score,
+                       reason           = excluded.reason,
+                       ttl_ms           = excluded.ttl_ms,
+                       flow_age_ms      = excluded.flow_age_ms,
+                       pkt_count        = excluded.pkt_count,
+                       byte_count       = excluded.byte_count,
+                       pid              = excluded.pid,
+                       process_path     = excluded.process_path,
+                       process_start    = excluded.process_start,
+                       dns_name         = excluded.dns_name,
+                       country_code     = excluded.country_code,
+                       asn              = excluded.asn,
+                       reputation_score = excluded.reputation_score,
+                       local_ip_text    = excluded.local_ip_text
                      RETURNING id",
                     params![
                         ts_ms,
@@ -367,6 +385,15 @@ fn flush(
                         continue;
                     }
                 };
+
+                // On re-evaluation the same verdict row is upserted (same id).
+                // The old detector_findings for this id are stale — replace them.
+                if let Err(e) = tx.execute(
+                    "DELETE FROM detector_findings WHERE verdict_id = ?1",
+                    params![verdict_id],
+                ) {
+                    warn!("storage: stale findings delete: {e}");
+                }
 
                 for finding in &findings {
                     let ev_json = serde_json::to_string(&finding.evidence).ok();
@@ -755,6 +782,125 @@ mod tests {
         let (blob, _) = ip_to_parts(ip);
         let recovered = blob_to_ip(&blob);
         assert_eq!(recovered, ip);
+    }
+
+    /// Verify that re-evaluation firing multiple times on the same active flow
+    /// produces exactly ONE verdict row (upserted) rather than one row per tick.
+    ///
+    /// Exercises the real StorageWorker + event channel end-to-end (not internal
+    /// state), per the rule that stateful-mechanism tests must go through the
+    /// actual public call path.
+    #[test]
+    fn test_re_evaluation_upserts_not_inserts() {
+        let db_path =
+            std::env::temp_dir().join(format!("synapse_upsert_{}.db", std::process::id()));
+        let spool_path = db_path.with_extension("spool");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&spool_path);
+
+        let worker = StorageWorker::start(db_path.clone()).expect("worker should start");
+        let tx = worker.event_tx();
+
+        // Re-use a fixed 5-tuple+verdict — simulates the re-evaluation loop
+        // firing three times on the same still-active flow.
+        let flow = make_test_flow(); // a_ip=10.0.0.1:50000, b_ip=8.8.8.8:443, proto=6
+        for tick_ts in [1_000_000u64, 2_000_000, 3_000_000] {
+            // Each tick sends a VerdictDecided with the same 5-tuple and verdict
+            // but an advancing ts_ms — exactly what the re-evaluation loop does.
+            tx.send(StorageEvent::VerdictDecided {
+                flow: Box::new(FlowRecord {
+                    flow_id: tick_ts, // flow_id advances each tick (simulates restarts)
+                    ..flow.clone()
+                }),
+                local_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+                verdict: "Alert".to_string(),
+                reason: format!("tick {tick_ts}"),
+                composite_score: 0.6,
+                ttl_ms: None,
+                findings: vec![],
+            })
+            .unwrap();
+        }
+
+        // Wait for the 250ms tick to flush all three events.
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        drop(tx);
+        worker.shutdown();
+
+        let conn = Connection::open(&db_path).unwrap();
+        let row_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM verdicts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            row_count, 1,
+            "three re-evaluation ticks for the same 5-tuple+verdict must produce exactly one row"
+        );
+
+        // ts_ms is set by the worker's wall clock, not the event — can't assert it.
+        // reason IS from the event: must reflect the LAST tick, proving the upsert
+        // updated the row rather than keeping the first write's stale values.
+        let kept_reason: String = conn
+            .query_row("SELECT reason FROM verdicts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            kept_reason, "tick 3000000",
+            "kept row must have the latest reason (last re-evaluation tick)"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&spool_path);
+    }
+
+    #[test]
+    fn test_escalation_alert_then_block_produces_two_rows() {
+        let db_path =
+            std::env::temp_dir().join(format!("synapse_escalate_{}.db", std::process::id()));
+        let spool_path = db_path.with_extension("spool");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&spool_path);
+
+        let worker = StorageWorker::start(db_path.clone()).expect("worker should start");
+        let tx = worker.event_tx();
+
+        let flow = make_test_flow(); // a_ip=10.0.0.1:50000, b_ip=8.8.8.8:443
+                                     // First: Alert verdict
+        tx.send(StorageEvent::VerdictDecided {
+            flow: Box::new(flow.clone()),
+            local_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+            verdict: "Alert".to_string(),
+            reason: "alert".to_string(),
+            composite_score: 0.6,
+            ttl_ms: None,
+            findings: vec![],
+        })
+        .unwrap();
+        // Then: Block verdict for the same flow (escalation)
+        tx.send(StorageEvent::VerdictDecided {
+            flow: Box::new(flow.clone()),
+            local_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+            verdict: "Block".to_string(),
+            reason: "block".to_string(),
+            composite_score: 0.9,
+            ttl_ms: Some(300_000),
+            findings: vec![],
+        })
+        .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        drop(tx);
+        worker.shutdown();
+
+        let conn = Connection::open(&db_path).unwrap();
+        let row_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM verdicts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            row_count, 2,
+            "Alert and Block for the same flow are different verdict values — must produce two rows"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&spool_path);
     }
 
     #[test]

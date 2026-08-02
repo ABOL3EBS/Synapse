@@ -65,9 +65,10 @@ function startDrag() {
 export default function SideNav({ active, onChange }: Props) {
   return (
     <nav className="w-44 shrink-0 flex flex-col bg-navy h-full">
-      {/* Wordmark — mousedown starts window drag */}
+      {/* Wordmark — mousedown starts window drag.
+          pt-[52px]: clears the macOS traffic-light zone (~38px) with breathing room. */}
       <div
-        className="pl-4 pr-4 pt-8 pb-5 flex items-center gap-2.5 cursor-default"
+        className="pl-4 pr-4 pt-[52px] pb-5 flex items-center gap-2.5 cursor-default"
         onMouseDown={startDrag}
       >
         <img src="/icon.png" alt="" className="w-7 h-7 rounded-md shrink-0" />

@@ -3,6 +3,15 @@ import type { ActivityItem } from "../lib/db";
 import { toPlainEnglish, toWhySentence } from "../lib/translate";
 import { relativeTime } from "../lib/time";
 
+const DETECTOR_LABEL: Record<string, string> = {
+  CrossFlow:          "Connection pattern analysis",
+  DnsAnalyzer:        "DNS behaviour analysis",
+  FlowBehavior:       "Traffic shape analysis",
+  IpReputation:       "IP reputation check",
+  ProcessCorrelator:  "Process behaviour analysis",
+  DnsTunnelDetector:  "DNS tunnel detection",
+};
+
 interface Props {
   item: ActivityItem;
 }
@@ -76,7 +85,12 @@ export default function ActivityRow({ item }: Props) {
               <DetailRow label="Address" value={remoteIp} />
               {item.country_code && <DetailRow label="Location" value={item.country_code} />}
               {item.detector_ids.length > 0 && (
-                <DetailRow label="Detectors" value={item.detector_ids.join(", ")} />
+                <DetailRow
+                  label="Detectors"
+                  value={item.detector_ids
+                    .map((id) => DETECTOR_LABEL[id] ?? id)
+                    .join(", ")}
+                />
               )}
             </div>
           )}

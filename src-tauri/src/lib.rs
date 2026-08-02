@@ -70,6 +70,9 @@ pub struct ActivityItem {
     pub remote_ip_text: String,  // direction-resolved: the non-local endpoint
     pub country_code: Option<String>,
     pub dns_name: Option<String>,
+    /// evidence_json from the highest-scoring detector finding; None if no findings.
+    /// Used by the UI to produce sub-type-specific copy for detectors like CrossFlow.
+    pub top_evidence: Option<String>,
 }
 
 // Resolve the remote endpoint using the stored local_ip_text.
@@ -175,36 +178,50 @@ fn get_activity_feed(limit: i64, state: tauri::State<DbState>) -> Vec<ActivityIt
                 remote_ip_text,
                 country_code: r.get(7)?,
                 dns_name: r.get(8)?,
+                top_evidence: None,     // filled below
             })
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default();
 
-    // Attach detector IDs for each verdict (separate query — avoids N+1 by
-    // fetching all findings for the returned verdict IDs in one pass).
+    // Attach detector IDs + top evidence for each verdict (one bulk query, no N+1).
+    // Rows arrive ORDER BY verdict_id, score DESC — first row per verdict is the
+    // highest-scoring finding, so we capture its evidence_json as top_evidence.
     if !items.is_empty() {
         let ids: Vec<i64> = items.iter().map(|i| i.id).collect();
         let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
-            "SELECT verdict_id, detector_id FROM detector_findings \
+            "SELECT verdict_id, detector_id, evidence_json FROM detector_findings \
              WHERE verdict_id IN ({placeholders}) ORDER BY verdict_id, score DESC"
         );
         if let Ok(mut fstmt) = conn.prepare(&sql) {
             let params: Vec<&dyn rusqlite::types::ToSql> =
                 ids.iter().map(|i| i as &dyn rusqlite::types::ToSql).collect();
             if let Ok(rows) = fstmt.query_map(params.as_slice(), |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
             }) {
-                // Build a map verdict_id → detector_ids
-                let mut map: std::collections::HashMap<i64, Vec<String>> =
+                let mut det_map: std::collections::HashMap<i64, Vec<String>> =
                     std::collections::HashMap::new();
-                for row in rows.flatten() {
-                    map.entry(row.0).or_default().push(row.1);
+                let mut ev_map: std::collections::HashMap<i64, String> =
+                    std::collections::HashMap::new();
+                for (vid, det, ev) in rows.flatten() {
+                    det_map.entry(vid).or_default().push(det);
+                    // Only the first row per verdict_id (highest score) → top_evidence
+                    if !ev_map.contains_key(&vid) {
+                        if let Some(json) = ev {
+                            ev_map.insert(vid, json);
+                        }
+                    }
                 }
                 for item in &mut items {
-                    if let Some(dids) = map.remove(&item.id) {
+                    if let Some(dids) = det_map.remove(&item.id) {
                         item.detector_ids = dids;
                     }
+                    item.top_evidence = ev_map.remove(&item.id);
                 }
             }
         }
@@ -342,12 +359,15 @@ fn get_top_apps(state: tauri::State<DbState>) -> Vec<TopApp> {
     let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
     let Some(conn) = guard.as_ref() else { return vec![]; };
 
+    let week_ago = now_ms() - 7 * 24 * 60 * 60 * 1000;
+
     let mut stmt = match conn.prepare(
         "SELECT process_path,
                 SUM(CASE WHEN verdict='Block' THEN 1 ELSE 0 END) as blocks,
                 SUM(CASE WHEN verdict='Alert'  THEN 1 ELSE 0 END) as alerts
          FROM verdicts
          WHERE process_path IS NOT NULL AND process_path != ''
+           AND ts_ms >= ?1
          GROUP BY process_path
          ORDER BY (blocks * 2 + alerts) DESC LIMIT 5",
     ) {
@@ -355,7 +375,7 @@ fn get_top_apps(state: tauri::State<DbState>) -> Vec<TopApp> {
         Err(_) => return vec![],
     };
 
-    stmt.query_map([], |r| {
+    stmt.query_map(rusqlite::params![week_ago], |r| {
         let path: String = r.get(0)?;
         let app_name = std::path::Path::new(&path)
             .file_name()

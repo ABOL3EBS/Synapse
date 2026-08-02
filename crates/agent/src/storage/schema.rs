@@ -1,7 +1,7 @@
 use log::info;
 use rusqlite::Connection;
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Apply the schema to an open connection. Idempotent — safe to call on
 /// every startup. Uses PRAGMA user_version for lightweight migration tracking.
@@ -45,9 +45,17 @@ pub fn apply_schema(conn: &Connection) -> Result<(), String> {
     if version < 3 {
         conn.execute_batch(V3_DDL)
             .map_err(|e| format!("schema v3: {e}"))?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
-            .map_err(|e| format!("set user_version: {e}"))?;
+        conn.pragma_update(None, "user_version", 3u32)
+            .map_err(|e| format!("set user_version v3: {e}"))?;
         info!("storage: schema v3 applied (verdicts.local_ip_text)");
+    }
+
+    if version < 4 {
+        conn.execute_batch(V4_DDL)
+            .map_err(|e| format!("schema v4: {e}"))?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(|e| format!("set user_version v4: {e}"))?;
+        info!("storage: schema v4 applied (dedup historical verdicts + unique 5-tuple index)");
     }
 
     Ok(())
@@ -186,4 +194,24 @@ const V3_DDL: &str = "
 -- which canonical endpoint is remote without a private/public heuristic.
 -- NULL for existing rows (rows written before V3 — treated as unknown by UI).
 ALTER TABLE verdicts ADD COLUMN local_ip_text TEXT;
+";
+
+// ---------------------------------------------------------------------------
+// V4 DDL — dedup historical re-evaluation rows + unique 5-tuple+verdict index
+// ---------------------------------------------------------------------------
+
+const V4_DDL: &str = "
+-- Collapse per-tick re-evaluation duplicates. Keeps MAX(id) per
+-- (5-tuple, verdict) — the most recent row with the freshest score,
+-- evidence, and ts_ms. ON DELETE CASCADE propagates to detector_findings.
+DELETE FROM verdicts
+WHERE id NOT IN (
+  SELECT MAX(id)
+  FROM verdicts
+  GROUP BY a_ip_text, a_port, b_ip_text, b_port, protocol, verdict
+);
+-- Enforce the invariant going forward: re-evaluation of the same active flow
+-- must UPSERT, not INSERT, so the verdict table counts distinct detections.
+CREATE UNIQUE INDEX IF NOT EXISTS v_5tuple_verdict
+  ON verdicts(a_ip_text, a_port, b_ip_text, b_port, protocol, verdict);
 ";

@@ -68,6 +68,14 @@ export default function TopApps({ apps }: Props) {
           </div>
         );
       })}
+      <div className="mt-3 pt-2 border-t border-black/[0.04] flex gap-3">
+        <span className="text-[9px] text-navy/30">
+          <span className="font-semibold text-emerald-dark">B</span> = blocked
+        </span>
+        <span className="text-[9px] text-navy/30">
+          <span className="font-semibold text-amber-700">A</span> = flagged
+        </span>
+      </div>
     </div>
   );
 }
