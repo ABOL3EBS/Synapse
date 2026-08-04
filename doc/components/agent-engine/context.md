@@ -4,12 +4,12 @@ Unprivileged capture loop. Receives BPF fd from helper, reads raw packets, parse
 
 ## Code location
 
-`crates/agent/src/main.rs` (279 lines) — standalone binary crate, startup + orchestration only
-`crates/agent/src/capture.rs` (915 lines) — `CaptureEngine` struct: BPF reads, packet parsing, capture loop, verdict handling
-`crates/agent/src/flow/mod.rs` (975 lines) — in-memory session window
-`crates/agent/src/enrichment/mod.rs` (495 lines) — 4-thread enrichment worker pool
-`crates/agent/src/detectors/mod.rs` (879 lines) — detector framework, RuleDetector, timeout enforcement, circuit breaker
-`crates/agent/src/decision/mod.rs` (420 lines) — DecisionEngine, weighted scoring, Verdict, active-flow re-evaluation
+`crates/agent/src/main.rs` (365 lines) — standalone binary crate, startup + orchestration only
+`crates/agent/src/capture.rs` (1781 lines) — `CaptureEngine` struct: BPF reads, packet parsing, capture loop, verdict handling
+`crates/agent/src/flow/mod.rs` (1203 lines) — in-memory session window
+`crates/agent/src/enrichment/mod.rs` (756 lines) — configurable enrichment worker pool
+`crates/agent/src/detectors/mod.rs` (718 lines) — detector framework, timeout enforcement, circuit breaker; 6 sub-modules
+`crates/agent/src/decision/mod.rs` (546 lines) — DecisionEngine, weighted scoring, Verdict, active-flow re-evaluation
 
 ## Startup sequence
 
@@ -119,9 +119,10 @@ loop {
 - `DecisionEngine::new(config: DecisionConfig)` — creates engine
 - `evaluate(features: &FlowFeatures, findings: &[DetectorFinding]) -> Verdict` — weighted scoring: `score × confidence × status_weight`
   - Completed=1.0x, TimedOut=0.1x, Errored=0.0x
-  - Block threshold=0.5, Alert threshold=0.2
+  - Block threshold=0.7, Alert threshold=0.3
   - TTL from most severe Completed finding, clamped [min_ttl, max_ttl]
 - `Verdict` enum: `Allow`, `Block { ttl, reason }`, `Alert { reason }`
+- Block threshold=0.7, Alert threshold=0.3 (default `DecisionConfig`)
 - **No uncertainty/findings_summary fields yet** — known limitation
 - **Log-only** — zero enforcement calls until detector pipeline is trusted
 
@@ -139,8 +140,6 @@ loop {
 ## Gotchas
 
 - Agent never opens `/dev/bpf*` — receives pre-configured fd from helper
-- Test target IP is hardcoded (192.168.1.100) — milestone 1 only
-- Block TTL is hardcoded (300s) — milestone 1 only
 - IPv6 `length` field is set to 0 — total-length is in jumbogram extension, not base header
 - Flow creation/expiry logs at INFO level; flow internal details at DEBUG level
 - DNS/GeoIP/Reputation are per-flow dispatch (known v1 inefficiency — redundant lookups for same IP)

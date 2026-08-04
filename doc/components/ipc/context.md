@@ -4,7 +4,7 @@ Two-layer protocol over Unix domain socket: fd-passing for the BPF device, lengt
 
 ## Code location
 
-`crates/platform-macos/src/protocol.rs` (112 lines)
+`crates/platform-macos/src/protocol.rs` (164 lines)
 
 ## fd-passing (SCM_RIGHTS)
 

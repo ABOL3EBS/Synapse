@@ -95,7 +95,7 @@ There's also a direct conflict with the stated free-tier rationale: **Windows ke
                                   ▼
                   ┌───────────────────────────────┐
                   │   BPF Device (/dev/bpf*)        │   passive capture, root required
-                  │   via libpcap                    │
+                  │   raw libc ioctls (no pcap)      │
                   └───────────────┬───────────────┘
                                   │ raw fd
                                   ▼
@@ -192,7 +192,7 @@ There's also a direct conflict with the stated free-tier rationale: **Windows ke
 | Layer | Technology | Strategic Reason |
 |---|---|---|
 | **Process Model** | `synapsed-helper` (root, launchd) + `synapse-agent` (unprivileged) | Only BPF-open and `pf` enforcement run privileged. All parsing of network/attacker-influenced data runs unprivileged — a bug in enrichment, detection, or storage is not a root exploit. |
-| **Packet Capture** | `pcap` crate (libpcap/BPF bindings), fd opened by helper, handed to agent via `SCM_RIGHTS` | Same primitive as `tcpdump`/Wireshark/old scapy version. No entitlement, no signing, just root — and root's involvement ends at the `open()` call. |
+| **Packet Capture** | Raw `libc` BPF ioctls (BIOCSBLEN → BIOCSETIF → BIOCIMMEDIATE → BIOCSETF), fd opened by helper, handed to agent via `SCM_RIGHTS` | No pcap crate — raw ioctls against `/dev/bpf*` directly. No entitlement, no signing, just root — and root's involvement ends at the `open()` call. |
 | **Enforcement** | `pf` via `pfctl`, invoked only by `synapsed-helper` behind an `EnforcementBackend` trait (typed values only — `IpAddr`/`Duration`, never strings — passed as argv, never shell-interpolated); direct ioctl planned as a latency optimization, not a security fix | Native macOS firewall since Leopard. Anchor tables for dynamic block/allow. No kernel driver, no NE entitlement. Typed values close the injection risk at the data layer; argv-based invocation (never `sh -c` string building) closes it at the execution layer — both are required, neither alone is sufficient. See §4c. |
 | **Process Attribution** | `libproc` bindings / parsed `lsof`-equivalent syscalls | Maps a flow to a PID/executable path without Endpoint Security entitlement. |
 | **Agent Engine** | Rust, `std::thread` + `crossbeam` | No `tokio`. This isn't a web server — treat it like an OS service. Avoids async runtime bloat for what is fundamentally a tight capture/process loop. A hybrid `tokio`+`crossbeam` runtime was proposed in review and declined for v1 — the actual driver of that proposal was a control-plane backend that doesn't exist yet. See §1b. |
@@ -206,7 +206,7 @@ There's also a direct conflict with the stated free-tier rationale: **Windows ke
 | **UI** | React + Tailwind + shadcn/ui | Standard, fast to iterate, matches Tauri's web-view frontend model. |
 | **Build** | Cargo workspace (3 crates) | Enough separation to avoid dependency hell, without micro-crate over-engineering. |
 
-**Future migration (post-payment):** swap `platform-macos`'s capture/enforcement internals from `pcap`+`pfctl` to a Swift `NEFilterDataProvider` system extension bridged over XPC/Unix socket. Everything above the `platform-macos` boundary (common types, agent engine, detectors, decision engine, storage, UI) stays untouched — that's the entire point of the crate boundary.
+**Future migration (post-payment):** swap `platform-macos`'s capture/enforcement internals from raw libc BPF ioctls + `pfctl` to a Swift `NEFilterDataProvider` system extension bridged over XPC/Unix socket. Everything above the `platform-macos` boundary (common types, agent engine, detectors, decision engine, storage, UI) stays untouched — that's the entire point of the crate boundary.
 
 ---
 
@@ -215,7 +215,7 @@ There's also a direct conflict with the stated free-tier rationale: **Windows ke
 The hot path (packets in, verdict out) and enrichment run as two decoupled sequences that join at the Flow Tracker. This split exists because enrichment (DNS, geo, reputation lookups) is I/O-bound and can take longer than the ~100ms flow-tick budget — an earlier version of this doc drew enrichment as a serial stage before flow tracking, which would have meant the hot path stalls on a network call. That was caught in review and fixed here.
 
 **Hot path:**
-1. **Capture:** `synapsed-helper` opens the BPF device as root and hands the fd to `synapse-agent` via `SCM_RIGHTS`; the agent (unprivileged) reads raw packets from it via libpcap. Root's involvement ends here.
+1. **Capture:** `synapsed-helper` opens the BPF device as root and hands the fd to `synapse-agent` via `SCM_RIGHTS`; the agent (unprivileged) reads raw packets via `libc::read()` with manual `BpfHdr` parsing (no libpcap). Root's involvement ends here.
 2. **Fast-Path:** Immediate match against known-bad rules/blocklists — including reputation-feed IPs **pre-seeded into the pf block table proactively**, before any traffic to them occurs — sends a typed `Block` command to the helper. This closes the first-packet exposure gap for *known* threats; it does not (and cannot, given a passive-tap architecture) prevent the triggering packet of a *novel* threat from being delivered. That gap is accepted and tracked, not hidden (see §1, first bullet).
 3. **Flow Tracking:** Traffic aggregated into sessions over an in-memory window (~100ms ticks), attaching whatever enrichment context has landed by this point (see below) without blocking for it, and producing feature vectors (packet_frequency, byte_ratio, connection_duration, destination reputation, **detection latency / flow-age-at-decision**, etc.). Flow-age is tracked explicitly so the decision engine knows how much of a given flow had already been delivered before a verdict was reached.
 4. **Detection:** Feature vectors run through every registered detector (rules, behavioral analysis, reputation) independently. Each call is wrapped in a `DetectorFinding` with an enforced per-detector latency budget (see §4b) — no detector blocks the others or the decision engine, by construction, not just by intent.
