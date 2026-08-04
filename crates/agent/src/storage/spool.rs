@@ -17,8 +17,6 @@ use rusqlite::{params, Connection};
 pub struct SpoolEntry {
     pub event_id: String,
     pub ts_ms: i64,
-    #[allow(dead_code)] // stored for operator inspection; not read in code
-    pub kind: String,
     pub payload: String,
 }
 
@@ -58,6 +56,8 @@ impl CriticalSpool {
     ) -> Result<(), String> {
         self.conn
             .execute(
+                // `kind` is written for operator/debugging visibility via raw SQL
+                // but not read back into Rust — see D7 in the 2026-08-03 health audit.
                 "INSERT OR IGNORE INTO spool (event_id, ts_ms, kind, payload) \
                  VALUES (?1, ?2, ?3, ?4)",
                 params![event_id, ts_ms, kind, payload],
@@ -70,7 +70,7 @@ impl CriticalSpool {
     /// the main DB on startup.
     pub fn unconfirmed(&self) -> Vec<SpoolEntry> {
         let mut stmt = match self.conn.prepare(
-            "SELECT event_id, ts_ms, kind, payload \
+            "SELECT event_id, ts_ms, payload \
              FROM spool WHERE done = 0 ORDER BY id",
         ) {
             Ok(s) => s,
@@ -83,8 +83,7 @@ impl CriticalSpool {
             Ok(SpoolEntry {
                 event_id: r.get(0)?,
                 ts_ms: r.get(1)?,
-                kind: r.get(2)?,
-                payload: r.get(3)?,
+                payload: r.get(2)?,
             })
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())

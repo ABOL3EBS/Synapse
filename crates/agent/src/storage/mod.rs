@@ -4,7 +4,7 @@ mod schema;
 mod spool;
 
 use std::collections::VecDeque;
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -602,9 +602,9 @@ fn ip_to_parts(ip: IpAddr) -> ([u8; 16], String) {
     (blob, ip.to_string())
 }
 
-/// Decode a 16-byte blob back to IpAddr (used in spool replay).
-#[allow(dead_code)]
+#[cfg(test)]
 fn blob_to_ip(blob: &[u8; 16]) -> IpAddr {
+    use std::net::Ipv6Addr;
     let v6 = Ipv6Addr::from(*blob);
     match v6.to_ipv4_mapped() {
         Some(v4) => IpAddr::V4(v4),

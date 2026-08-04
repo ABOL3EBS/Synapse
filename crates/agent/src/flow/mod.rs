@@ -468,7 +468,6 @@ impl FlowTracker {
     }
 
     /// Get a reference to a flow by ID.
-    #[allow(dead_code)]
     pub fn get(&self, flow_id: u64) -> Option<&FlowRecord> {
         self.flows.get(&flow_id)
     }
@@ -509,8 +508,7 @@ impl FlowTracker {
         self.flows.len()
     }
 
-    /// Whether the tracker is empty.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.flows.is_empty()
     }

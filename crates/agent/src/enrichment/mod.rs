@@ -26,11 +26,6 @@ use synapse_common::{EnrichmentKind, EnrichmentRequest, EnrichmentResult};
 
 pub use reputation_store::ReputationStore;
 
-/// Default timeout for a single enrichment lookup (e.g., DNS).
-/// Currently unused — reserved for future per-lookup timeouts.
-#[allow(dead_code)]
-const LOOKUP_TIMEOUT_MS: u64 = 2000;
-
 // ---------------------------------------------------------------------------
 // GeoIP database wrapper
 // ---------------------------------------------------------------------------
@@ -203,13 +198,6 @@ impl EnrichmentPool {
         self.tx
             .try_send(request)
             .map_err(|e| format!("enrichment pool dispatch failed: {e}"))
-    }
-
-    /// Non-blocking receive of completed enrichment results.
-    /// Returns None if no results are ready yet.
-    #[allow(dead_code)]
-    pub fn try_recv(&self) -> Option<EnrichmentResult> {
-        self.rx.try_recv().ok()
     }
 
     /// Drain all available results (non-blocking). Returns a Vec of results
