@@ -22,9 +22,9 @@ Helper (requires root):
 sudo RUST_LOG=info cargo run --bin synapsed-helper
 ```
 
-Agent (unprivileged):
+Agent (unprivileged — always capture logs):
 ```bash
-cargo run --bin synapse-agent
+RUST_LOG=info cargo run --bin synapse-agent 2>&1 | tee ~/.synapse/agent.log
 ```
 
 ## Verification Rules
@@ -153,6 +153,8 @@ crates/
 13. **Any value that combines multiple detector findings via addition must have an explicit, documented ceiling.** An uncapped composite score existed in this project — not a design decision, just never noticed — that allowed multiple weak findings to reach block threshold via quantity, bypassing the `override_threshold: 0.85` single-finding safety margin that exists precisely to prevent that. The fix is `.min(1.0)` after the summation loop. Whenever you write or modify an aggregation path, state explicitly what ceiling applies and why.
 
 14. **Verify Claude Code's auto-approval and permission settings before doing anything that touches `git push`, enforcement code, or `pfctl`.** Session-level "always allow" grants in Claude Code are NOT persisted to `~/.claude/settings.json` — they reset between sessions. An untracked auto-approval silently approved commits and pushes without a visible prompt during part of a session in this project. Check `cat ~/.claude/settings.json` and confirm `permissions.allow` contains only what you intend. When in doubt, use a fresh session with no prior approvals.
+
+15. **Any exclusion or allowlist built from network-topology facts (own IPs, default gateway, known-good endpoints) must be live-refreshed via the shared `Arc<ArcSwap<HashSet<IpAddr>>>` mechanism — never computed once at startup and held as a static value.** On 2026-08-04, CrossFlow's `excluded_ips` was a frozen `HashSet` populated at agent startup. When the gateway changed (either because `detect_default_gateway()` returned `None` or a different IP at startup, or because the machine moved to a different network after the agent was running), the old gateway was not in the set. CrossFlow scored it at 0.8 and produced Alert verdicts for five legitimate gateway flows. The fix: `excluded_ips` is now an `Arc<ArcSwap<HashSet<IpAddr>>>` that the existing own-ips-refresh thread rebuilds every 5s (own_ips ∪ {gateway} ∪ hardcoded API IPs). `is_excluded()` calls `.load()` on every evaluation — the exclusion set is always current within one refresh cycle. The property is proven by `test_excluded_ips_live_updates_without_restart`: ArcSwap is swapped while CrossFlowState is alive, score changes from nonzero to 0 without a restart. Never introduce a second independent refresh mechanism for the same underlying data — one thread, both ArcSwaps.
 
 ## Agent workflow
 

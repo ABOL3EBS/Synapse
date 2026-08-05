@@ -265,4 +265,24 @@
 
 | 10 | Helper reconnect loop (accept→enforce→accept) with per-connection cache-push cancellation via `Arc<AtomicBool>` | `platform-macos/helper/main.rs` | Verified |
 
-All 202 tests pass. clippy clean. fmt clean.
+| 11 | CrossFlow gateway exclusion live-refreshed via `Arc<ArcSwap<HashSet<IpAddr>>>` — see incident 2026-08-04 below | `agent/detectors/cross_flow.rs`, `agent/src/main.rs` | Verified |
+
+---
+
+## Incident 2026-08-04 — CrossFlow false-positives against local gateway (192.168.0.1)
+
+**Symptom:** Five Alert verdicts (verdict IDs 17189, 17206, 17260, 17261, 17700) with CrossFlow score=0.8, confidence=0.8, composite=0.64 against the home gateway 192.168.0.1. All Alerts, never a Block (0.64 < 0.7 block threshold; min_detectors_for_block=2 also not met). No enforcement action was taken.
+
+**Root cause:** `CrossFlowState::excluded_ips` was a `HashSet<IpAddr>` owned by value, populated once at agent startup from `own_ips ∪ {gateway} ∪ {API IPs}`. It was never updated after that. Two independent failure modes could cause the gateway to be absent at scoring time:
+1. `detect_default_gateway()` returned `None` or a wrong IP at startup (agent startup log was not captured, so this cannot be confirmed or ruled out).
+2. The agent started on a different network (e.g., office 172.18.22.x), cached that gateway, and then the machine moved to the home network — the new gateway 192.168.0.1 was never inserted.
+
+Neither trigger could be confirmed because agent stdout was not redirected to a file. The startup log line `"default gateway detected: ..."` / `"could not detect default gateway — gateway guard disabled"` would have distinguished them instantly.
+
+**Fix:** `CrossFlowState::excluded_ips` changed from `HashSet<IpAddr>` to `Arc<ArcSwap<HashSet<IpAddr>>>`. The existing own-ips-refresh thread (which already ran every 5s) now also rebuilds the CrossFlow exclusion set each tick by calling `detect_own_ips()` + `detect_default_gateway()`. `is_excluded()` calls `.load()` on every evaluation. A network change takes effect within one refresh cycle (~5s), without restarting the agent. The live-update property is proven by `test_excluded_ips_live_updates_without_restart` in `cross_flow.rs`.
+
+**Structural change:** `CrossFlowState::new()` signature changed from `excluded_ips: HashSet<IpAddr>` to `excluded_ips: Arc<ArcSwap<HashSet<IpAddr>>>`. All six call sites in tests updated to use a `live_excluded([...])` helper that wraps the set. `build_cf_excluded()` extracted as a named function shared between startup and the refresh thread, so the two paths cannot diverge.
+
+**Log capture added:** The agent startup command in CLAUDE.md is now `RUST_LOG=info cargo run --bin synapse-agent 2>&1 | tee ~/.synapse/agent.log`. CLAUDE.md rule 15 codifies the live-refresh requirement for all network-topology-derived exclusion sets.
+
+All 203 tests pass. clippy clean. fmt clean.
