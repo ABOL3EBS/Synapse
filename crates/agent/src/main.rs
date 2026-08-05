@@ -148,20 +148,68 @@ fn main() -> io::Result<()> {
     //    P1: ArcSwap for lock-free reads in should_skip_block.
     let own_ips: Arc<ArcSwap<HashSet<IpAddr>>> =
         Arc::new(ArcSwap::from_pointee(capture::detect_own_ips()));
+
+    // CrossFlow exclusion set: own_ips + gateway + known high-volume API endpoints.
+    // Kept separate from own_ips because the semantics differ: own_ips is used
+    // for enforcement (never block our own address); cf_excluded is used only by
+    // CrossFlow to skip per-destination counting. The gateway and API endpoints
+    // are excluded from CrossFlow counting but must NOT be exempt from enforcement
+    // (a compromised router or CDN IP is still in-scope for blocking).
+    //
+    // Excluded API endpoints are scoped to the SPECIFIC IP only — NOT the full
+    // ASN or CIDR. The Claude desktop app sustains ~156 connections/60s to
+    // 160.79.104.10 (Anthropic API / api.anthropic.com), enough to trigger
+    // CrossFlow's pid_diversity threshold on normal API usage. If Anthropic
+    // changes the IP, update this list. Exclusion applies to CrossFlow only —
+    // all other detectors (reputation, flow_behavior, dns_analyzer) still
+    // evaluate flows to this IP normally.
+    const CROSSFLOW_EXCLUDED_API_IPS: &[&str] = &[
+        "160.79.104.10", // Anthropic API (api.anthropic.com) — Claude desktop false positive
+    ];
+    fn build_cf_excluded(own: &HashSet<IpAddr>, gateway: Option<IpAddr>) -> HashSet<IpAddr> {
+        let mut set = own.clone();
+        if let Some(gw) = gateway {
+            set.insert(gw);
+        }
+        for &ip_str in CROSSFLOW_EXCLUDED_API_IPS {
+            if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                set.insert(ip);
+            }
+        }
+        set
+    }
+    let cf_excluded: Arc<ArcSwap<HashSet<IpAddr>>> = Arc::new(ArcSwap::from_pointee(
+        build_cf_excluded(&own_ips.load(), gateway_ip),
+    ));
+    info!(
+        "CrossFlow exclusion set: {} addresses (own_ips + gateway + api endpoints)",
+        cf_excluded.load().len()
+    );
+
     {
-        let cache = own_ips.clone();
+        let own_ips_cache = own_ips.clone();
+        let cf_excluded_cache = cf_excluded.clone();
         let refresh_secs = cfg.local_ip_refresh_secs();
         std::thread::Builder::new()
             .name("own-ips-refresh".into())
             .spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_secs(refresh_secs));
-                let new_ips = capture::detect_own_ips();
-                let current = cache.load();
-                if **current != new_ips {
-                    info!("own IPs refreshed: {} addresses", new_ips.len());
+                let new_own = capture::detect_own_ips();
+                // Rebuild CrossFlow exclusion set every tick: gateway may have
+                // changed (network switch) even when own IPs are unchanged.
+                let new_gw = capture::detect_default_gateway();
+                let new_cf = build_cf_excluded(&new_own, new_gw);
+                let current = own_ips_cache.load();
+                if **current != new_own {
+                    info!("own IPs refreshed: {} addresses", new_own.len());
                     drop(current);
-                    cache.store(Arc::new(new_ips));
+                    own_ips_cache.store(Arc::new(new_own));
                 }
+                cf_excluded_cache.store(Arc::new(new_cf));
+                log::debug!(
+                    "own-ips-refresh tick: cf_excluded updated (gateway={:?})",
+                    new_gw
+                );
             })
             .map_err(|e| io::Error::other(format!("spawn own-ips-refresh: {e}")))?;
     }
@@ -231,38 +279,6 @@ fn main() -> io::Result<()> {
     synapse_common::init_detector_pool(8);
     info!("detector worker pool initialized (8 workers)");
 
-    // CrossFlow exclusion set: gateway + own_ips snapshot + known high-volume
-    // API endpoints. own_ips already contains subnet-directed broadcasts (e.g.
-    // 172.18.22.255) computed from interface netmasks by detect_own_ips().
-    // Protocol-level infrastructure addresses (multicast, 255.255.255.255) are
-    // handled by is_infrastructure_destination() inside CrossFlowState, not here.
-    //
-    // Excluded API endpoints are scoped to the SPECIFIC IP only — NOT the full
-    // ASN or CIDR. The Claude desktop app sustains ~156 connections/60s to
-    // 160.79.104.10 (Anthropic API / api.anthropic.com), enough to trigger
-    // CrossFlow's pid_diversity threshold on normal API usage. If Anthropic
-    // changes the IP, update this list. Exclusion applies to CrossFlow only —
-    // all other detectors (reputation, flow_behavior, dns_analyzer) still
-    // evaluate flows to this IP normally.
-    const CROSSFLOW_EXCLUDED_API_IPS: &[&str] = &[
-        "160.79.104.10", // Anthropic API (api.anthropic.com) — Claude desktop false positive
-    ];
-    let mut cf_excluded: std::collections::HashSet<std::net::IpAddr> =
-        own_ips.load().as_ref().clone();
-    if let Some(gw) = gateway_ip {
-        cf_excluded.insert(gw);
-    }
-    for &ip_str in CROSSFLOW_EXCLUDED_API_IPS {
-        match ip_str.parse::<std::net::IpAddr>() {
-            Ok(ip) => {
-                cf_excluded.insert(ip);
-            }
-            Err(e) => warn!(
-                "CrossFlow: failed to parse excluded API IP {:?}: {}",
-                ip_str, e
-            ),
-        }
-    }
     let cross_flow_state = Arc::new(std::sync::Mutex::new(
         detectors::cross_flow::CrossFlowState::new(
             detectors::cross_flow::CrossFlowConfig::default(),

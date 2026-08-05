@@ -9,6 +9,8 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
+
 use synapse_common::{
     Detector, DetectorFinding, DetectorId, DetectorStatus, Evidence, FlowRecord, Severity,
 };
@@ -82,20 +84,21 @@ pub struct CrossFlowState {
     // Per-PID remote IP history for connection-diversity.
     pid_diversity: HashMap<u32, VecDeque<(IpAddr, Instant)>>,
     config: CrossFlowConfig,
-    // IPs excluded from per-destination counting. Caller populates this with
-    // the default gateway and the own_ips snapshot (which already includes
-    // subnet-directed broadcasts computed from interface netmasks). This is
-    // intentionally narrow: RFC1918 as a whole is NOT excluded, so lateral
-    // movement against other LAN hosts remains visible.
+    // IPs excluded from per-destination counting. Live-refreshed: the caller
+    // shares an Arc<ArcSwap<...>> that the own-ips-refresh thread updates every
+    // 5s (own_ips ∪ {gateway} ∪ hardcoded API endpoints). is_excluded() calls
+    // .load() on every evaluation so a network change takes effect within one
+    // refresh cycle without restarting CrossFlowState.
     //
-    // Protocol-level infrastructure addresses (255.255.255.255, 224.0.0.0/4,
-    // ff00::/8) are caught by is_infrastructure_destination() rather than this
-    // set, since they're address-pattern checks that need no configuration.
-    excluded_ips: HashSet<IpAddr>,
+    // This is intentionally narrow: RFC1918 as a whole is NOT excluded, so
+    // lateral movement against other LAN hosts remains visible. Protocol-level
+    // infrastructure (255.255.255.255, 224.0.0.0/4, ff00::/8) is caught by
+    // is_infrastructure_destination(), not this set.
+    excluded_ips: Arc<ArcSwap<HashSet<IpAddr>>>,
 }
 
 impl CrossFlowState {
-    pub fn new(config: CrossFlowConfig, excluded_ips: HashSet<IpAddr>) -> Self {
+    pub fn new(config: CrossFlowConfig, excluded_ips: Arc<ArcSwap<HashSet<IpAddr>>>) -> Self {
         Self {
             ip_stats: HashMap::new(),
             beacon_history: HashMap::new(),
@@ -106,7 +109,7 @@ impl CrossFlowState {
     }
 
     fn is_excluded(&self, ip: IpAddr) -> bool {
-        self.excluded_ips.contains(&ip) || crate::capture::is_infrastructure_destination(ip)
+        self.excluded_ips.load().contains(&ip) || crate::capture::is_infrastructure_destination(ip)
     }
 
     // Called for every new flow (not per-packet). remote_port is the
@@ -563,6 +566,10 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
+    fn live_excluded(ips: impl IntoIterator<Item = IpAddr>) -> Arc<ArcSwap<HashSet<IpAddr>>> {
+        Arc::new(ArcSwap::from_pointee(ips.into_iter().collect()))
+    }
+
     fn make_flow(a_ip: IpAddr, b_ip: IpAddr) -> FlowRecord {
         FlowRecord {
             flow_id: 1,
@@ -586,7 +593,7 @@ mod tests {
     }
 
     fn default_state() -> CrossFlowState {
-        CrossFlowState::new(CrossFlowConfig::default(), HashSet::new())
+        CrossFlowState::new(CrossFlowConfig::default(), live_excluded([]))
     }
 
     // ── Existing scan / DNS-burst tests ─────────────────────────────────────
@@ -655,7 +662,7 @@ mod tests {
         let gateway: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
         let state = Arc::new(Mutex::new(CrossFlowState::new(
             CrossFlowConfig::default(),
-            [gateway].into_iter().collect(),
+            live_excluded([gateway]),
         )));
         for _ in 0..250 {
             state.lock().unwrap().record_connection(gateway, 6, 443);
@@ -676,7 +683,7 @@ mod tests {
         let lan_host: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
         let state = Arc::new(Mutex::new(CrossFlowState::new(
             CrossFlowConfig::default(),
-            [gateway].into_iter().collect(),
+            live_excluded([gateway]),
         )));
         for _ in 0..250 {
             state.lock().unwrap().record_connection(lan_host, 6, 445);
@@ -715,7 +722,7 @@ mod tests {
         let subnet_bcast: IpAddr = IpAddr::V4(Ipv4Addr::new(172, 18, 22, 255));
         let state = Arc::new(Mutex::new(CrossFlowState::new(
             CrossFlowConfig::default(),
-            [subnet_bcast].into_iter().collect(),
+            live_excluded([subnet_bcast]),
         )));
         for _ in 0..250 {
             state
@@ -974,7 +981,7 @@ mod tests {
             max_tracked_pids: 3,
             ..CrossFlowConfig::default()
         };
-        let mut state = CrossFlowState::new(cfg, HashSet::new());
+        let mut state = CrossFlowState::new(cfg, live_excluded([]));
         for pid in 0..5_u32 {
             let ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, pid as u8));
             state.record_pid_connection(pid, ip);
@@ -993,7 +1000,7 @@ mod tests {
             pid_diversity_window_secs: 1,
             ..CrossFlowConfig::default()
         };
-        let mut state = CrossFlowState::new(cfg, HashSet::new());
+        let mut state = CrossFlowState::new(cfg, live_excluded([]));
         let pid = 7_u32;
         // Insert a stale entry (>1s old) by backdating manually.
         state.pid_diversity.insert(
@@ -1111,5 +1118,59 @@ mod tests {
                 "beacon must NOT be keyed on local ephemeral port {local_eph} (pre-fix bug)"
             );
         }
+    }
+
+    // ── Live-refresh property ────────────────────────────────────────────────
+    //
+    // This test proves the specific bug class closed on 2026-08-04:
+    // CrossFlowState::excluded_ips was a static HashSet, so a network change
+    // (new gateway, new own IP) after agent startup meant the old gateway IP
+    // remained un-excluded. The fix replaces the owned set with an
+    // Arc<ArcSwap<...>> that the own-ips-refresh thread updates every 5s.
+    //
+    // The test exercises the live-update path directly: the ArcSwap is swapped
+    // while CrossFlowState is alive and no restart occurs.
+    #[test]
+    fn test_excluded_ips_live_updates_without_restart() {
+        let target: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let local: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2));
+
+        // Start with empty exclusion set — target is NOT excluded.
+        let live_set = live_excluded([]);
+        let state = Arc::new(Mutex::new(CrossFlowState::new(
+            CrossFlowConfig::default(),
+            live_set.clone(),
+        )));
+
+        // Drive enough connections to trigger scan detection.
+        for _ in 0..250 {
+            state.lock().unwrap().record_connection(target, 6, 443);
+        }
+        let detector = CrossFlowDetector::new(state);
+        let flow = make_flow(target, local);
+
+        let before = detector.evaluate(&flow);
+        assert!(
+            before.score > 0.0,
+            "target must score nonzero before exclusion (got {})",
+            before.score
+        );
+
+        // Simulate the own-ips-refresh thread updating the ArcSwap: target IP
+        // is now the gateway (or a new own IP). No CrossFlowState reconstruction.
+        let mut new_set = HashSet::new();
+        new_set.insert(target);
+        live_set.store(Arc::new(new_set));
+
+        // Same CrossFlowState, same CrossFlowDetector — score must now be 0.
+        let after = detector.evaluate(&flow);
+        assert_eq!(
+            after.score, 0.0,
+            "target must score 0 after ArcSwap refresh without restarting CrossFlowState"
+        );
+        assert!(
+            after.evidence.is_empty(),
+            "no evidence must be emitted for an excluded IP"
+        );
     }
 }
