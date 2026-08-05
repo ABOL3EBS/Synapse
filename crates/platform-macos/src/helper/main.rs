@@ -9,6 +9,7 @@
 //   4. Execute pfctl commands in a dedicated anchor to block/unblock IPs.
 
 mod enforce;
+mod reconcile_db;
 
 use std::ffi::CString;
 use std::fs;
@@ -390,6 +391,31 @@ fn run() -> io::Result<()> {
     // 2. Initialise pf anchor (idempotent — safe across reconnection cycles).
     ensure_anchor()?;
 
+    // 2b. Startup reconcile: sync the live pf table with the agent's DB before
+    //     accepting any connections. Recovers from: prior crash left orphan blocks,
+    //     or someone flushed pf while the helper was down.
+    //     Non-fatal: if the DB doesn't exist yet (agent hasn't run), skip silently.
+    {
+        let mut startup_backend = enforce::MacOsEnforcementBackend::new();
+        let db_path = reconcile_db::agent_db_path();
+        match reconcile_db::open_read_only(&db_path) {
+            Ok(conn) => match reconcile_db::query_desired_state(&conn) {
+                Ok(desired) => {
+                    use synapse_common::EnforcementBackend;
+                    match startup_backend.reconcile(&desired) {
+                        Ok(report) => info!(
+                            "[RECONCILE] startup pass: removed {} orphan(s), restored {} block(s), {} error(s)",
+                            report.orphans_removed, report.re_applied, report.errors.len()
+                        ),
+                        Err(e) => warn!("[RECONCILE] startup reconcile failed: {e}"),
+                    }
+                }
+                Err(e) => warn!("[RECONCILE] startup: could not query desired state: {e}"),
+            },
+            Err(e) => info!("[RECONCILE] startup: DB not available ({e}) — skipping"),
+        }
+    }
+
     // 3. Enable pf (reference counted — safe to call multiple times).
     let enable = std::process::Command::new("pfctl").args(["-e"]).output()?;
     if !enable.status.success() {
@@ -439,6 +465,41 @@ fn run() -> io::Result<()> {
     // active_blocks and TTL cancellation handles so unblock-timers fire
     // correctly even if the agent crashes and reconnects.
     let mut backend = MacOsEnforcementBackend::new();
+
+    // 5a. Periodic reconcile thread: re-sync live pf table vs DB every 60 s.
+    //     Detects and corrects external tampering (manual pfctl flush, another tool
+    //     modifying the anchor) without waiting for an agent-initiated enforcement
+    //     command. 60 s is appropriate — pfctl subprocess cost makes 5 s too noisy.
+    {
+        let reconcile_running = Arc::clone(&running);
+        thread::Builder::new()
+            .name("reconcile-periodic".to_string())
+            .spawn(move || {
+                use synapse_common::EnforcementBackend;
+                let mut periodic_backend = enforce::MacOsEnforcementBackend::new();
+                while reconcile_running.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_secs(60));
+                    if !reconcile_running.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let db_path = reconcile_db::agent_db_path();
+                    match reconcile_db::open_read_only(&db_path) {
+                        Ok(conn) => match reconcile_db::query_desired_state(&conn) {
+                            Ok(desired) => match periodic_backend.reconcile(&desired) {
+                                Ok(report) => info!(
+                                    "[RECONCILE] periodic pass: removed {} orphan(s), restored {} block(s), {} error(s)",
+                                    report.orphans_removed, report.re_applied, report.errors.len()
+                                ),
+                                Err(e) => warn!("[RECONCILE] periodic reconcile failed: {e}"),
+                            },
+                            Err(e) => warn!("[RECONCILE] periodic: could not query desired state: {e}"),
+                        },
+                        Err(e) => log::debug!("[RECONCILE] periodic: DB not available ({e})"),
+                    }
+                }
+            })
+            .map_err(|e| io::Error::other(format!("spawn reconcile-periodic: {e}")))?;
+    }
 
     // 5. Accept loop — wait for an agent, run the enforcement loop, and return
     //    here when the agent disconnects so the next connection can be accepted.

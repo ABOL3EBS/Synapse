@@ -206,12 +206,210 @@ impl EnforcementBackend for MacOsEnforcementBackend {
         })
     }
 
-    /// §4a/§4c: STUB — real reconciliation is tracked separate work.
-    /// Returns default (no re-applied, no evicted, no errors).
+    /// §4a/§4c: Diff live pf table against desired state; apply corrections.
+    ///
+    /// REMOVE direction: IPs in the live table not in desired state (orphans
+    /// from a prior crash, expired blocks, or external pf manipulation).
+    /// RE-ADD direction: IPs in desired state missing from the live table
+    /// (another tool flushed pf, or the anchor was reloaded).
+    ///
+    /// Never panics or returns Err — errors accumulate in the report so the
+    /// caller can log-and-continue.
     fn reconcile(
         &mut self,
-        _desired: &DesiredFirewallState,
+        desired: &DesiredFirewallState,
     ) -> Result<ReconciliationReport, String> {
-        Ok(ReconciliationReport::default())
+        let mut report = ReconciliationReport::default();
+
+        let live = match read_live_table() {
+            Ok(set) => set,
+            Err(e) => {
+                let msg = format!("reconcile: read live pf table failed: {e}");
+                warn!("{msg}");
+                report.errors.push(msg);
+                return Ok(report);
+            }
+        };
+
+        let desired_set: HashSet<IpAddr> = desired.blocks.iter().map(|b| b.ip()).collect();
+        let (orphans, missing) = compute_diff(&live, &desired_set);
+
+        for ip in &orphans {
+            match Self::unblock_ip(*ip) {
+                Ok(()) => {
+                    report.orphans_removed += 1;
+                    // Remove from in-memory tracking — it was never legitimately added
+                    // during this session, but clean up just in case.
+                    if let Ok(mut guard) = self.active_blocks.lock() {
+                        guard.remove(ip);
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("reconcile: remove orphan {ip}: {e}");
+                    warn!("{msg}");
+                    report.errors.push(msg);
+                }
+            }
+        }
+
+        for ip in &missing {
+            // block_ip takes IpAddr directly — no ValidatedBlock wrapper needed here.
+            // desired state IPs are already validated by query_desired_state().
+            match Self::block_ip(*ip) {
+                Ok(()) => {
+                    report.re_applied += 1;
+                    if let Ok(mut guard) = self.active_blocks.lock() {
+                        guard.insert(*ip);
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("reconcile: re-add {ip}: {e}");
+                    warn!("{msg}");
+                    report.evicted.push(BlockId::from(*ip));
+                    report.errors.push(msg);
+                }
+            }
+        }
+
+        info!(
+            "[RECONCILE] pass complete: removed {} orphan(s), restored {} missing block(s), {} error(s)",
+            report.orphans_removed, report.re_applied, report.errors.len()
+        );
+        Ok(report)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reconciliation helpers (pure functions — no pfctl I/O, fully testable)
+// ---------------------------------------------------------------------------
+
+/// Read the current contents of the pf blocklist table.
+/// Returns a set of IpAddr parsed from pfctl -T show output (one IP per line).
+fn read_live_table() -> Result<HashSet<IpAddr>, String> {
+    let output = std::process::Command::new("pfctl")
+        .args(["-a", PF_ANCHOR_NAME, "-t", PF_TABLE_NAME, "-T", "show"])
+        .output()
+        .map_err(|e| format!("pfctl -T show spawn failed: {e}"))?;
+
+    // pfctl exits non-zero when the table is empty ("no addresses found") or
+    // when the anchor doesn't exist yet. Treat both as an empty live set.
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("No addresses") || stderr.contains("pfctl: DIOCRGETADDRS") {
+            return Ok(HashSet::new());
+        }
+        // For any other pfctl error, propagate so the caller logs it.
+        return Err(format!(
+            "pfctl -T show failed ({}): {stderr}",
+            output.status
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let ips: HashSet<IpAddr> = stdout
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            // pfctl may include CIDR notation (e.g. "1.2.3.4/32") — strip the prefix.
+            let addr_part = trimmed.split('/').next().unwrap_or(trimmed);
+            match addr_part.parse::<IpAddr>() {
+                Ok(ip) => Some(ip),
+                Err(_) => {
+                    if !trimmed.is_empty() {
+                        warn!("reconcile: unrecognised pf table entry: {trimmed:?}");
+                    }
+                    None
+                }
+            }
+        })
+        .collect();
+
+    Ok(ips)
+}
+
+/// Pure diff: compute orphans (in live but not desired) and missing (in desired
+/// but not live). No I/O — extracted so the logic can be unit-tested without
+/// real pfctl calls.
+fn compute_diff(live: &HashSet<IpAddr>, desired: &HashSet<IpAddr>) -> (Vec<IpAddr>, Vec<IpAddr>) {
+    let orphans: Vec<IpAddr> = live.difference(desired).copied().collect();
+    let missing: Vec<IpAddr> = desired.difference(live).copied().collect();
+    (orphans, missing)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn set(ips: &[&str]) -> HashSet<IpAddr> {
+        ips.iter().map(|s| ip(s)).collect()
+    }
+
+    #[test]
+    fn test_compute_diff_in_sync() {
+        let live = set(&["1.2.3.4", "5.6.7.8"]);
+        let desired = set(&["1.2.3.4", "5.6.7.8"]);
+        let (orphans, missing) = compute_diff(&live, &desired);
+        assert!(orphans.is_empty(), "no orphans when in sync");
+        assert!(missing.is_empty(), "no missing when in sync");
+    }
+
+    #[test]
+    fn test_compute_diff_orphan_detection() {
+        let live = set(&["1.2.3.4", "99.0.0.1"]);
+        let desired = set(&["1.2.3.4"]);
+        let (orphans, missing) = compute_diff(&live, &desired);
+        assert_eq!(orphans, vec![ip("99.0.0.1")]);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn test_compute_diff_missing_detection() {
+        let live = set(&["1.2.3.4"]);
+        let desired = set(&["1.2.3.4", "5.6.7.8"]);
+        let (orphans, missing) = compute_diff(&live, &desired);
+        assert!(orphans.is_empty());
+        assert_eq!(missing, vec![ip("5.6.7.8")]);
+    }
+
+    #[test]
+    fn test_compute_diff_both_directions() {
+        let live = set(&["1.2.3.4", "203.0.113.99"]);
+        let desired = set(&["1.2.3.4", "5.6.7.8"]);
+        let (orphans, missing) = compute_diff(&live, &desired);
+        assert_eq!(orphans, vec![ip("203.0.113.99")]);
+        assert_eq!(missing, vec![ip("5.6.7.8")]);
+    }
+
+    #[test]
+    fn test_compute_diff_empty_live() {
+        let live = set(&[]);
+        let desired = set(&["1.2.3.4", "5.6.7.8"]);
+        let (orphans, missing) = compute_diff(&live, &desired);
+        assert!(orphans.is_empty());
+        let mut missing_sorted = missing.clone();
+        missing_sorted.sort();
+        assert_eq!(missing_sorted, vec![ip("1.2.3.4"), ip("5.6.7.8")]);
+    }
+
+    #[test]
+    fn test_compute_diff_empty_desired() {
+        let live = set(&["1.2.3.4", "5.6.7.8"]);
+        let desired = set(&[]);
+        let (orphans, missing) = compute_diff(&live, &desired);
+        let mut orphans_sorted = orphans.clone();
+        orphans_sorted.sort();
+        assert_eq!(orphans_sorted, vec![ip("1.2.3.4"), ip("5.6.7.8")]);
+        assert!(missing.is_empty());
+    }
+
+    // Confirm the IPv4 loopback is a well-formed IpAddr (parse sanity).
+    #[test]
+    fn test_ip_parse_sanity() {
+        let _: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
     }
 }

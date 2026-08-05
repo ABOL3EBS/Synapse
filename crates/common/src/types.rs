@@ -153,11 +153,17 @@ pub struct EnforcementReceipt {
 }
 
 /// Result of a reconciliation pass (§4a/§4c).
-/// Reports what had to be re-applied (anchor eviction recovery),
-/// what was evicted that couldn't be recovered, and any errors.
+/// Reports both directions of the diff: orphan removal and missing-block
+/// restoration, plus any errors encountered during the pass.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReconciliationReport {
-    /// Blocks that were re-applied after anchor eviction.
+    /// Orphaned entries removed from the live pf table — IPs that were present
+    /// in the table but have no valid Block in enforcement_log (stale blocks
+    /// from a prior crash or external pf manipulation).
+    pub orphans_removed: usize,
+    /// Blocks that were re-applied after the table was flushed externally —
+    /// IPs that enforcement_log says should be active but were absent from
+    /// the live pf table.
     pub re_applied: usize,
     /// Block IDs that were in DesiredFirewallState but could not be restored.
     pub evicted: Vec<BlockId>,
