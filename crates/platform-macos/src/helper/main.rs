@@ -30,6 +30,19 @@ use synapse_platform_macos::protocol;
 
 use enforce::MacOsEnforcementBackend;
 
+const HELPER_PID_FILE: &str = "/var/run/synapsed-helper.pid";
+
+/// Path to the trigger file that signals the helper to run a reconcile pass
+/// without waiting for the next 60-second periodic interval.
+/// Written by the dashboard's request_unblock command; deleted by the helper
+/// before running the reconcile so it is not re-triggered on the next cycle.
+fn trigger_file_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    std::path::PathBuf::from(home)
+        .join(".synapse")
+        .join("reconcile-now")
+}
+
 // ---------------------------------------------------------------------------
 // Peer credential authentication
 // ---------------------------------------------------------------------------
@@ -378,6 +391,15 @@ fn run() -> io::Result<()> {
     }
     info!("synapsed-helper starting (pid={})", std::process::id());
 
+    // Write PID file so the dashboard can check liveness via kill(pid, 0).
+    // Non-fatal: if /var/run/ is inaccessible, log and continue — the dashboard
+    // will report "helper offline" but enforcement is unaffected.
+    if let Err(e) = std::fs::write(HELPER_PID_FILE, format!("{}\n", std::process::id())) {
+        warn!("could not write PID file {HELPER_PID_FILE}: {e}");
+    } else {
+        info!("PID file written: {HELPER_PID_FILE}");
+    }
+
     // 1. Open and configure BPF device (raw, no pcap).
     //    The fd is opened once and kept alive for the lifetime of the helper so
     //    it can be handed to each new agent connection via SCM_RIGHTS.
@@ -478,23 +500,41 @@ fn run() -> io::Result<()> {
                 use synapse_common::EnforcementBackend;
                 let mut periodic_backend = enforce::MacOsEnforcementBackend::new();
                 while reconcile_running.load(Ordering::Acquire) {
-                    thread::sleep(Duration::from_secs(60));
+                    // Poll 1 s/tick. Exits early when the dashboard writes the trigger
+                    // file (unblock request), otherwise waits up to 60 ticks (60 s).
+                    let trigger = trigger_file_path();
+                    let mut ticks = 0u32;
+                    let triggered = 'wait: loop {
+                        if !reconcile_running.load(Ordering::Acquire) {
+                            break 'wait false;
+                        }
+                        if trigger.exists() {
+                            let _ = std::fs::remove_file(&trigger);
+                            break 'wait true;
+                        }
+                        thread::sleep(Duration::from_secs(1));
+                        ticks += 1;
+                        if ticks >= 60 {
+                            break 'wait false;
+                        }
+                    };
                     if !reconcile_running.load(Ordering::Acquire) {
                         break;
                     }
+                    let source = if triggered { "triggered" } else { "periodic" };
                     let db_path = reconcile_db::agent_db_path();
                     match reconcile_db::open_read_only(&db_path) {
                         Ok(conn) => match reconcile_db::query_desired_state(&conn) {
                             Ok(desired) => match periodic_backend.reconcile(&desired) {
                                 Ok(report) => info!(
-                                    "[RECONCILE] periodic pass: removed {} orphan(s), restored {} block(s), {} error(s)",
+                                    "[RECONCILE] {source} pass: removed {} orphan(s), restored {} block(s), {} error(s)",
                                     report.orphans_removed, report.re_applied, report.errors.len()
                                 ),
-                                Err(e) => warn!("[RECONCILE] periodic reconcile failed: {e}"),
+                                Err(e) => warn!("[RECONCILE] {source} reconcile failed: {e}"),
                             },
-                            Err(e) => warn!("[RECONCILE] periodic: could not query desired state: {e}"),
+                            Err(e) => warn!("[RECONCILE] {source}: could not query desired state: {e}"),
                         },
-                        Err(e) => log::debug!("[RECONCILE] periodic: DB not available ({e})"),
+                        Err(e) => log::debug!("[RECONCILE] {source}: DB not available ({e})"),
                     }
                 }
             })
@@ -680,6 +720,7 @@ fn run() -> io::Result<()> {
         }
     }
     let _ = std::fs::remove_file(IPC_SOCKET_PATH);
+    let _ = std::fs::remove_file(HELPER_PID_FILE);
     info!("helper shut down cleanly");
     Ok(())
 }

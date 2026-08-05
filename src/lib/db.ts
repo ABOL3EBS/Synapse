@@ -52,6 +52,31 @@ export interface CountryStat {
   count: number;
 }
 
+export interface ActiveBlock {
+  ip_text: string;
+  remaining_ms: number;
+  reason: string;
+}
+
+/** Three-state unblock result — mirrors UnblockResult in settings.rs */
+export interface UnblockResult {
+  queued: boolean;
+  fast_path: boolean;
+  message: string;
+}
+
+export interface AgentStatus {
+  agent_ok: boolean;
+  helper_ok: boolean;
+  db_mtime_ms: number;
+}
+
+export interface ConfigValues {
+  block_threshold: number;
+  alert_threshold: number;
+  cf_exclusions: string[];
+}
+
 // ---------------------------------------------------------------------------
 // Tauri context check
 // ---------------------------------------------------------------------------
@@ -96,4 +121,24 @@ export function getTopApps(): Promise<TopApp[]> {
 export function getThreatCountries(): Promise<CountryStat[]> {
   if (!isTauri()) return Promise.reject(new Error("not-tauri"));
   return invoke<CountryStat[]>("get_threat_countries");
+}
+
+export function getActiveBlocks(): Promise<ActiveBlock[]> {
+  if (!isTauri()) return Promise.reject(new Error("not-tauri"));
+  return invoke<ActiveBlock[]>("get_active_blocks");
+}
+
+export function requestUnblock(ip_text: string): Promise<UnblockResult> {
+  if (!isTauri()) return Promise.reject(new Error("not-tauri"));
+  return invoke<UnblockResult>("request_unblock", { ip_text });
+}
+
+export function getAgentStatus(): Promise<AgentStatus> {
+  if (!isTauri()) return Promise.reject(new Error("not-tauri"));
+  return invoke<AgentStatus>("get_agent_status");
+}
+
+export function getConfigValues(): Promise<ConfigValues> {
+  if (!isTauri()) return Promise.reject(new Error("not-tauri"));
+  return invoke<ConfigValues>("get_config_values");
 }

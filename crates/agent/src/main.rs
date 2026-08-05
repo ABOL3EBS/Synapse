@@ -35,6 +35,13 @@ use synapse_platform_macos::protocol;
 // Main
 // ---------------------------------------------------------------------------
 
+fn agent_pid_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    std::path::PathBuf::from(home)
+        .join(".synapse")
+        .join("agent.pid")
+}
+
 fn main() -> io::Result<()> {
     synapse_common::log_format::init_logging();
     let euid = unsafe { libc::geteuid() };
@@ -45,6 +52,19 @@ fn main() -> io::Result<()> {
     );
     if euid == 0 {
         warn!("agent running as root — expected during milestone 1 testing");
+    }
+
+    // Write PID file so the dashboard can check liveness via kill(pid, 0).
+    // Same pattern as the helper's HELPER_PID_FILE — process-independent,
+    // correct regardless of whether any verdicts have been written recently.
+    {
+        let pid_path = agent_pid_path();
+        if let Some(dir) = pid_path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(e) = std::fs::write(&pid_path, format!("{}\n", std::process::id())) {
+            warn!("could not write agent PID file {}: {e}", pid_path.display());
+        }
     }
 
     // Signal handler — clean shutdown on SIGINT/SIGTERM.
@@ -377,5 +397,6 @@ fn main() -> io::Result<()> {
     if let Some(worker) = storage_worker {
         worker.shutdown();
     }
+    let _ = std::fs::remove_file(agent_pid_path());
     Ok(())
 }

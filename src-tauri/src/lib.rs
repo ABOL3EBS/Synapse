@@ -1,8 +1,9 @@
 // src-tauri/src/lib.rs
 //
-// Tauri v2 backend — read-only access to ~/.synapse/synapse.db.
-// Never writes, never touches the spool, never sends enforcement commands.
+// Tauri v2 backend — read-only dashboard queries + settings commands.
 // Graceful degradation: all commands return empty/default data when DB is absent.
+
+mod settings;
 
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -14,12 +15,14 @@ use std::sync::Mutex;
 
 pub struct DbState(pub Mutex<Option<Connection>>);
 
-fn db_path() -> std::path::PathBuf {
+pub(crate) fn db_path() -> std::path::PathBuf {
     if let Ok(path) = std::env::var("SYNAPSE_DB_PATH") {
         return std::path::PathBuf::from(path);
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    std::path::PathBuf::from(home).join(".synapse").join("synapse.db")
+    std::path::PathBuf::from(home)
+        .join(".synapse")
+        .join("synapse.db")
 }
 
 fn open_db() -> Option<Connection> {
@@ -31,17 +34,16 @@ fn open_db() -> Option<Connection> {
         &path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .map(|conn| {
+    .inspect(|conn| {
         let _ = conn.execute_batch(
             "PRAGMA journal_mode = WAL;\
              PRAGMA query_only   = ON;",
         );
-        conn
     })
     .ok()
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -67,7 +69,7 @@ pub struct ActivityItem {
     pub detector_ids: Vec<String>,
     pub a_ip_text: String,
     pub b_ip_text: String,
-    pub remote_ip_text: String,  // direction-resolved: the non-local endpoint
+    pub remote_ip_text: String, // direction-resolved: the non-local endpoint
     pub country_code: Option<String>,
     pub dns_name: Option<String>,
     /// evidence_json from the highest-scoring detector finding; None if no findings.
@@ -106,7 +108,10 @@ pub struct ThreatStats {
 fn get_protection_status(state: tauri::State<DbState>) -> ProtectionStatus {
     let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
     let Some(conn) = guard.as_ref() else {
-        return ProtectionStatus { is_protected: false, blocks_week: 0 };
+        return ProtectionStatus {
+            is_protected: false,
+            blocks_week: 0,
+        };
     };
 
     let now = now_ms();
@@ -162,23 +167,19 @@ fn get_activity_feed(limit: i64, state: tauri::State<DbState>) -> Vec<ActivityIt
             let a_ip_text: String = r.get(4)?;
             let b_ip_text: String = r.get(5)?;
             let local_ip_text: Option<String> = r.get(6)?;
-            let remote_ip_text = pick_remote(
-                &a_ip_text,
-                &b_ip_text,
-                local_ip_text.as_deref(),
-            );
+            let remote_ip_text = pick_remote(&a_ip_text, &b_ip_text, local_ip_text.as_deref());
             Ok(ActivityItem {
                 id: r.get(0)?,
                 ts_ms: r.get(1)?,
                 app_name,
                 verdict: r.get(3)?,
-                detector_ids: vec![],   // filled below
+                detector_ids: vec![], // filled below
                 a_ip_text,
                 b_ip_text,
                 remote_ip_text,
                 country_code: r.get(7)?,
                 dns_name: r.get(8)?,
-                top_evidence: None,     // filled below
+                top_evidence: None, // filled below
             })
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -195,8 +196,10 @@ fn get_activity_feed(limit: i64, state: tauri::State<DbState>) -> Vec<ActivityIt
              WHERE verdict_id IN ({placeholders}) ORDER BY verdict_id, score DESC"
         );
         if let Ok(mut fstmt) = conn.prepare(&sql) {
-            let params: Vec<&dyn rusqlite::types::ToSql> =
-                ids.iter().map(|i| i as &dyn rusqlite::types::ToSql).collect();
+            let params: Vec<&dyn rusqlite::types::ToSql> = ids
+                .iter()
+                .map(|i| i as &dyn rusqlite::types::ToSql)
+                .collect();
             if let Ok(rows) = fstmt.query_map(params.as_slice(), |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
@@ -211,9 +214,9 @@ fn get_activity_feed(limit: i64, state: tauri::State<DbState>) -> Vec<ActivityIt
                 for (vid, det, ev) in rows.flatten() {
                     det_map.entry(vid).or_default().push(det);
                     // Only the first row per verdict_id (highest score) → top_evidence
-                    if !ev_map.contains_key(&vid) {
+                    if let std::collections::hash_map::Entry::Vacant(e) = ev_map.entry(vid) {
                         if let Some(json) = ev {
-                            ev_map.insert(vid, json);
+                            e.insert(json);
                         }
                     }
                 }
@@ -234,7 +237,11 @@ fn get_activity_feed(limit: i64, state: tauri::State<DbState>) -> Vec<ActivityIt
 fn get_threat_stats(state: tauri::State<DbState>) -> ThreatStats {
     let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
     let Some(conn) = guard.as_ref() else {
-        return ThreatStats { blocks_today: 0, blocks_week: 0, blocked_addresses: 0 };
+        return ThreatStats {
+            blocks_today: 0,
+            blocks_week: 0,
+            blocked_addresses: 0,
+        };
     };
 
     let now = now_ms();
@@ -276,7 +283,9 @@ pub struct ChartPoint {
 #[tauri::command]
 fn get_activity_chart(state: tauri::State<DbState>) -> Vec<ChartPoint> {
     let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(conn) = guard.as_ref() else { return vec![]; };
+    let Some(conn) = guard.as_ref() else {
+        return vec![];
+    };
 
     let now = now_ms();
     let since = now - 24 * 60 * 60 * 1000;
@@ -311,14 +320,16 @@ fn get_activity_chart(state: tauri::State<DbState>) -> Vec<ChartPoint> {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DetectorStat {
     pub name: String,
-    pub count: i64,       // findings with score > 0
-    pub has_runs: bool,   // true if detector ran at all (even with 0 findings)
+    pub count: i64,     // findings with score > 0
+    pub has_runs: bool, // true if detector ran at all (even with 0 findings)
 }
 
 #[tauri::command]
 fn get_detector_breakdown(state: tauri::State<DbState>) -> Vec<DetectorStat> {
     let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(conn) = guard.as_ref() else { return vec![]; };
+    let Some(conn) = guard.as_ref() else {
+        return vec![];
+    };
 
     // Return all detectors that ran, with finding count (score > 0) per detector.
     // Detectors that ran but had zero signal appear with count=0, has_runs=true —
@@ -357,7 +368,9 @@ pub struct TopApp {
 #[tauri::command]
 fn get_top_apps(state: tauri::State<DbState>) -> Vec<TopApp> {
     let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(conn) = guard.as_ref() else { return vec![]; };
+    let Some(conn) = guard.as_ref() else {
+        return vec![];
+    };
 
     let week_ago = now_ms() - 7 * 24 * 60 * 60 * 1000;
 
@@ -382,7 +395,11 @@ fn get_top_apps(state: tauri::State<DbState>) -> Vec<TopApp> {
             .and_then(|n| n.to_str())
             .unwrap_or("Unknown")
             .to_string();
-        Ok(TopApp { app_name, blocks: r.get(1)?, alerts: r.get(2)? })
+        Ok(TopApp {
+            app_name,
+            blocks: r.get(1)?,
+            alerts: r.get(2)?,
+        })
     })
     .map(|rows| rows.filter_map(|r| r.ok()).collect())
     .unwrap_or_default()
@@ -401,7 +418,9 @@ pub struct CountryStat {
 #[tauri::command]
 fn get_threat_countries(state: tauri::State<DbState>) -> Vec<CountryStat> {
     let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(conn) = guard.as_ref() else { return vec![]; };
+    let Some(conn) = guard.as_ref() else {
+        return vec![];
+    };
 
     let mut stmt = match conn.prepare(
         "SELECT country_code, COUNT(*) as cnt
@@ -416,7 +435,10 @@ fn get_threat_countries(state: tauri::State<DbState>) -> Vec<CountryStat> {
     };
 
     stmt.query_map([], |r| {
-        Ok(CountryStat { country_code: r.get(0)?, count: r.get(1)? })
+        Ok(CountryStat {
+            country_code: r.get(0)?,
+            count: r.get(1)?,
+        })
     })
     .map(|rows| rows.filter_map(|r| r.ok()).collect())
     .unwrap_or_default()
@@ -430,6 +452,9 @@ fn get_threat_countries(state: tauri::State<DbState>) -> Vec<CountryStat> {
 pub fn run() {
     tauri::Builder::default()
         .manage(DbState(Mutex::new(open_db())))
+        .manage(settings::WriteDbState(
+            Mutex::new(settings::open_write_db()),
+        ))
         .invoke_handler(tauri::generate_handler![
             get_protection_status,
             get_activity_feed,
@@ -438,6 +463,10 @@ pub fn run() {
             get_detector_breakdown,
             get_top_apps,
             get_threat_countries,
+            settings::get_active_blocks,
+            settings::request_unblock,
+            settings::get_agent_status,
+            settings::get_config_values,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Synapse dashboard");
