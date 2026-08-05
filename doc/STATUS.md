@@ -96,8 +96,9 @@
 | Common types | `crates/common/src/lib.rs` | 116 | `EnforcementCommand`, `PacketInfo`, `EnforcementBackend` trait, `EnrichmentRequest`, `EnrichmentResult`, `EnrichmentKind`, IPC constants (`PF_ANCHOR_NAME`, `PF_TABLE_NAME`, `IPC_SOCKET_PATH`), re-exports `Detector`, `run_detector_with_timeout`, `DecisionConfig`, `Verdict`, `FlowFeatures` |
 | Shared types | `crates/common/src/types.rs` | 898 | `ValidatedBlock`, `BlockId`, `DesiredFirewallState`, `EnforcementReceipt`, `ReconciliationReport`, `PortPidCache` (HashMap-based), `IpcMessage` enum, enrichment types, `DetectorId` (8 variants: `CrossFlow`, `RuleEngine`, `ReputationEngine`, `DnsAnalyzer`, `ProcessCorrelator`, `FlowBehavior`, `IpReputation`, `DnsTunnelDetector`, `Custom(u16)`), `Severity`, `Evidence`, `DetectorStatus`, `DetectorFinding`, `Detector` trait, `run_detector_with_timeout()` with `catch_unwind`, `FlowRecord`, `DecisionConfig` (block=0.7, alert=0.3, `min_detectors_for_block: 2`, `override_threshold: 0.85`, `ttl_by_severity: HashMap<Severity, Duration>`), `Verdict`, `FlowFeatures` |
 | Log formatter | `crates/common/src/log_format.rs` | 68 | Shared ANSI-colored formatter via `env_logger` + `colored`. `init_logging()` called once per binary. Message-content-aware coloring: `[BLOCK]`=red, `[ENFORCE]`=green, `[ALERT]`/`[SKIP]`=yellow, flow/enrich=cyan. HH:MM:SS timestamps. |
-| Helper daemon | `crates/platform-macos/src/helper/main.rs` | 624 | BPF raw ioctls, SCM_RIGHTS fd handoff, pf anchor init, reconnect loop (accept→enforce→accept), per-connection cache-push thread with `AtomicBool` cancellation. Socket 0666 with `getpeereid()` peer-credential auth. |
-| Enforcement backend | `crates/platform-macos/src/helper/enforce.rs` | 217 | `MacOsEnforcementBackend` — only pfctl executor, idempotent apply_block with AtomicBool TTL cancellation, kill_state, stub reconcile |
+| Helper daemon | `crates/platform-macos/src/helper/main.rs` | 685 | BPF raw ioctls, SCM_RIGHTS fd handoff, pf anchor init, reconnect loop (accept→enforce→accept), per-connection cache-push thread with `AtomicBool` cancellation. Socket 0666 with `getpeereid()` peer-credential auth. **Startup reconcile** (after `ensure_anchor()`) + **60 s periodic reconcile thread**. |
+| Enforcement backend | `crates/platform-macos/src/helper/enforce.rs` | 415 | `MacOsEnforcementBackend` — only pfctl executor, idempotent apply_block with AtomicBool TTL cancellation, kill_state, **reconcile()** (both directions: orphan removal + missing-block re-add, pure `compute_diff()` extracted for unit testing). 7 unit tests. |
+| Reconcile DB | `crates/platform-macos/src/helper/reconcile_db.rs` | 215 | Read-only access to agent's `enforcement_log` for desired firewall state. SQL: MAX(ts_ms) subquery ensures Unblock supersedes Block. TTL filter (`ts_ms + ttl_ms > now_ms`). Skip blocks with <30 s remaining (avoids extending lifetime beyond original decision). `agent_db_path()`, `open_read_only()`, `query_desired_state()`. 5 unit tests. |
 | Process lookup | `crates/platform-macos/src/process_lookup.rs` | 696 | `libproc` crate (v0.14) typed structs for all FFI. **Port→PID cache** (`build_port_pid_cache`): per-process fd scan. **Port reading** via `read_port_be()` — raw BE bytes at verified offsets (268/264), bypasses c_int native-endian corruption on LE ARM. |
 | Agent binary | `crates/agent/src/main.rs` | 365 | Startup + orchestration only. Loads `AgentConfig` (TOML), passes config to all components. BPF fd receive, IPC reader thread, local IP detection, GeoIP/feeds loading via config paths, `CaptureInit` struct construction, capture loop delegation. 6 production detectors (incl. CrossFlow) registered. Tests for BPF wordalign, packet parsing. |
 | Capture engine | `crates/agent/src/capture.rs` | 1781 | `CaptureEngine` struct: BPF read buffer, packet parsing (IPv4+IPv6 with `payload_length` parsing), flow tracker integration, enrichment dispatch, verdict handling via `handle_verdict()`, active-flow re-evaluation, `CrossFlowState` wired (record_connection + record_pid_connection on NewFlow, purge_expired on tick). Direction helpers — `remote_ip` and `remote_port` both direction-resolved for CrossFlow recording. **Enforcement guards.** BpfHdr struct. `handle_verdict()` emits `VerdictDecided` (Alert+Block) and `EnforcementRequested` (Block) to storage worker. `emit_cb_transitions()` emits circuit-breaker state changes. **`CaptureInit` bundle struct** (11 fields, replaces positional args). 22 tests. |
@@ -115,7 +116,7 @@
 | IPC protocol | `crates/platform-macos/src/protocol.rs` | 164 | `send_fd`/`recv_fd` (SCM_RIGHTS), `send_message`/`recv_message` (bincode, length-prefixed), stream split via `try_clone()` |
 | Storage worker | `crates/agent/src/storage/` (5 files) | 1507 | `StorageWorker` + `StorageEvent` enum (`EnforcementRequested`, `VerdictDecided`, `CircuitBreakerTransition`). Crash-safe spool (`CriticalSpool` — separate DB, `synchronous=FULL`). Idempotent replay via `INSERT OR IGNORE` + stable event IDs (`boot_id XOR fib_hash(pid)` prefix). Binary IP storage (16-byte BLOB + TEXT, always both). SQLite hardening PRAGMAs. **V2 schema** via `PRAGMA user_version` — V1: base tables; V2: adds `metadata` table with `last_retention_run_ms` for wall-clock retention persistence across restarts. Retention: enforcement_log 90d, verdicts+findings (CASCADE) 7d, CB events 7d — wall-clock hourly check on every 250ms tick, last-run timestamp persisted in `metadata`. `pending_critical_ids: VecDeque<String>`, `pop_front()` (O(1)) — previously `Vec` + `remove(0)` (O(n)). `StorageReader` (read-only connection, `query_only=ON`) with `recent_verdicts`, `verdict_findings`, `recent_enforcement`, `detector_health`, `kpi_since`. `#![allow(dead_code)]` on models/reader until Tauri IPC is wired. 4 tests: `test_ip_roundtrip_v4`, `test_ip_roundtrip_v6`, `test_spool_append_and_confirm`, `test_write_failure_degrades_gracefully`. |
 
-**Total:** ~13,540 lines across 28 files. 202 tests (180 agent + 16 common + 6 platform-macos).
+**Total:** ~13,880 lines across 29 files. 215 tests (181 agent + 16 common + 6 platform-macos lib + 12 helper).
 
 **Verified end-to-end (2026-07-22):** Helper sends PortPidCache (49–51 entries, ~483 PIDs, ~6675 fds, 62–64 probe_ok, ~7–8ms root scan). Agent receives cache, looks up src_port on each packet, resolves to correct PID + executable path. Live test: Brave Browser connection to 142.251.142.74:443 resolved to pid=743 → `Brave Browser Helper`.
 
@@ -181,8 +182,27 @@
 
 ## Stub (known incomplete — not done)
 
-- **`reconcile()`** (`enforce.rs`): Returns `Ok(ReconciliationReport::default())`.
 - **Reputation enrichment** (`enrichment/mod.rs`): `ReputationStore` loads blocklist/CIDR/CSV feeds but `lookup()` returns `None` for IPs not in any feed. No live reputation scoring yet.
+
+## Milestone 12 — reconcile() implemented and live-verified (2026-08-05)
+
+`reconcile()` is no longer a stub. Both directions implemented in `enforce.rs` + `reconcile_db.rs`, wired into startup and 60 s periodic thread in `helper/main.rs`.
+
+**Two bugs caught during implementation (not a clean first pass):**
+1. **Silent re-add failure:** the missing-block path called `ValidatedBlock::try_new(ip, Duration::from_secs(1))` before passing the IP to `block_ip()`. `ValidatedBlock` minimum TTL is 30 s, so this always failed validation, silently setting `re_applied = 0` for every missing block. Fixed by calling `block_ip(*ip)` directly — the IP is already validated by `query_desired_state()`.
+2. **TTL-extending clamp:** when constructing `ValidatedBlock` for the query result, `remaining_ms` was clamped up to 30 s for near-expiry blocks. This would extend a block's effective lifetime beyond what the decision engine originally authorized. Fixed by skipping blocks with `remaining_ms < 30_000` instead — they expire naturally, and the next reconcile pass won't include them.
+
+**Live verification (2026-08-05):**
+```
+[16:44:35] [RECONCILE] startup pass: removed 0 orphan(s), restored 1 block(s), 0 error(s)
+[16:44:35] [ENFORCE] added 198.51.100.99 to table 'synapse_blocklist'
+[16:45:35] [RECONCILE] periodic pass: removed 1 orphan(s), restored 0 missing block(s), 0 error(s)
+[16:45:35] [ENFORCE] removed 203.0.113.1 from table 'synapse_blocklist'
+[16:46:35] [RECONCILE] periodic pass: removed 0 orphan(s), restored 0 missing block(s), 0 error(s)
+```
+- **Case 2 (recovery):** table flushed, startup reconcile re-added `198.51.100.99` (active block in `enforcement_log`, ~52 min remaining). 9 expired blocks in DB not re-added.
+- **Case 1 (orphan removal):** `203.0.113.1` manually added to pf table (no `enforcement_log` record). 60 s periodic tick removed it. `198.51.100.99` preserved.
+- **Case 3 (expired not re-added):** confirmed across both passes — zero expired blocks restored.
 
 ## Known limitations (security-relevant)
 
