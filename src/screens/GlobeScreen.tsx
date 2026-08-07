@@ -6,7 +6,6 @@ import { countryName } from "../lib/translate";
 
 const REFRESH_MS = 30_000;
 
-// Home location: the machine running Synapse. Arcs originate here.
 const HOME_LAT = 53.35;
 const HOME_LNG = -6.26; // Dublin, Ireland — update to match your actual location
 
@@ -19,7 +18,6 @@ interface ArcPoint {
   count: number;
 }
 
-// Single dot marking the home location so arcs have a visible origin.
 const HOME_DOT = [{ lat: HOME_LAT, lng: HOME_LNG, size: 0.6, color: "#60a5fa" }];
 
 function buildArcs(stats: CountryStat[]): ArcPoint[] {
@@ -41,23 +39,36 @@ function buildArcs(stats: CountryStat[]): ArcPoint[] {
 
 export default function GlobeScreen() {
   const globeRef = useRef<GlobeMethods | undefined>(undefined);
+  const containerRef = useRef<HTMLDivElement>(null);
   const [stats, setStats] = useState<CountryStat[]>([]);
   const [tooltip, setTooltip] = useState<{ country: string; count: number } | null>(null);
   const [error, setError] = useState(false);
   const [ready, setReady] = useState(false);
+  // Default matches previous fixed size until ResizeObserver fires on mount.
+  const [globeSize, setGlobeSize] = useState(420);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      const { width, height } = entries[0].contentRect;
+      // Keep globe square, sized to the smaller container dimension.
+      setGlobeSize(Math.floor(Math.min(width, height)));
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   useEffect(() => {
     const load = () =>
       getThreatCountries()
         .then(setStats)
         .catch(() => setError(true));
-
     load();
     const id = setInterval(load, REFRESH_MS);
     return () => clearInterval(id);
   }, []);
 
-  // Auto-rotate; stop on user interaction
   useEffect(() => {
     if (!globeRef.current) return;
     const controls = globeRef.current.controls();
@@ -68,7 +79,6 @@ export default function GlobeScreen() {
 
   const arcs = buildArcs(stats);
 
-  // Ranked list for the sidebar panel
   const ranked = [...stats]
     .filter((s) => COUNTRY_COORDS[s.country_code.toUpperCase()])
     .sort((a, b) => b.count - a.count)
@@ -76,18 +86,22 @@ export default function GlobeScreen() {
 
   return (
     <div className="h-full flex bg-canvas">
-      {/* Globe — bg-[#0a0f1e] must match the Globe backgroundColor prop so the
-          area outside the 420×420 canvas blends seamlessly with the space scene. */}
-      <div className="flex-1 flex items-center justify-center relative bg-[#0a0f1e]">
+      {/* Globe container — ResizeObserver measures this element so the canvas
+          tracks its actual pixel size rather than a hard-coded 420×420. The
+          bg-[#0a0f1e] must match the Globe backgroundColor prop so the area
+          outside the square canvas blends with the space scene. */}
+      <div
+        ref={containerRef}
+        className="flex-1 flex items-center justify-center relative bg-[#0a0f1e]"
+      >
         <Globe
           ref={globeRef}
-          width={420}
-          height={420}
+          width={globeSize}
+          height={globeSize}
           backgroundColor="#0a0f1e"
           globeImageUrl="/earth-day.jpg"
           atmosphereColor="#1e3a5f"
           atmosphereAltitude={0.12}
-          // Animated arcs flying from home to each threat country
           arcsData={arcs}
           arcStartLat="startLat"
           arcStartLng="startLng"
@@ -99,10 +113,10 @@ export default function GlobeScreen() {
           arcDashAnimateTime={1400}
           arcStroke={0.8}
           onArcHover={(arc) => {
-            if (arc) setTooltip({ country: (arc as ArcPoint).country, count: (arc as ArcPoint).count });
+            if (arc)
+              setTooltip({ country: (arc as ArcPoint).country, count: (arc as ArcPoint).count });
             else setTooltip(null);
           }}
-          // Home location marker
           pointsData={HOME_DOT}
           pointColor="color"
           pointRadius="size"
@@ -110,30 +124,31 @@ export default function GlobeScreen() {
           onGlobeReady={() => setReady(true)}
         />
 
-        {/* Tooltip */}
         {tooltip && (
-          <div className="absolute top-4 left-1/2 -translate-x-1/2
+          <div
+            className="absolute top-4 left-1/2 -translate-x-1/2
             bg-white shadow-card border border-black/[0.04]
-            rounded-xl px-3 py-2 text-navy text-sm font-medium pointer-events-none">
-            {tooltip.country} — {tooltip.count.toLocaleString()} {tooltip.count === 1 ? "event" : "events"}
+            rounded-xl px-3 py-2 text-navy text-sm font-medium pointer-events-none"
+          >
+            {tooltip.country} — {tooltip.count.toLocaleString()}{" "}
+            {tooltip.count === 1 ? "event" : "events"}
           </div>
         )}
       </div>
 
-      {/* Right panel — light card matching the rest of the app */}
+      {/* Right panel */}
       <div className="w-52 flex flex-col justify-center px-4 py-6 gap-4 border-l border-black/[0.04]">
         <div>
           <p className="text-[10px] font-semibold uppercase tracking-widest text-navy/30 mb-3">
             Threat Origins
           </p>
 
-          {error && (
-            <p className="text-xs text-navy/30">Couldn't load data.</p>
-          )}
+          {error && <p className="text-xs text-navy/30">Couldn't load data.</p>}
 
           {!error && ranked.length === 0 && (
             <p className="text-xs text-navy/30 leading-relaxed">
-              No geo-tagged threats yet. Country data appears once Synapse flags traffic to public IPs.
+              No geo-tagged threats yet. Country data appears once Synapse flags traffic to public
+              IPs.
             </p>
           )}
 

@@ -1,6 +1,22 @@
 # Implementation Status — Synapse IPS
 
-**Last verified:** 2026-08-02. Ground-truth ledger — if this file and the architecture doc disagree, this file wins.
+**Last verified:** 2026-08-07. Ground-truth ledger — if this file and the architecture doc disagree, this file wins.
+
+## Latest change (2026-08-07) — gateway detection fallback + last-known-good caching
+
+- **Root-cause diagnosis (H1/H2/H3) for 2026-08-06 gateway re-block.** First verdict at 18:31:58 against 172.18.22.1 (58s into session) proved gateway was never excluded from t=0. DB query confirmed CrossFlow+ProcessCorrelator composite ≥ 0.70 triggered the block at 20:16. Code review confirmed H1 (detection returned None at startup) was the root cause; H2 (refresh hadn't fired) was secondary; H3 (code divergence between startup and refresh paths) was ruled out — both call identical `build_cf_excluded()`. The remaining structural gap: when `detect_default_gateway()` returns `None` on every refresh tick, the live-refresh mechanism provides zero recovery and has no last-known-good fallback.
+
+- **`capture.rs`: `detect_gateway_via_rt_dump()` fallback.** When `NET_RT_FLAGS|RTF_GATEWAY` sysctl returns `needed == 0` (no RTF_GATEWAY routes — common on VPN networks where Pritunl replaces the default route with /1 interface routes lacking RTF_GATEWAY flag), `detect_default_gateway()` now falls back to `detect_gateway_via_rt_dump()`. The fallback uses `NET_RT_DUMP` (mib[4]=1, mib[5]=0) to obtain all IPv4 routes regardless of flags, then passes the buffer through the existing `rt_buf_find_gateway()` parser. Old code returned `None` immediately at `needed == 0` after logging "sysctl route size query failed" — a misleading message that fires on a successful sysctl call with no matching routes. The misleading log is now gated on `ret < 0` only; `needed == 0` emits a `debug!` and falls through to the RT_DUMP path.
+
+- **`main.rs`: `last_known_gw` in `own-ips-refresh` thread.** The refresh thread now initialises `let mut last_known_gw: Option<IpAddr> = gateway_ip` (seeded from startup detection) and only updates it when `detect_default_gateway()` returns `Some`. When detection returns `None`, `last_known_gw` is preserved and `effective_gw = new_gw.or(last_known_gw)` is used for `build_cf_excluded()`. This prevents the gateway from being silently dropped from `cf_excluded` during transient detection failures (e.g. VPN reconnect, routing table momentarily inconsistent). `log::debug!` emitted when fallback path is taken.
+
+## Latest change (2026-08-06) — CrossFlow per-PID keying + FlowBehavior UDP/443 false positive
+
+- **`detectors/cross_flow.rs`: per-PID connection counting.** `ip_stats: HashMap<IpAddr, IpFlowStats>` rekeyed to `HashMap<(u32, IpAddr), IpFlowStats>`. `record_connection()` and `get_stats()` now take `pid: u32` as first argument. The key change ensures connection-count thresholds apply per-process, not aggregate-all-PIDs. Before: browser with 5 tabs each making 45 connections to the same IP = 225 aggregate → CrossFlow fires. After: each tab/PID has 45 connections → 0 score. `capture.rs` call site updated: `state.record_connection(pid, remote_ip, info_pkt.protocol, remote_port)`. Two new regression tests: `test_many_pids_each_below_threshold_do_not_fire` (5 PIDs × 45 connections = 0 score) and `test_single_pid_above_threshold_fires_with_new_keying` (1 PID × 201 connections → score ≥ 0.9). `make_flow_with_pid()` helper added. All existing tests updated with `pid=0` argument.
+
+- **`detectors/flow_behavior.rs`: removed UDP/443 false-positive score.** `score_port_protocol_mismatch()` previously awarded 0.4 for `(protocol=17, dst_port=443)`. UDP/443 is QUIC/HTTP3 (RFC 9000), used by all modern browsers. Removing it eliminated false positives on every Brave/Chrome flow to Google/Microsoft CDNs.
+
+## Latest change (2026-08-05) — Dashboard: Settings screen
 
 ## Latest change (2026-08-02) — Schema V4: verdict deduplication (storage bug present since inception)
 

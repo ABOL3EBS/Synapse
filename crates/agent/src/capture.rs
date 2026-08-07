@@ -330,12 +330,21 @@ pub fn detect_default_gateway() -> Option<IpAddr> {
             0,
         )
     };
-    if ret < 0 || needed == 0 {
+    if ret < 0 {
         warn!(
             "sysctl route size query failed: {}",
             std::io::Error::last_os_error()
         );
         return None;
+    }
+    if needed == 0 {
+        // sysctl succeeded but no RTF_GATEWAY routes exist in the kernel's IPv4
+        // routing table. Common on VPN networks (e.g. Pritunl) that replace the
+        // default route with /1 interface routes lacking the RTF_GATEWAY flag.
+        // Fall back to NET_RT_DUMP which returns ALL routes regardless of flags,
+        // then parse the default route's gateway from that buffer.
+        debug!("no RTF_GATEWAY routes in routing table — falling back to RT_DUMP");
+        return detect_gateway_via_rt_dump();
     }
 
     // Second call: fill buffer. Kernel may return a slightly smaller value
@@ -360,21 +369,87 @@ pub fn detect_default_gateway() -> Option<IpAddr> {
     }
     buf.truncate(needed);
 
-    rt_buf_find_gateway(&buf)
+    rt_buf_find_gateway(&buf, true)
 }
 
-/// Walk a sysctl routing table buffer and return the gateway address from the
-/// true default route (dst = 0.0.0.0).
+/// Fallback gateway detection using NET_RT_DUMP when NET_RT_FLAGS|RTF_GATEWAY
+/// returns no entries. NET_RT_DUMP returns all routes regardless of flags, so
+/// it finds the default route even on VPN networks where the routing table
+/// lacks RTF_GATEWAY-flagged entries.
+pub(crate) fn detect_gateway_via_rt_dump() -> Option<IpAddr> {
+    const NET_RT_DUMP: libc::c_int = 1;
+    let mib: [libc::c_int; 6] = [
+        libc::CTL_NET,
+        libc::PF_ROUTE,
+        0,
+        libc::AF_INET,
+        NET_RT_DUMP,
+        0,
+    ];
+
+    let mut needed: libc::size_t = 0;
+    let ret = unsafe {
+        libc::sysctl(
+            mib.as_ptr() as *mut _,
+            6,
+            std::ptr::null_mut(),
+            &mut needed,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret < 0 || needed == 0 {
+        warn!(
+            "NET_RT_DUMP size query failed: {}",
+            std::io::Error::last_os_error()
+        );
+        return None;
+    }
+
+    let mut buf = vec![0u8; needed];
+    let ret = unsafe {
+        libc::sysctl(
+            mib.as_ptr() as *mut _,
+            6,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut needed,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret < 0 {
+        warn!(
+            "NET_RT_DUMP fill failed: {}",
+            std::io::Error::last_os_error()
+        );
+        return None;
+    }
+    buf.truncate(needed);
+
+    // require_gateway_flag=false: NET_RT_DUMP returns ALL routes regardless of
+    // flags. Routes lacking RTF_GATEWAY are still valid when that flag is absent
+    // from the entire routing table (e.g. Pritunl /1 interface routes). Interface
+    // routes use AF_LINK gateways which rt_msg_dst_and_gateway skips, so they are
+    // excluded naturally — no additional filter needed.
+    rt_buf_find_gateway(&buf, false)
+}
+
+/// Walk a routing table buffer and return the gateway for the default route.
 ///
-/// On macOS with VPN tunnels, more-specific VPN gateway routes (e.g. split-tunnel
-/// /1 routes) appear before the LAN default route in the kernel's dump. The old
-/// "first RTF_GATEWAY|RTF_UP wins" logic therefore returned the VPN gateway
-/// instead of the LAN gateway, so the LAN gateway was never added to
-/// CrossFlowState::excluded_ips and triggered false-positive DNS-burst alerts.
+/// `require_gateway_flag`:
+///   - `true` — only consider routes with `RTF_GATEWAY | RTF_UP` set.
+///     Used by the primary sysctl path (NET_RT_FLAGS|RTF_GATEWAY),
+///     which already pre-filters to gateway routes.
+///   - `false` — only require `RTF_UP`. Used by the RT_DUMP fallback path
+///     when `needed == 0` means no RTF_GATEWAY routes exist in the
+///     routing table (e.g. Pritunl VPN replaces the default with
+///     interface routes). Routes with AF_LINK (non-IP) gateways are
+///     skipped automatically by `rt_msg_dst_and_gateway`.
 ///
-/// Fix: prefer the entry whose RTA_DST is 0.0.0.0 (the true default). Fall back
-/// to the first non-loopback, non-unspecified gateway only if no such entry exists.
-fn rt_buf_find_gateway(buf: &[u8]) -> Option<IpAddr> {
+/// Prefer the entry whose RTA_DST is 0.0.0.0 (the true default). Fall back to
+/// the first qualifying non-loopback, non-unspecified gateway if no 0.0.0.0
+/// entry exists.
+fn rt_buf_find_gateway(buf: &[u8], require_gateway_flag: bool) -> Option<IpAddr> {
     let hdr_size = std::mem::size_of::<libc::rt_msghdr>();
     let mut offset = 0usize;
     let mut fallback: Option<IpAddr> = None;
@@ -388,14 +463,22 @@ fn rt_buf_find_gateway(buf: &[u8]) -> Option<IpAddr> {
             break;
         }
 
-        if rtm.rtm_flags & (libc::RTF_GATEWAY | libc::RTF_UP) == (libc::RTF_GATEWAY | libc::RTF_UP)
-        {
+        let required = if require_gateway_flag {
+            libc::RTF_GATEWAY | libc::RTF_UP
+        } else {
+            libc::RTF_UP
+        };
+        if rtm.rtm_flags & required == required {
             let msg = &buf[offset..offset + msg_len];
             if let Some((dst, gw)) = rt_msg_dst_and_gateway(msg, &rtm) {
                 if !gw.is_loopback() && !gw.is_unspecified() {
                     if dst.is_unspecified() {
-                        // Exact match: this is the 0.0.0.0 default route.
-                        debug!("detected default gateway via sysctl: {gw}");
+                        let via = if require_gateway_flag {
+                            "sysctl"
+                        } else {
+                            "RT_DUMP"
+                        };
+                        debug!("detected default gateway via {via}: {gw}");
                         return Some(gw);
                     }
                     if fallback.is_none() {
@@ -408,7 +491,12 @@ fn rt_buf_find_gateway(buf: &[u8]) -> Option<IpAddr> {
     }
 
     if let Some(gw) = fallback {
-        debug!("detected default gateway via sysctl (fallback): {gw}");
+        let via = if require_gateway_flag {
+            "sysctl"
+        } else {
+            "RT_DUMP"
+        };
+        debug!("detected default gateway via {via} (fallback): {gw}");
         return Some(gw);
     }
     warn!("could not detect default gateway from routing table");
@@ -1160,7 +1248,7 @@ impl CaptureEngine {
                         current_local_ip,
                     );
                     if let Ok(mut state) = self.cross_flow_state.lock() {
-                        state.record_connection(remote_ip, info_pkt.protocol, remote_port);
+                        state.record_connection(pid, remote_ip, info_pkt.protocol, remote_port);
                         if pid != 0 {
                             state.record_pid_connection(pid, remote_ip);
                         }
@@ -1731,7 +1819,7 @@ mod tests {
             lan_gw,
         ));
 
-        let result = rt_buf_find_gateway(&buf);
+        let result = rt_buf_find_gateway(&buf, true);
         assert_eq!(
             result,
             Some(IpAddr::V4(lan_gw)),
@@ -1746,12 +1834,59 @@ mod tests {
         let flags = libc::RTF_GATEWAY | libc::RTF_UP;
         let buf = make_route_entry(flags, std::net::Ipv4Addr::new(8, 8, 8, 0), only_gw);
 
-        let result = rt_buf_find_gateway(&buf);
+        let result = rt_buf_find_gateway(&buf, true);
         assert_eq!(
             result,
             Some(IpAddr::V4(only_gw)),
             "fallback must return the only RTF_GATEWAY|RTF_UP entry when no 0.0.0.0 route exists"
         );
+    }
+
+    #[test]
+    fn test_rt_buf_find_gateway_no_rtf_gateway_flag_still_finds_default_route() {
+        // Simulate the Aug 6 2026 Pritunl VPN failure: the routing table has a
+        // default route entry (dst=0.0.0.0 → gateway=172.18.22.1) but WITHOUT
+        // RTF_GATEWAY set. The NET_RT_FLAGS|RTF_GATEWAY sysctl would return
+        // needed == 0, so this buffer comes from the NET_RT_DUMP fallback path
+        // which only requires RTF_UP.
+        //
+        // Verifies that rt_buf_find_gateway(&buf, false) finds the gateway even
+        // when RTF_GATEWAY is absent — which is the specific condition that caused
+        // the 1h45m block in incident #4.
+        let lan_gw = std::net::Ipv4Addr::new(172, 18, 22, 1);
+        // RTF_UP only — no RTF_GATEWAY — models VPN-modified routing table
+        let flags = libc::RTF_UP;
+        let buf = make_route_entry(flags, std::net::Ipv4Addr::UNSPECIFIED, lan_gw);
+
+        let result = rt_buf_find_gateway(&buf, false);
+        assert_eq!(
+            result,
+            Some(IpAddr::V4(lan_gw)),
+            "RT_DUMP fallback must find gateway even when RTF_GATEWAY flag is absent"
+        );
+
+        // Confirm that the strict path (require_gateway_flag=true) does NOT find it,
+        // which is exactly why the primary detection returns None on this routing table.
+        let strict_result = rt_buf_find_gateway(&buf, true);
+        assert_eq!(
+            strict_result, None,
+            "primary path must NOT find a route without RTF_GATEWAY (proves why detection failed)"
+        );
+    }
+
+    #[test]
+    fn test_detect_gateway_via_rt_dump_returns_valid_ip_on_connected_host() {
+        // Live test: call detect_gateway_via_rt_dump() against the actual routing
+        // table. On any machine with a working network connection this must succeed,
+        // regardless of whether the primary RTF_GATEWAY sysctl would also succeed.
+        let gw = detect_gateway_via_rt_dump();
+        assert!(
+            gw.is_some(),
+            "RT_DUMP fallback must find a gateway on any connected host"
+        );
+        let ip = gw.unwrap();
+        assert!(!ip.is_unspecified(), "gateway must not be 0.0.0.0");
+        assert!(!ip.is_loopback(), "gateway must not be loopback");
     }
 
     #[test]

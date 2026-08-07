@@ -81,10 +81,11 @@ impl FlowBehavior {
     }
 
     fn score_port_protocol_mismatch(protocol: u8, dst_port: u16) -> f32 {
-        // Heuristic: protocol 6 (TCP) to port 53, or protocol 17 (UDP) to port 443.
         match (protocol, dst_port) {
-            (6, 53) => 0.3,   // TCP DNS — unusual but valid
-            (17, 443) => 0.4, // UDP to HTTPS port — suspicious
+            (6, 53) => 0.3, // TCP DNS — unusual but valid
+            // (17, 443) removed: UDP/443 is QUIC/HTTP3 (RFC 9000), used by all
+            // modern browsers. Flagging it 0.4 produced false positives on every
+            // Brave/Chrome flow to Google/Microsoft CDNs alongside a CrossFlow hit.
             _ => 0.0,
         }
     }

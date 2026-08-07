@@ -52,52 +52,57 @@ export default function StatsScreen() {
   }
 
   return (
-    <div className="h-full flex flex-col px-7 pt-7 pb-5 overflow-y-auto scroll-area">
-      <header className="shrink-0 mb-5">
-        <h2 className="text-xl font-bold text-navy tracking-tight">Threat Report</h2>
-        <p className="text-xs text-navy/40 mt-0.5">What Synapse has stopped for you</p>
-      </header>
+    /* Outer: scrollable viewport, no padding (padding lives on the inner centred wrapper). */
+    <div className="h-full overflow-y-auto scroll-area">
+      {/* max-w-4xl centres content up to 896 px; beyond that the side padding grows. */}
+      <div className="max-w-4xl mx-auto px-7 pt-7 pb-5 flex flex-col min-h-full">
+        <header className="shrink-0 mb-5">
+          <h2 className="text-xl font-bold text-navy tracking-tight">Threat Report</h2>
+          <p className="text-xs text-navy/40 mt-0.5">What Synapse has stopped for you</p>
+        </header>
 
-      {/* Stat cards */}
-      <div className="grid grid-cols-3 gap-3 shrink-0">
-        {loading ? (
-          <>
-            <SkeletonCard />
-            <SkeletonCard />
-            <SkeletonCard />
-          </>
-        ) : (
-          <>
-            <StatCard
-              label={
-                stats?.blocks_today === 0 && (stats?.blocks_week ?? 0) > 0
-                  ? "All quiet today"
-                  : "Stopped today"
-              }
-              value={stats?.blocks_today ?? 0}
-              accent="emerald"
-            />
-            <StatCard label="This week" value={stats?.blocks_week ?? 0} accent="emerald" />
-            <StatCard label="Blocked IPs" value={stats?.blocked_addresses ?? 0} accent="navy" />
-          </>
-        )}
-      </div>
+        {/* Stat cards — grid fills up to max-w-4xl, never stretches wider */}
+        <div className="grid grid-cols-3 gap-3 shrink-0">
+          {loading ? (
+            <>
+              <SkeletonCard />
+              <SkeletonCard />
+              <SkeletonCard />
+            </>
+          ) : (
+            <>
+              <StatCard
+                label={
+                  stats?.blocks_today === 0 && (stats?.blocks_week ?? 0) > 0
+                    ? "All quiet today"
+                    : "Stopped today"
+                }
+                value={stats?.blocks_today ?? 0}
+                accent="emerald"
+              />
+              <StatCard label="This week" value={stats?.blocks_week ?? 0} accent="emerald" />
+              <StatCard label="Blocked IPs" value={stats?.blocked_addresses ?? 0} accent="navy" />
+            </>
+          )}
+        </div>
 
-      {/* Activity timeline */}
-      <Section title="Activity · last 24 h">
-        <Sparkline points={chart} />
-      </Section>
+        {/* Activity timeline */}
+        <Section title="Activity · last 24 h">
+          <Sparkline points={chart} />
+        </Section>
 
-      {/* Two-column lower section */}
-      <div className="flex gap-4 mt-4 flex-1 min-h-0">
-        <Panel title="Detection breakdown" className="flex-1">
-          <DetectorChart stats={detectors} />
-          {detectors.length === 0 && <Empty text="No findings yet" />}
-        </Panel>
-        <Panel title="Flagged apps" className="flex-1">
-          <TopApps apps={topApps} />
-          {topApps.length === 0 && <Empty text="No apps flagged yet" />}
-        </Panel>
+        {/* Two-column lower section — fixed min-height, NOT flex-1, so the panels
+            don't grow into empty whitespace when the window is tall. */}
+        <div className="flex gap-4 mt-4 shrink-0">
+          <Panel title="Detection breakdown" className="flex-1 min-h-[240px]">
+            <DetectorChart stats={detectors} />
+            {detectors.length === 0 && <Empty text="No findings yet" />}
+          </Panel>
+          <Panel title="Flagged apps" className="flex-1 min-h-[240px]">
+            <TopApps apps={topApps} />
+            {topApps.length === 0 && <Empty text="No apps flagged yet" />}
+          </Panel>
+        </div>
       </div>
     </div>
   );

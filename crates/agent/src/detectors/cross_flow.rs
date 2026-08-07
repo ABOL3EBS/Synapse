@@ -47,6 +47,11 @@ impl Default for CrossFlowConfig {
     fn default() -> Self {
         Self {
             window_secs: 60,
+            // 200/100: these thresholds apply per-(pid, remote_ip) — not the old
+            // aggregate-all-PIDs counter. A single process making >200 connections
+            // to one IP in 60s is genuinely anomalous; 20 browser tabs each making
+            // 10 connections increments 20 separate (pid, ip) entries, none of
+            // which crosses 200. Port scans operate in the thousands/min range.
             scan_connection_threshold_high: 200,
             scan_connection_threshold_medium: 100,
             dns_burst_threshold_high: 80,
@@ -78,7 +83,13 @@ struct IpFlowStats {
 }
 
 pub struct CrossFlowState {
-    ip_stats: HashMap<IpAddr, IpFlowStats>,
+    // Key: (pid, remote_ip). Keying by (pid, IpAddr) rather than IpAddr alone
+    // ensures the scan-connection counter measures one *process*'s connection
+    // rate to one IP — not the aggregate of every PID on the machine. The old
+    // IpAddr-only key meant 20 browser tabs × 10 connections each = 200 against
+    // the same AWS endpoint, identical signal to 1 malicious process × 200.
+    // pid=0 is the sentinel for flows where PID attribution failed at BPF time.
+    ip_stats: HashMap<(u32, IpAddr), IpFlowStats>,
     // Per-(remote_ip, remote_port, protocol) arrival timestamps for beaconing.
     beacon_history: HashMap<(IpAddr, u16, u8), VecDeque<Instant>>,
     // Per-PID remote IP history for connection-diversity.
@@ -114,7 +125,14 @@ impl CrossFlowState {
 
     // Called for every new flow (not per-packet). remote_port is the
     // direction-resolved port of the remote endpoint, not info_pkt.dst_port.
-    pub fn record_connection(&mut self, remote_ip: IpAddr, protocol: u8, remote_port: u16) {
+    // pid=0 is the sentinel for flows where PID attribution failed at BPF time.
+    pub fn record_connection(
+        &mut self,
+        pid: u32,
+        remote_ip: IpAddr,
+        protocol: u8,
+        remote_port: u16,
+    ) {
         if self.is_excluded(remote_ip) {
             log::debug!(
                 "CrossFlow: dst={}:{} proto={} EXCLUDED (gateway/own-ip/api-endpoint/broadcast/multicast)",
@@ -125,11 +143,14 @@ impl CrossFlowState {
             return;
         }
         let now = Instant::now();
-        let stats = self.ip_stats.entry(remote_ip).or_insert(IpFlowStats {
-            connection_count: 0,
-            dns_query_count: 0,
-            last_seen: now,
-        });
+        let stats = self
+            .ip_stats
+            .entry((pid, remote_ip))
+            .or_insert(IpFlowStats {
+                connection_count: 0,
+                dns_query_count: 0,
+                last_seen: now,
+            });
         stats.connection_count = stats.connection_count.saturating_add(1);
         stats.last_seen = now;
         // remote_port is already direction-resolved so port==53 means remote DNS.
@@ -168,7 +189,7 @@ impl CrossFlowState {
         let scan_cutoff = now - Duration::from_secs(self.config.window_secs);
         let pid_cutoff = now - Duration::from_secs(self.config.pid_diversity_window_secs);
 
-        self.ip_stats.retain(|_, s| s.last_seen >= scan_cutoff);
+        self.ip_stats.retain(|_, s| s.last_seen >= scan_cutoff); // key is (pid, IpAddr)
 
         self.beacon_history.retain(|_, deque| {
             while deque.front().is_some_and(|t| *t < scan_cutoff) {
@@ -185,9 +206,9 @@ impl CrossFlowState {
         });
     }
 
-    pub fn get_stats(&self, ip: &IpAddr) -> Option<(u64, u64)> {
+    pub fn get_stats(&self, pid: u32, ip: &IpAddr) -> Option<(u64, u64)> {
         self.ip_stats
-            .get(ip)
+            .get(&(pid, *ip))
             .map(|s| (s.connection_count, s.dns_query_count))
     }
 
@@ -408,13 +429,16 @@ impl CrossFlowDetector {
         if !b_ok {
             log::debug!("CrossFlow eval: b_ip={} EXCLUDED", flow.b_ip);
         }
+        // Use the flow's PID for the per-(pid, ip) lookup so the scan counter
+        // reflects this process's connection rate, not all processes combined.
+        let pid = flow.pid.unwrap_or(0);
         let stats_a = if a_ok {
-            state.get_stats(&flow.a_ip)
+            state.get_stats(pid, &flow.a_ip)
         } else {
             None
         };
         let stats_b = if b_ok {
-            state.get_stats(&flow.b_ip)
+            state.get_stats(pid, &flow.b_ip)
         } else {
             None
         };
@@ -579,7 +603,9 @@ mod tests {
             b_port: 443,
             protocol: 6,
             local_port: 50000,
-            pid: Some(42),
+            // pid: None → evaluate() uses unwrap_or(0) sentinel, matching test
+            // record_connection calls which also use pid=0.
+            pid: None,
             packet_count: 10,
             byte_count: 5000,
             dns_name: None,
@@ -594,6 +620,106 @@ mod tests {
 
     fn default_state() -> CrossFlowState {
         CrossFlowState::new(CrossFlowConfig::default(), live_excluded([]))
+    }
+
+    fn make_flow_with_pid(a_ip: IpAddr, b_ip: IpAddr, pid: u32) -> FlowRecord {
+        FlowRecord {
+            pid: Some(pid),
+            ..make_flow(a_ip, b_ip)
+        }
+    }
+
+    // ── Per-PID keying regression tests ─────────────────────────────────────
+    //
+    // These two tests prove the specific false-positive class closed by
+    // changing ip_stats from HashMap<IpAddr, _> to HashMap<(u32, IpAddr), _>.
+    //
+    // Scenario that triggered repeated false-positive waves:
+    //   • Chrome/Brave window with 20 tabs to AWS CDN endpoints
+    //   • Each tab's helper process (distinct PID) makes ~10 connections/min
+    //   • Aggregate to same remote IP = ~200 — old code crossed threshold
+    //   • Each individual PID only made ~10 — obviously not a scanner
+    //
+    // The two tests bracket the fix: the negative case proves the old
+    // false-positive path is eliminated; the positive case proves a real
+    // single-process scan still fires exactly as expected.
+
+    #[test]
+    fn test_many_pids_each_below_threshold_do_not_fire() {
+        // Mirrors the actual incident pattern:
+        //   • Brave Browser opens 5 renderer/helper processes to an AWS CDN
+        //   • Each process makes ~45 connections in 60s (normal page-load + keep-alives)
+        //   • Old IpAddr-keyed code: aggregate = 5 × 45 = 225 → crosses high threshold
+        //     (200) → autonomous Block of legitimate CDN IP
+        //   • New (pid, IpAddr)-keyed code: each PID counter = 45, which is below
+        //     the medium threshold (100) → score = 0 for every process
+        //
+        // This test fails against the old code and passes against the new code.
+        // Numbers are derived from the actual incident (201-204 connections total
+        // spread across multiple Brave Helper processes, all to AWS/Microsoft ranges).
+        let state = Arc::new(Mutex::new(default_state()));
+        let remote: IpAddr = IpAddr::V4(Ipv4Addr::new(13, 107, 6, 152)); // CDN representative
+        let local: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5));
+        let pids: [u32; 5] = [8001, 8002, 8003, 8004, 8005]; // 5 Brave renderer/helper processes
+
+        for &pid in &pids {
+            for _ in 0..45 {
+                state.lock().unwrap().record_connection(pid, remote, 6, 443);
+            }
+        }
+        // Total connections to remote IP = 225 → would have fired (>200) under old code.
+        // Each individual PID = 45 → below medium threshold (100) under new code.
+
+        let detector = CrossFlowDetector::new(Arc::clone(&state));
+
+        for &pid in &pids {
+            let flow = make_flow_with_pid(remote, local, pid);
+            let finding = detector.evaluate(&flow);
+            assert_eq!(
+                finding.score, 0.0,
+                "pid={pid}: 45 connections from one process must not fire \
+                 (per-PID count 45 < medium threshold 100); \
+                 old aggregate-all-PIDs code produced 225 total and Blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn test_single_pid_above_threshold_fires_with_new_keying() {
+        // Positive case: one PID makes 201 connections to one IP.
+        // Proves the structural fix did NOT widen the gap on the attack side —
+        // a real port-scanner or C2 beacon still crosses the threshold.
+        let state = Arc::new(Mutex::new(default_state()));
+        let remote: IpAddr = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)); // RFC 5737 test
+        let local: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5));
+        let scanner_pid: u32 = 31337;
+
+        for _ in 0..201 {
+            state
+                .lock()
+                .unwrap()
+                .record_connection(scanner_pid, remote, 6, 443);
+        }
+
+        let detector = CrossFlowDetector::new(state);
+        let flow = make_flow_with_pid(remote, local, scanner_pid);
+        let finding = detector.evaluate(&flow);
+
+        assert!(
+            finding.score >= 0.9,
+            "single-PID scan (201 connections) must still score ≥0.9 after per-PID rekey, \
+             got {:.3}",
+            finding.score
+        );
+        assert!(
+            finding.confidence >= 0.9,
+            "confidence must be ≥0.9, got {:.3}",
+            finding.confidence
+        );
+        assert!(
+            !finding.evidence.is_empty(),
+            "evidence must be populated for a genuine scan finding"
+        );
     }
 
     // ── Existing scan / DNS-burst tests ─────────────────────────────────────
@@ -616,7 +742,7 @@ mod tests {
         let state = Arc::new(Mutex::new(default_state()));
         let remote: IpAddr = IpAddr::V4(Ipv4Addr::new(52, 73, 240, 202));
         for _ in 0..201 {
-            state.lock().unwrap().record_connection(remote, 6, 443);
+            state.lock().unwrap().record_connection(0, remote, 6, 443);
         }
         let detector = CrossFlowDetector::new(state);
         let flow = make_flow(remote, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)));
@@ -631,7 +757,7 @@ mod tests {
         let state = Arc::new(Mutex::new(default_state()));
         let remote: IpAddr = IpAddr::V4(Ipv4Addr::new(52, 73, 240, 202));
         for _ in 0..150 {
-            state.lock().unwrap().record_connection(remote, 6, 443);
+            state.lock().unwrap().record_connection(0, remote, 6, 443);
         }
         let detector = CrossFlowDetector::new(state);
         let flow = make_flow(remote, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)));
@@ -645,7 +771,7 @@ mod tests {
         let state = Arc::new(Mutex::new(default_state()));
         let remote: IpAddr = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
         for _ in 0..85 {
-            state.lock().unwrap().record_connection(remote, 17, 53);
+            state.lock().unwrap().record_connection(0, remote, 17, 53);
         }
         let detector = CrossFlowDetector::new(state);
         let flow = make_flow(remote, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)));
@@ -665,7 +791,7 @@ mod tests {
             live_excluded([gateway]),
         )));
         for _ in 0..250 {
-            state.lock().unwrap().record_connection(gateway, 6, 443);
+            state.lock().unwrap().record_connection(0, gateway, 6, 443);
         }
         let detector = CrossFlowDetector::new(state);
         let flow = make_flow(gateway, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)));
@@ -686,7 +812,7 @@ mod tests {
             live_excluded([gateway]),
         )));
         for _ in 0..250 {
-            state.lock().unwrap().record_connection(lan_host, 6, 445);
+            state.lock().unwrap().record_connection(0, lan_host, 6, 445);
         }
         let detector = CrossFlowDetector::new(state);
         let flow = make_flow(lan_host, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)));
@@ -706,7 +832,7 @@ mod tests {
             state
                 .lock()
                 .unwrap()
-                .record_connection(mdns_multicast, 17, 5353);
+                .record_connection(0, mdns_multicast, 17, 5353);
         }
         let detector = CrossFlowDetector::new(state);
         let flow = make_flow(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 43)), mdns_multicast);
@@ -728,7 +854,7 @@ mod tests {
             state
                 .lock()
                 .unwrap()
-                .record_connection(subnet_bcast, 17, 137);
+                .record_connection(0, subnet_bcast, 17, 137);
         }
         let detector = CrossFlowDetector::new(state);
         let flow = make_flow(IpAddr::V4(Ipv4Addr::new(172, 18, 22, 43)), subnet_bcast);
@@ -744,7 +870,7 @@ mod tests {
         let state = Arc::new(Mutex::new(default_state()));
         let remote: IpAddr = IpAddr::V4(Ipv4Addr::new(52, 73, 240, 202));
         for _ in 0..250 {
-            state.lock().unwrap().record_connection(remote, 6, 443);
+            state.lock().unwrap().record_connection(0, remote, 6, 443);
         }
         let detector = CrossFlowDetector::new(state);
         let flow = make_flow(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), remote);
@@ -850,8 +976,8 @@ mod tests {
         let bcast: IpAddr = IpAddr::V4(Ipv4Addr::BROADCAST);
         let mcast: IpAddr = IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1));
         for _ in 0..20 {
-            state.record_connection(bcast, 17, 9999);
-            state.record_connection(mcast, 17, 9998);
+            state.record_connection(0, bcast, 17, 9999);
+            state.record_connection(0, mcast, 17, 9998);
         }
         assert!(
             state.get_beacon_history(bcast, 9999, 17).is_none(),
@@ -1054,12 +1180,12 @@ mod tests {
             crate::capture::determine_remote_endpoint(remote, remote_ephemeral, local, 53, local);
 
         let mut state = default_state();
-        state.record_connection(r_ip, 17 /* UDP */, r_port);
+        state.record_connection(0, r_ip, 17 /* UDP */, r_port);
 
         // Connection count increments (a connection did happen).
         // DNS count must NOT increment (r_port != 53 — this was the bug).
         assert_eq!(
-            state.get_stats(&remote),
+            state.get_stats(0, &remote),
             Some((1, 0)),
             "inbound to local:53: dns_query_count must be 0 \
              (was 1 before the remote_port direction fix)"
@@ -1077,10 +1203,10 @@ mod tests {
             crate::capture::determine_remote_endpoint(local, 55000, remote, 53, local);
 
         let mut state = default_state();
-        state.record_connection(r_ip, 17, r_port);
+        state.record_connection(0, r_ip, 17, r_port);
 
         assert_eq!(
-            state.get_stats(&remote),
+            state.get_stats(0, &remote),
             Some((1, 1)),
             "outbound DNS query: dns_query_count must be 1"
         );
@@ -1101,7 +1227,7 @@ mod tests {
         for local_eph in [60000_u16, 60001, 60002, 60003, 60004] {
             let (r_ip, r_port) =
                 crate::capture::determine_remote_endpoint(c2, 443, local, local_eph, local);
-            state.record_connection(r_ip, 6 /* TCP */, r_port);
+            state.record_connection(0, r_ip, 6 /* TCP */, r_port);
         }
 
         // All 5 must be under the single key (c2, 443, TCP) — the remote port.
@@ -1144,7 +1270,7 @@ mod tests {
 
         // Drive enough connections to trigger scan detection.
         for _ in 0..250 {
-            state.lock().unwrap().record_connection(target, 6, 443);
+            state.lock().unwrap().record_connection(0, target, 6, 443);
         }
         let detector = CrossFlowDetector::new(state);
         let flow = make_flow(target, local);

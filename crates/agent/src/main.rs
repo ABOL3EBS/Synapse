@@ -210,6 +210,14 @@ fn main() -> io::Result<()> {
         let own_ips_cache = own_ips.clone();
         let cf_excluded_cache = cf_excluded.clone();
         let refresh_secs = cfg.local_ip_refresh_secs();
+        // Seed last_known_gw from startup detection so the refresh thread
+        // never silently drops the gateway when detection transiently fails
+        // (e.g. VPN reconnect causes needed == 0 for one or two ticks).
+        let mut last_known_gw: Option<IpAddr> = gateway_ip;
+        // Count consecutive ticks where detection returned None and we fell back.
+        // Surfaced as warn! so persistent detection failures (not just transient ones)
+        // remain visible — the Aug 6 incident was silent for 1h45m before triggering.
+        let mut consecutive_detect_failures: u32 = 0;
         std::thread::Builder::new()
             .name("own-ips-refresh".into())
             .spawn(move || loop {
@@ -218,7 +226,49 @@ fn main() -> io::Result<()> {
                 // Rebuild CrossFlow exclusion set every tick: gateway may have
                 // changed (network switch) even when own IPs are unchanged.
                 let new_gw = capture::detect_default_gateway();
-                let new_cf = build_cf_excluded(&new_own, new_gw);
+                if new_gw.is_some() {
+                    if consecutive_detect_failures > 0 {
+                        info!(
+                            "own-ips-refresh: gateway detection recovered after \
+                             {} consecutive failures — new gateway: {:?}",
+                            consecutive_detect_failures, new_gw
+                        );
+                    }
+                    last_known_gw = new_gw;
+                    consecutive_detect_failures = 0;
+                } else if last_known_gw.is_some() {
+                    // Detection failed — preserve last successful value.
+                    // This prevents the gateway from dropping out of cf_excluded
+                    // during transient failures (VPN reconnect, split routing).
+                    consecutive_detect_failures += 1;
+                    // Warn at 1 minute, then every 5 minutes — keeps persistent
+                    // detection failures visible without log spam.
+                    let warn_ticks = 60u64 / refresh_secs.max(1);
+                    let warn_period = 5 * 60u64 / refresh_secs.max(1);
+                    let n = consecutive_detect_failures as u64;
+                    if n == warn_ticks
+                        || (n > warn_ticks && (n - warn_ticks).is_multiple_of(warn_period))
+                    {
+                        warn!(
+                            "own-ips-refresh: gateway detection has failed {} consecutive \
+                             ticks (~{}s) — running on last known gateway {:?}. \
+                             Detection may be persistently broken on this network \
+                             (e.g. VPN routing table has no RTF_GATEWAY routes).",
+                            consecutive_detect_failures,
+                            consecutive_detect_failures as u64 * refresh_secs,
+                            last_known_gw
+                        );
+                    } else {
+                        log::debug!(
+                            "own-ips-refresh: gateway detection returned None — \
+                             preserving last known: {:?} (consecutive failures: {})",
+                            last_known_gw,
+                            consecutive_detect_failures
+                        );
+                    }
+                }
+                let effective_gw = new_gw.or(last_known_gw);
+                let new_cf = build_cf_excluded(&new_own, effective_gw);
                 let current = own_ips_cache.load();
                 if **current != new_own {
                     info!("own IPs refreshed: {} addresses", new_own.len());
@@ -227,8 +277,8 @@ fn main() -> io::Result<()> {
                 }
                 cf_excluded_cache.store(Arc::new(new_cf));
                 log::debug!(
-                    "own-ips-refresh tick: cf_excluded updated (gateway={:?})",
-                    new_gw
+                    "own-ips-refresh tick: cf_excluded updated (effective_gateway={:?})",
+                    effective_gw
                 );
             })
             .map_err(|e| io::Error::other(format!("spawn own-ips-refresh: {e}")))?;

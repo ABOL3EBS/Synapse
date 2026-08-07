@@ -24,7 +24,13 @@ pub fn open_write_db() -> Option<Connection> {
     }
     Connection::open(&path)
         .inspect(|conn| {
-            let _ = conn.execute_batch("PRAGMA journal_mode = WAL;");
+            // WAL: allow concurrent agent reads/writes without SQLITE_BUSY.
+            // busy_timeout: retry writes for up to 5s if the agent holds the
+            // write lock momentarily — default is 0 (fail immediately).
+            let _ = conn.execute_batch(
+                "PRAGMA journal_mode = WAL;\
+                 PRAGMA busy_timeout  = 5000;",
+            );
         })
         .ok()
 }

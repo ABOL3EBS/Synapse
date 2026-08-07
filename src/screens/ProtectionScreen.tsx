@@ -41,7 +41,10 @@ export default function ProtectionScreen() {
       : "No threats found this week. All clear.";
 
   return (
-    <div className="h-full flex">
+    /* Outer centres the constrained inner panel horizontally and vertically. */
+    <div className="h-full flex items-center justify-center">
+      {/* max-w-3xl caps each half at ~384 px — comfortable at default and wide sizes. */}
+      <div className="w-full max-w-3xl h-full flex">
       {/* Left — shield hero */}
       <div className="flex-1 flex flex-col items-center justify-center gap-6 px-10">
         <div className={`transition-opacity duration-300 ${shieldState === "inactive" ? "opacity-30 grayscale" : shieldState === "warning" ? "opacity-70" : "opacity-100"}`}>
@@ -93,6 +96,7 @@ export default function ProtectionScreen() {
             </p>
           </div>
         )}
+      </div>
       </div>
     </div>
   );

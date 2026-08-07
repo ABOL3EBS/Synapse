@@ -13,9 +13,11 @@
     "windows": [
       {
         "title": "Synapse",
-        "width": 860,
-        "height": 560,
-        "resizable": false,
+        "width": 960,
+        "height": 640,
+        "minWidth": 900,
+        "minHeight": 620,
+        "resizable": true,
         "decorations": true,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true
