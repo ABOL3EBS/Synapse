@@ -63,17 +63,17 @@ export default function SettingsScreen() {
 
   return (
     <div className="h-full overflow-y-auto scroll-area">
-      {/* Responsive max-width wrapper — same stepping as Stats/Report. */}
-      <div className="max-w-4xl xl:max-w-6xl 2xl:max-w-7xl mx-auto px-6 py-5 space-y-6">
-      {/* Active Blocks */}
-      <section>
+      {/* flex-col + min-h-full: fills the viewport; Active Blocks grows to consume remaining space. */}
+      <div className="max-w-4xl xl:max-w-6xl 2xl:max-w-7xl mx-auto px-6 py-5 flex flex-col gap-6 min-h-full">
+      {/* Active Blocks — flex-1 so it expands to fill space left by the two fixed sections below. */}
+      <section className="flex flex-col flex-1 min-h-[120px]">
         <p className="text-[10px] font-semibold uppercase tracking-widest text-navy/30 mb-3">
           Active Blocks
         </p>
-        <div className="rounded-2xl border border-black/[0.04] bg-white divide-y divide-black/[0.04] overflow-hidden">
+        <div className="rounded-2xl border border-black/[0.04] bg-white divide-y divide-black/[0.04] overflow-hidden flex-1 flex flex-col">
           {blocks.length === 0 ? (
-            <div className="px-4 py-4 text-sm text-navy/40 text-center">
-              No active blocks
+            <div className="flex-1 flex items-center justify-center">
+              <span className="text-sm text-navy/40">No active blocks</span>
             </div>
           ) : (
             blocks.map((block) => (
