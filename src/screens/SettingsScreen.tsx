@@ -62,7 +62,9 @@ export default function SettingsScreen() {
   };
 
   return (
-    <div className="h-full overflow-y-auto scroll-area px-6 py-5 space-y-6">
+    <div className="h-full overflow-y-auto scroll-area">
+      {/* Responsive max-width wrapper — same stepping as Stats/Report. */}
+      <div className="max-w-4xl xl:max-w-6xl 2xl:max-w-7xl mx-auto px-6 py-5 space-y-6">
       {/* Active Blocks */}
       <section>
         <p className="text-[10px] font-semibold uppercase tracking-widest text-navy/30 mb-3">
@@ -130,6 +132,7 @@ export default function SettingsScreen() {
           Additional exclusions can be added via <code className="font-mono">synapse.toml</code>.
         </p>
       </section>
+      </div>
     </div>
   );
 }

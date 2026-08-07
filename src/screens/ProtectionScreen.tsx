@@ -43,8 +43,8 @@ export default function ProtectionScreen() {
   return (
     /* Outer centres the constrained inner panel horizontally and vertically. */
     <div className="h-full flex items-center justify-center">
-      {/* max-w-3xl caps each half at ~384 px — comfortable at default and wide sizes. */}
-      <div className="w-full max-w-3xl h-full flex">
+      {/* Responsive max-width: wider at large windows so the two-column layout doesn't look narrow. */}
+      <div className="w-full max-w-4xl xl:max-w-5xl 2xl:max-w-6xl flex">
       {/* Left — shield hero */}
       <div className="flex-1 flex flex-col items-center justify-center gap-6 px-10">
         <div className={`transition-opacity duration-300 ${shieldState === "inactive" ? "opacity-30 grayscale" : shieldState === "warning" ? "opacity-70" : "opacity-100"}`}>

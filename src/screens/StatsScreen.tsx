@@ -54,8 +54,8 @@ export default function StatsScreen() {
   return (
     /* Outer: scrollable viewport, no padding (padding lives on the inner centred wrapper). */
     <div className="h-full overflow-y-auto scroll-area">
-      {/* max-w-4xl centres content up to 896 px; beyond that the side padding grows. */}
-      <div className="max-w-4xl mx-auto px-7 pt-7 pb-5 flex flex-col min-h-full">
+      {/* Responsive max-width: grows with the window rather than staying fixed at 896 px. */}
+      <div className="max-w-4xl xl:max-w-6xl 2xl:max-w-7xl mx-auto px-7 pt-7 pb-5 flex flex-col min-h-full">
         <header className="shrink-0 mb-5">
           <h2 className="text-xl font-bold text-navy tracking-tight">Threat Report</h2>
           <p className="text-xs text-navy/40 mt-0.5">What Synapse has stopped for you</p>
@@ -91,9 +91,8 @@ export default function StatsScreen() {
           <Sparkline points={chart} />
         </Section>
 
-        {/* Two-column lower section — fixed min-height, NOT flex-1, so the panels
-            don't grow into empty whitespace when the window is tall. */}
-        <div className="flex gap-4 mt-4 shrink-0">
+        {/* Two-column lower section — grows to fill remaining vertical space. */}
+        <div className="flex gap-4 mt-4 flex-1">
           <Panel title="Detection breakdown" className="flex-1 min-h-[240px]">
             <DetectorChart stats={detectors} />
             {detectors.length === 0 && <Empty text="No findings yet" />}
