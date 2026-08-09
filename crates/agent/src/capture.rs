@@ -628,6 +628,141 @@ pub fn detect_own_ips() -> HashSet<IpAddr> {
     ips
 }
 
+/// Detect gateway IPs reachable via VPN tunnel interfaces (utun*, ppp*, tun*).
+///
+/// On Pritunl/OpenVPN, the physical router keeps the actual `default` routing
+/// entry (e.g. 192.168.0.1 via en0). The VPN server endpoint only appears as
+/// the RTA_GATEWAY field in /1-split or subnet routes via the tunnel interface:
+///
+///   0/1      192.168.10.1  UGScg  utun6
+///   128.0/1  192.168.10.1  UGSc   utun6
+///
+/// This function reads RTA_GATEWAY from the routing table — NOT ifa_dstaddr
+/// from getifaddrs(). On Pritunl/OpenVPN, ifa_dstaddr for a utun interface is
+/// the machine's own tunnel IP (self-loop, e.g. 192.168.10.43 → 192.168.10.43),
+/// not the VPN server. Using ifa_dstaddr was confirmed wrong against a live
+/// routing table before this function was written (incident #5, 2026-08-09).
+///
+/// `own_ips` filters self-loop artifacts: utun subnet routes list the machine's
+/// own tunnel IP as their gateway; filtering here keeps the returned set clean.
+pub fn detect_vpn_gateway_peers(own_ips: &HashSet<IpAddr>) -> HashSet<IpAddr> {
+    use std::ffi::CStr;
+
+    const IF_NAMESIZE: usize = 16; // IFNAMSIZ on macOS/BSD
+
+    const NET_RT_DUMP: libc::c_int = 1;
+    let mib: [libc::c_int; 6] = [
+        libc::CTL_NET,
+        libc::PF_ROUTE,
+        0,
+        libc::AF_INET,
+        NET_RT_DUMP,
+        0,
+    ];
+
+    let mut needed: libc::size_t = 0;
+    let ret = unsafe {
+        libc::sysctl(
+            mib.as_ptr() as *mut _,
+            6,
+            std::ptr::null_mut(),
+            &mut needed,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret < 0 || needed == 0 {
+        return HashSet::new();
+    }
+
+    let mut buf = vec![0u8; needed];
+    let mut filled = needed;
+    let ret = unsafe {
+        libc::sysctl(
+            mib.as_ptr() as *mut _,
+            6,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut filled,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret < 0 {
+        return HashSet::new();
+    }
+    buf.truncate(filled);
+
+    collect_vpn_peers_from_buf(&buf, own_ips, |idx| {
+        let mut name_buf = [0i8; IF_NAMESIZE];
+        let ptr = unsafe { libc::if_indextoname(idx as libc::c_uint, name_buf.as_mut_ptr()) };
+        if ptr.is_null() {
+            return None;
+        }
+        Some(
+            unsafe { CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    })
+}
+
+/// Walk a routing-table buffer and collect VPN gateway IPs.
+///
+/// Extracted from `detect_vpn_gateway_peers` so the test suite can inject a
+/// synthetic buffer and interface-name resolver without touching the sysctl layer.
+///
+/// For each RTF_UP route whose interface name (resolved by `iface_name_fn`)
+/// matches a tunnel prefix (utun*/ppp*/tun*), the RTA_GATEWAY IP is extracted.
+/// IPs present in `own_ips` are filtered before returning — this removes
+/// self-loop gateway artifacts (the machine's own tunnel IP appearing as the
+/// gateway of subnet routes) without requiring a separate getifaddrs() call.
+fn collect_vpn_peers_from_buf(
+    buf: &[u8],
+    own_ips: &HashSet<IpAddr>,
+    iface_name_fn: impl Fn(u32) -> Option<String>,
+) -> HashSet<IpAddr> {
+    let hdr_size = std::mem::size_of::<libc::rt_msghdr>();
+    let mut offset = 0usize;
+    let mut peers: HashSet<IpAddr> = HashSet::new();
+
+    while offset + hdr_size <= buf.len() {
+        // SAFETY: buf is bounds-checked; read_unaligned handles unaligned access.
+        let rtm: libc::rt_msghdr =
+            unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const libc::rt_msghdr) };
+        let msg_len = rtm.rtm_msglen as usize;
+        if msg_len < hdr_size || offset + msg_len > buf.len() {
+            break;
+        }
+
+        if rtm.rtm_flags & libc::RTF_UP != 0 {
+            if let Some(name) = iface_name_fn(rtm.rtm_index as u32) {
+                if is_tunnel_iface(&name) {
+                    let msg = &buf[offset..offset + msg_len];
+                    // rt_msg_dst_and_gateway reads RTA_GATEWAY from the routing table
+                    // message — the gateway IP field, not the interface's own address.
+                    // On Pritunl/OpenVPN, this yields 192.168.10.1 (VPN server), not
+                    // 192.168.10.43 (the machine's own tunnel IP in ifa_dstaddr).
+                    if let Some((_, gw)) = rt_msg_dst_and_gateway(msg, &rtm) {
+                        if !gw.is_loopback() && !gw.is_unspecified() && !own_ips.contains(&gw) {
+                            debug!("VPN peer gateway: {gw} via {name}");
+                            peers.insert(gw);
+                        }
+                    }
+                }
+            }
+        }
+
+        offset += msg_len;
+    }
+
+    peers
+}
+
+/// Returns true for kernel tunnel interface name prefixes on macOS.
+fn is_tunnel_iface(name: &str) -> bool {
+    name.starts_with("utun") || name.starts_with("ppp") || name.starts_with("tun")
+}
+
 /// Compute subnet broadcast address: ip | !mask.
 /// Handles both IPv4 and IPv6. Returns None on parse failure.
 fn compute_broadcast(ip: IpAddr, netmask: *const libc::sockaddr) -> Option<IpAddr> {
@@ -1910,6 +2045,157 @@ mod tests {
             assert!(
                 !ip.is_unspecified(),
                 "own IPs must not contain unspecified: {ip}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // VPN peer detection tests
+    // ---------------------------------------------------------------------------
+
+    /// Build a minimal sockaddr_in byte buffer for a given IPv4 address.
+    /// Layout: [sin_len(1), sin_family(1), sin_port(2), sin_addr(4), sin_zero(8)]
+    /// sin_addr bytes are in network byte order (ip.octets() order).
+    fn make_sockaddr_in_bytes(ip: std::net::Ipv4Addr) -> Vec<u8> {
+        let mut buf = vec![0u8; std::mem::size_of::<libc::sockaddr_in>()];
+        buf[0] = buf.len() as u8; // sin_len
+        buf[1] = libc::AF_INET as u8; // sin_family
+        buf[4..8].copy_from_slice(&ip.octets()); // sin_addr, network byte order
+        buf
+    }
+
+    /// rt_roundup for 64-bit Darwin: align to 8 bytes (sizeof(long)).
+    fn rt_roundup_test(n: usize) -> usize {
+        const ALIGN: usize = 8;
+        if n == 0 {
+            ALIGN
+        } else {
+            (n + ALIGN - 1) & !(ALIGN - 1)
+        }
+    }
+
+    /// Build a single synthetic rt_msghdr record with IPv4 DST and GATEWAY sockaddrs.
+    fn build_rt_record(
+        rtm_index: u16,
+        rtm_flags: libc::c_int,
+        dst_ip: std::net::Ipv4Addr,
+        gw_ip: std::net::Ipv4Addr,
+    ) -> Vec<u8> {
+        let dst_sa = make_sockaddr_in_bytes(dst_ip);
+        let gw_sa = make_sockaddr_in_bytes(gw_ip);
+        let dst_rounded = rt_roundup_test(dst_sa.len());
+        let gw_rounded = rt_roundup_test(gw_sa.len());
+
+        let hdr_size = std::mem::size_of::<libc::rt_msghdr>();
+        let total = hdr_size + dst_rounded + gw_rounded;
+
+        let mut buf = vec![0u8; total];
+
+        let mut rtm: libc::rt_msghdr = unsafe { std::mem::zeroed() };
+        rtm.rtm_msglen = total as libc::c_ushort;
+        rtm.rtm_version = 5; // RTM_VERSION on macOS
+        rtm.rtm_type = 4; // RTM_GET
+        rtm.rtm_index = rtm_index as libc::c_ushort;
+        rtm.rtm_flags = rtm_flags;
+        rtm.rtm_addrs = (libc::RTA_DST | libc::RTA_GATEWAY) as libc::c_int;
+        unsafe { std::ptr::write_unaligned(buf.as_mut_ptr() as *mut libc::rt_msghdr, rtm) };
+
+        buf[hdr_size..hdr_size + dst_sa.len()].copy_from_slice(&dst_sa);
+        let gw_pos = hdr_size + dst_rounded;
+        buf[gw_pos..gw_pos + gw_sa.len()].copy_from_slice(&gw_sa);
+
+        buf
+    }
+
+    /// Confirm that collect_vpn_peers_from_buf:
+    ///   - returns the real VPN server gateway (192.168.10.1) from both /1 split routes
+    ///   - deduplicates those two routes to a single set entry
+    ///   - does NOT return the machine's own tunnel IP (192.168.10.43) that appears
+    ///     as the gateway of a self-referential subnet/host route
+    ///
+    /// This encodes the exact distinction that broke Option A (ifa_dstaddr extraction):
+    /// on Pritunl/OpenVPN, ifa_dstaddr is the machine's own IP (self-loop), not the
+    /// VPN server. RTA_GATEWAY from the routing table is the correct field.
+    #[test]
+    fn test_collect_vpn_peers_self_loop_excluded_real_gateway_included() {
+        let utun6_idx: u16 = 42; // arbitrary synthetic interface index
+        let gw_ip = std::net::Ipv4Addr::new(192, 168, 10, 1);
+        let own_tunnel_ip = std::net::Ipv4Addr::new(192, 168, 10, 43);
+
+        // own_ips represents the machine's own tunnel address, as detect_own_ips() returns.
+        let own_ips: HashSet<IpAddr> = [IpAddr::V4(own_tunnel_ip)].into_iter().collect();
+
+        let mut buf = Vec::new();
+        // Route 1: 0/1 via 192.168.10.1 via utun6 (Pritunl split-half #1).
+        buf.extend(build_rt_record(
+            utun6_idx,
+            libc::RTF_UP,
+            std::net::Ipv4Addr::new(0, 0, 0, 0),
+            gw_ip,
+        ));
+        // Route 2: 128.0/1 via 192.168.10.1 via utun6 (split-half #2 — same gateway).
+        buf.extend(build_rt_record(
+            utun6_idx,
+            libc::RTF_UP,
+            std::net::Ipv4Addr::new(128, 0, 0, 0),
+            gw_ip,
+        ));
+        // Route 3: 192.168.10.43 → 192.168.10.43 (self-referential host route — the
+        // utun interface's own inet address appearing as its own gateway). This is the
+        // exact pattern that made Option A (ifa_dstaddr) wrong: we must NOT pick up
+        // 192.168.10.43 as a VPN peer.
+        buf.extend(build_rt_record(
+            utun6_idx,
+            libc::RTF_UP,
+            own_tunnel_ip,
+            own_tunnel_ip,
+        ));
+
+        let peers = collect_vpn_peers_from_buf(&buf, &own_ips, |idx| {
+            if idx == utun6_idx as u32 {
+                Some("utun6".to_string())
+            } else {
+                None
+            }
+        });
+
+        assert!(
+            peers.contains(&IpAddr::V4(gw_ip)),
+            "VPN server gateway 192.168.10.1 must be in vpn_peers"
+        );
+        assert!(
+            !peers.contains(&IpAddr::V4(own_tunnel_ip)),
+            "Own tunnel IP 192.168.10.43 must NOT be in vpn_peers — it appears as \
+             the gateway in self-referential routes but is the machine's own address. \
+             This is the Option A failure mode."
+        );
+        assert_eq!(
+            peers.len(),
+            1,
+            "Both /1 split routes share gateway 192.168.10.1 — \
+             set insert must deduplicate to exactly 1 entry, got: {:?}",
+            peers
+        );
+    }
+
+    /// Live-system smoke test: vpn_peers must never contain loopback, unspecified,
+    /// or own IPs regardless of whether VPN is connected.
+    #[test]
+    fn test_detect_vpn_gateway_peers_no_loopback_unspecified_or_own_ip() {
+        let own = detect_own_ips();
+        let peers = detect_vpn_gateway_peers(&own);
+        for ip in &peers {
+            assert!(
+                !ip.is_loopback(),
+                "loopback must not appear in vpn_peers: {ip}"
+            );
+            assert!(
+                !ip.is_unspecified(),
+                "unspecified must not appear in vpn_peers: {ip}"
+            );
+            assert!(
+                !own.contains(ip),
+                "own IP must not appear in vpn_peers after filtering: {ip}"
             );
         }
     }

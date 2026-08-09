@@ -186,10 +186,28 @@ fn main() -> io::Result<()> {
     const CROSSFLOW_EXCLUDED_API_IPS: &[&str] = &[
         "160.79.104.10", // Anthropic API (api.anthropic.com) — Claude desktop false positive
     ];
-    fn build_cf_excluded(own: &HashSet<IpAddr>, gateway: Option<IpAddr>) -> HashSet<IpAddr> {
+    fn build_cf_excluded(
+        own: &HashSet<IpAddr>,
+        gateway: Option<IpAddr>,
+        vpn_peers: &HashSet<IpAddr>,
+    ) -> HashSet<IpAddr> {
         let mut set = own.clone();
         if let Some(gw) = gateway {
             set.insert(gw);
+        }
+        // VPN tunnel endpoints: gateway IPs of routes via utun*/ppp*/tun* interfaces.
+        // These absorb all VPN-tunnelled traffic and trigger CrossFlow's connection-count
+        // and DNS-burst sub-detectors on normal VPN use. They are infrastructure, not
+        // adversarial. Excluding them is the same trade-off as excluding the default
+        // gateway: we lose the ability to detect the VPN gateway itself as a lateral-
+        // movement source via CrossFlow. This is accepted because: (a) the VPN gateway
+        // is trusted infrastructure by definition, and (b) lateral movement from other
+        // LAN hosts still routes through the physical interface (en0/Wi-Fi), NOT through
+        // the tunnel — those hosts remain fully visible to CrossFlow. vpn_peers is
+        // already filtered against own_ips by detect_vpn_gateway_peers(), so no own IP
+        // can enter cf_excluded via this path.
+        for &peer in vpn_peers {
+            set.insert(peer);
         }
         for &ip_str in CROSSFLOW_EXCLUDED_API_IPS {
             if let Ok(ip) = ip_str.parse::<IpAddr>() {
@@ -198,11 +216,15 @@ fn main() -> io::Result<()> {
         }
         set
     }
+    let vpn_peers = capture::detect_vpn_gateway_peers(&own_ips.load());
+    if !vpn_peers.is_empty() {
+        info!("VPN tunnel peers detected: {:?}", vpn_peers);
+    }
     let cf_excluded: Arc<ArcSwap<HashSet<IpAddr>>> = Arc::new(ArcSwap::from_pointee(
-        build_cf_excluded(&own_ips.load(), gateway_ip),
+        build_cf_excluded(&own_ips.load(), gateway_ip, &vpn_peers),
     ));
     info!(
-        "CrossFlow exclusion set: {} addresses (own_ips + gateway + api endpoints)",
+        "CrossFlow exclusion set: {} addresses (own_ips + gateway + vpn_peers + api endpoints)",
         cf_excluded.load().len()
     );
 
@@ -268,7 +290,23 @@ fn main() -> io::Result<()> {
                     }
                 }
                 let effective_gw = new_gw.or(last_known_gw);
-                let new_cf = build_cf_excluded(&new_own, effective_gw);
+                // Re-detect VPN peers every tick — VPN may connect mid-session, and
+                // the whole point of this mechanism is that VPN connects AFTER startup.
+                let new_vpn_peers = capture::detect_vpn_gateway_peers(&new_own);
+                let new_cf = build_cf_excluded(&new_own, effective_gw, &new_vpn_peers);
+                if !new_vpn_peers.is_empty() {
+                    let current_cf = cf_excluded_cache.load();
+                    let new_peers_in_cf: Vec<_> = new_vpn_peers
+                        .iter()
+                        .filter(|ip| !current_cf.contains(ip))
+                        .collect();
+                    if !new_peers_in_cf.is_empty() {
+                        info!(
+                            "own-ips-refresh: VPN peers added to cf_excluded: {:?}",
+                            new_peers_in_cf
+                        );
+                    }
+                }
                 let current = own_ips_cache.load();
                 if **current != new_own {
                     info!("own IPs refreshed: {} addresses", new_own.len());
