@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { ActivityItem } from "../lib/db";
 import { toPlainEnglish, toWhySentence } from "../lib/translate";
 import { relativeTime } from "../lib/time";
+import { useNow } from "../hooks/useNow";
 
 const DETECTOR_LABEL: Record<string, string> = {
   CrossFlow:          "Connection pattern analysis",
@@ -37,6 +38,7 @@ const VERDICT_LABEL_CLASS: Record<ActivityItem["verdict"], string> = {
 export default function ActivityRow({ item }: Props) {
   const [expanded, setExpanded] = useState(false);
   const [techOpen, setTechOpen] = useState(false);
+  const now = useNow();
 
   const sentence = toPlainEnglish(item);
   const whySentence = toWhySentence(item);
@@ -55,7 +57,7 @@ export default function ActivityRow({ item }: Props) {
         {/* Content */}
         <div className="flex-1 min-w-0">
           <p className="text-sm font-medium text-navy leading-snug">{sentence}</p>
-          <p className="text-xs text-navy/40 mt-0.5">{relativeTime(item.ts_ms)}</p>
+          <p className="text-xs text-navy/40 mt-0.5">{relativeTime(item.ts_ms, now)}</p>
         </div>
 
         {/* Verdict badge + chevron */}

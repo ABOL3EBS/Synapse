@@ -7,6 +7,7 @@ import {
   type ConfigValues,
   type UnblockResult,
 } from "../lib/db";
+import { useNow } from "../hooks/useNow";
 
 const REFRESH_MS = 10_000;
 
@@ -19,12 +20,13 @@ type UnblockState =
 
 export default function SettingsScreen() {
   const [blocks, setBlocks] = useState<ActiveBlock[]>([]);
+  const [fetchedAt, setFetchedAt] = useState(() => Date.now());
   const [config, setConfig] = useState<ConfigValues | null>(null);
   const [unblockState, setUnblockState] = useState<Record<string, UnblockState>>({});
 
   useEffect(() => {
     const load = () => {
-      getActiveBlocks().then(setBlocks).catch(() => {});
+      getActiveBlocks().then((data) => { setBlocks(data); setFetchedAt(Date.now()); }).catch(() => {});
       getConfigValues().then(setConfig).catch(() => {});
     };
     load();
@@ -80,6 +82,7 @@ export default function SettingsScreen() {
               <BlockRow
                 key={block.ip_text}
                 block={block}
+                fetchedAt={fetchedAt}
                 state={unblockState[block.ip_text] ?? { kind: "idle" }}
                 onUnblock={() => handleUnblock(block.ip_text)}
               />
@@ -139,13 +142,18 @@ export default function SettingsScreen() {
 
 function BlockRow({
   block,
+  fetchedAt,
   state,
   onUnblock,
 }: {
   block: ActiveBlock;
+  fetchedAt: number;
   state: UnblockState;
   onUnblock: () => void;
 }) {
+  const now = useNow();
+  const liveRemaining = Math.max(0, block.remaining_ms - (now - fetchedAt));
+
   // Strip the boilerplate prefix so only the detector findings are shown.
   const shortReason = block.reason
     .replace(/^score [0-9.]+ exceeds block threshold: /, "")
@@ -165,8 +173,8 @@ function BlockRow({
         )}
       </div>
       <div className="flex items-center gap-2 shrink-0 mt-0.5">
-        <span className="text-[11px] text-navy/40">
-          {formatRemaining(block.remaining_ms)}
+        <span className="text-[11px] text-navy/40 tabular-nums">
+          {formatRemaining(liveRemaining)}
         </span>
         <UnblockButton state={state} onUnblock={onUnblock} />
       </div>
