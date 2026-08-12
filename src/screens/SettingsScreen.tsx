@@ -146,13 +146,30 @@ function BlockRow({
   state: UnblockState;
   onUnblock: () => void;
 }) {
+  // Strip the boilerplate prefix so only the detector findings are shown.
+  const shortReason = block.reason
+    .replace(/^score [0-9.]+ exceeds block threshold: /, "")
+    .replace(/^score [0-9.]+ exceeds alert threshold: /, "");
+
   return (
-    <div className="px-4 py-3 flex items-center gap-3">
-      <span className="text-sm font-mono text-navy flex-1">{block.ip_text}</span>
-      <span className="text-[11px] text-navy/40 shrink-0">
-        {formatRemaining(block.remaining_ms)}
-      </span>
-      <UnblockButton state={state} onUnblock={onUnblock} />
+    <div className="px-4 py-3 flex items-start gap-3">
+      <div className="flex-1 min-w-0">
+        <span className="text-sm font-mono text-navy block">{block.ip_text}</span>
+        {shortReason && (
+          <span
+            className="text-[11px] text-navy/40 font-mono truncate block mt-0.5"
+            title={block.reason}
+          >
+            {shortReason}
+          </span>
+        )}
+      </div>
+      <div className="flex items-center gap-2 shrink-0 mt-0.5">
+        <span className="text-[11px] text-navy/40">
+          {formatRemaining(block.remaining_ms)}
+        </span>
+        <UnblockButton state={state} onUnblock={onUnblock} />
+      </div>
     </div>
   );
 }

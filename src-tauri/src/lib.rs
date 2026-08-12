@@ -76,6 +76,8 @@ pub struct ActivityItem {
     /// evidence_json from the highest-scoring detector finding; None if no findings.
     /// Used by the UI to produce sub-type-specific copy for detectors like CrossFlow.
     pub top_evidence: Option<String>,
+    /// Composite threat score (0.0–1.0) produced by the decision engine.
+    pub composite_score: Option<f64>,
 }
 
 // Resolve the remote endpoint using the stored local_ip_text.
@@ -146,7 +148,8 @@ fn get_activity_feed(limit: i64, state: tauri::State<DbState>) -> Vec<ActivityIt
     // but the real feed only shows Block/Alert in normal operation.
     let mut stmt = match conn.prepare(
         "SELECT v.id, v.ts_ms, v.process_path, v.verdict,
-                v.a_ip_text, v.b_ip_text, v.local_ip_text, v.country_code, v.dns_name
+                v.a_ip_text, v.b_ip_text, v.local_ip_text, v.country_code, v.dns_name,
+                v.composite_score
          FROM verdicts v
          ORDER BY v.ts_ms DESC
          LIMIT ?1",
@@ -181,6 +184,7 @@ fn get_activity_feed(limit: i64, state: tauri::State<DbState>) -> Vec<ActivityIt
                 country_code: r.get(7)?,
                 dns_name: r.get(8)?,
                 top_evidence: None, // filled below
+                composite_score: r.get(9)?,
             })
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())

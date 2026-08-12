@@ -22,6 +22,8 @@ export interface ActivityItem {
   dns_name: string | null;
   /** evidence_json from the highest-scoring detector finding; null if none. */
   top_evidence: string | null;
+  /** Composite threat score 0.0–1.0 from the decision engine. */
+  composite_score: number | null;
 }
 
 export interface ThreatStats {

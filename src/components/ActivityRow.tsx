@@ -84,6 +84,9 @@ export default function ActivityRow({ item }: Props) {
             <div className="bg-canvas rounded-xl px-3 py-2.5 space-y-1.5 text-xs font-mono text-navy/50">
               <DetailRow label="Address" value={remoteIp} />
               {item.country_code && <DetailRow label="Location" value={item.country_code} />}
+              {item.composite_score != null && (
+                <DetailRow label="Score" value={item.composite_score.toFixed(2)} />
+              )}
               {item.detector_ids.length > 0 && (
                 <DetailRow
                   label="Detectors"
