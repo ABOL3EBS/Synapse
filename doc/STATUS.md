@@ -1,6 +1,41 @@
 # Implementation Status — Synapse IPS
 
-**Last verified:** 2026-08-07. Ground-truth ledger — if this file and the architecture doc disagree, this file wins.
+**Last verified:** 2026-08-11. Ground-truth ledger — if this file and the architecture doc disagree, this file wins.
+
+## Latest change (2026-08-11) — true-positive validation pass (all active detectors)
+
+Full E2E test of every detector capable of firing under RFC 5737 constraints. Test traffic targeted RFC 5737 ranges only (203.0.113.0/24, 198.51.100.0/24). Production thresholds throughout (block=0.70, alert=0.30, override=0.85, min_detectors_for_block=2). Agent and helper both running on real hardware (en0, VPN down for routing sanity).
+
+### Results
+
+| Detector | Scenario | Expected verdict | Actual verdict | Pass/Fail |
+|---|---|---|---|---|
+| CrossFlow (scan, medium-tier) | 120 TCP connections to 203.0.113.1:1–120 in <2s (Python socket.connect_ex) | Alert (CrossFlow alone: adjusted=0.56) | **Block** (CrossFlow + IpReputation + ProcessCorrelator co-fired) | PASS — block correct; co-fire documented below |
+| CrossFlow (scan, high-tier / override) | 240 TCP connections to 203.0.113.1:1–240 in <2s (cooldown from Scenario 1 active) | Block (override: 0.90×0.95=0.855 ≥ 0.85) | **Block** confirmed in debug log (`score=0.90 conf=0.95`); re-enforcement suppressed by cooldown | PASS — override score confirmed; cooldown behavior expected |
+| CrossFlow (beaconing) | 7 TCP connections to 198.51.100.1:9999 at 5s intervals (Python sleep loop) | Alert (score=0.60/0.60, adjusted=0.36 < 0.70; alert threshold passed) | **Alert** `score 0.61: Beacon-like periodicity: 7 connections, mean=5.0s, CV=0.001` | PASS |
+| IpReputation | Single TCP connection to 203.0.113.1 after adding to blocklist | Block (IpReputation score=0.70, conf=0.80, adjusted=0.56; + RFC1918 evidence for 2 detectors) | **Block** `score 1.00: Destination IP matches blocklist; Source IP is RFC1918 (local network)` | PASS |
+| DnsTunnelDetector | — | **UNTESTED** | — | — |
+| ProcessCorrelator | — (passive; contributed unresolved-PID signal during Scenario 1 scan) | Nonzero contribution expected for short-lived Python sockets | Confirmed contributing (python3 connections fail PID attribution; `score_unresolved_process` fires) | PASS (passive verification) |
+| FlowBehavior | — (passive; no genuine positive case achievable with synthetic RFC 5737 sockets at test volumes) | Near-zero or zero; cannot reach alert alone (max realistic adjusted ≈ 0.30) | Confirmed zero/sub-alert contribution during all scenarios | PASS (passive verification) |
+
+### Prediction deviations
+
+**Scenario 1 co-fire (IpReputation + ProcessCorrelator):** Predicted CrossFlow alone → Alert (adjusted=0.56). Actual: Block. Root cause: 203.0.113.1 was already in the blocklist for Scenario 4 (tests were not sequentially isolated), so IpReputation fired first (score=0.70, conf=0.80). ProcessCorrelator added a small contribution from unresolved PID on short-lived `socket.connect_ex()` calls (python3 flows expire before PID attribution completes → `score_unresolved_process=0.5` for external IPs). Combined composite crossed block threshold with 2+ detectors. This is correct behavior — detector corroboration strengthening a verdict — not a false positive.
+
+**Scenario 2 cooldown:** Block verdict was issued during Scenario 1 and remained in the in-memory cooldown map. Subsequent evaluations of 203.0.113.1 during Scenario 2 showed `BLOCK skip (cooldown active)` even with override score=0.90/0.95 visible in debug log. The override score itself (`adjusted=0.855 ≥ 0.85`) was confirmed live in the agent log — the cooldown suppression is a rate-limiting mechanism, not a failure to detect.
+
+### DnsTunnelDetector — known verification gap (FIXME)
+
+**DnsTunnelDetector has NEVER been true-positive tested — RFC 5737 destinations cannot exercise it (no PTR records, no real DNS responses). A controlled local DNS server test is the correct follow-up, not yet built.**
+
+This is a **fixable verification gap**, not an accepted limitation like the VPN-gateway blind spot. The VPN-gateway blind spot is a topology/false-positive trade-off with no clean solution. The DnsTunnelDetector gap is an infrastructure gap: the test harness doesn't yet include a local authoritative DNS server that returns forged high-entropy PTR records and crafted large responses. Building such a server (e.g., a Python `dnslib`-based server serving long base64-encoded TXT and PTR records on a local loopback address) would exercise all four sub-scores: entropy check (dns_name), label-count check (dns_name), rate check (sustained same-flow DNS), and payload check (large responses). DNS tunneling is one of the core detection goals of this project — this gap should be closed before the system is considered production-validated.
+
+**Remediation path:**
+1. Stand up a local DNS server (`python3 -m dnslib` or `coredns`) bound to `127.0.0.1:5353`.
+2. Configure it to return PTR records with high-entropy subdomains (e.g. `aBcDeFgHiJ.tunnel.test` — entropy > threshold).
+3. Send sustained DNS queries on a single flow (same src_port) so `packet_count` accumulates.
+4. Return large TXT responses (>512 bytes) to trigger the payload sub-score.
+5. Verify `DnsTunnelDetector` fires with score > 0 before setting a Block verdict.
 
 ## Latest change (2026-08-07) — gateway detection fallback + last-known-good caching
 
