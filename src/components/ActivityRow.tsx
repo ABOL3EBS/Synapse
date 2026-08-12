@@ -17,7 +17,7 @@ interface Props {
 }
 
 const VERDICT_DOT: Record<ActivityItem["verdict"], string> = {
-  Block: "bg-emerald",
+  Block: "bg-danger",
   Alert: "bg-amber",
   Allow: "bg-navy/20",
 };
@@ -29,7 +29,7 @@ const VERDICT_LABEL: Record<ActivityItem["verdict"], string> = {
 };
 
 const VERDICT_LABEL_CLASS: Record<ActivityItem["verdict"], string> = {
-  Block: "text-emerald-dark bg-emerald-light",
+  Block: "text-danger bg-danger-light",
   Alert: "text-amber-700 bg-amber-light",
   Allow: "text-navy/40 bg-navy/5",
 };
