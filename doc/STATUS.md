@@ -2,6 +2,22 @@
 
 **Last verified:** 2026-08-11. Ground-truth ledger — if this file and the architecture doc disagree, this file wins.
 
+## Latest change (2026-08-12) — dashboard UI polish (5 groups)
+
+Five groups of UI improvements shipped and verified in the real Tauri window.
+
+| Group | What | Files |
+|---|---|---|
+| 1 | Block verdict dot + badge → red (`bg-danger` / `text-danger bg-danger-light`) | `ActivityRow.tsx` |
+| 2 | BlockRow shows detector findings as subtitle under IP (strips boilerplate prefix); composite score added to ActivityRow technical-details panel | `SettingsScreen.tsx`, `ActivityRow.tsx`, `src-tauri/src/lib.rs`, `db.ts` |
+| 3 | Active block countdown ticks live (1 s) via `useNow` hook; Activity relative timestamps drift in real time | `SettingsScreen.tsx`, `ActivityRow.tsx`, `time.ts`, `hooks/useNow.ts` |
+| 4 | Activity polls every 5 s (was 30 s); Protection polls every 10 s (was 30 s). `busy_timeout=5000` verified safe | `ActivityScreen.tsx`, `ProtectionScreen.tsx` |
+| 5 | New verdict rows appearing between polls flash green (`rgba(16,185,129,0.22)` → white, 1.4 s). `seenIds` ref skips initial mount so only genuine new rows flash | `ActivityScreen.tsx`, `ActivityRow.tsx`, `index.css` |
+
+**Composite score end-to-end (Group 2):** `composite_score: Option<f64>` added to `ActivityItem` Rust struct; SQL SELECT now fetches `v.composite_score`; TypeScript interface updated; `DetailRow` renders it between Location and Detectors in the expanded technical-details panel.
+
+**`useNow` hook:** `src/hooks/useNow.ts` — `setInterval` tick every 1 s, returns `Date.now()`. Used by both `ActivityRow` (timestamps) and `BlockRow` (countdown: `remaining_ms − (now − fetchedAt)`).
+
 ## Latest change (2026-08-11) — true-positive validation pass (all active detectors)
 
 Full E2E test of every detector capable of firing under RFC 5737 constraints. Test traffic targeted RFC 5737 ranges only (203.0.113.0/24, 198.51.100.0/24). Production thresholds throughout (block=0.70, alert=0.30, override=0.85, min_detectors_for_block=2). Agent and helper both running on real hardware (en0, VPN down for routing sanity).
@@ -298,19 +314,23 @@ This is a **fixable verification gap**, not an accepted limitation like the VPN-
 
 | File | Lines | Description |
 |---|---|---|
-| `src-tauri/src/lib.rs` | 386 | Tauri IPC commands: `get_threat_stats`, `get_activity_chart`, `get_detector_breakdown`, `get_top_apps`, `get_threat_countries`, `get_recent_activity`. Read-only rusqlite connection, WAL mode. |
+| `src-tauri/src/lib.rs` | 478 | Tauri IPC commands: `get_threat_stats`, `get_activity_chart`, `get_detector_breakdown`, `get_top_apps`, `get_threat_countries`, `get_activity_feed`. Read-only rusqlite connection, WAL mode. `ActivityItem` now includes `composite_score: Option<f64>`. |
 | `src/App.tsx` | 22 | Root shell — SideNav + tab routing. |
-| `src/components/SideNav.tsx` | 107 | Nav tabs: Protection / Activity / Report / Threat Map. `startDragging()` on wordmark for window drag. |
-| `src/screens/ProtectionScreen.tsx` | 134 | Shield icon + status + active blocks count. `shield-pulse` CSS animation when protected. |
-| `src/screens/ActivityScreen.tsx` | 86 | Live feed from `get_recent_activity`. Activity rows with process path, verdict badge, stagger animation. |
+| `src/components/SideNav.tsx` | 107 | Nav tabs: Protection / Activity / Report / Threat Map / Settings. `startDragging()` on wordmark for window drag. |
+| `src/screens/ProtectionScreen.tsx` | 147 | Shield icon + status + active blocks count. `shield-pulse` CSS animation. 10 s poll. |
+| `src/screens/ActivityScreen.tsx` | 119 | Live feed, 5 s poll. `seenIds` ref + `flashIds` state: new rows flash green on arrival. `isNew` prop passed to `ActivityRow`. |
+| `src/screens/SettingsScreen.tsx` | 274 | Active Blocks (live countdown via `useNow` + `fetchedAt`; BlockRow shows reason subtitle), Detection Thresholds, CrossFlow Exclusions. |
 | `src/screens/StatsScreen.tsx` | 131 | Report screen — sparkline, detector breakdown chart, top flagged apps, animated KPI counters (`useCountUp`). |
-| `src/screens/GlobeScreen.tsx` | 170 | Threat Map — react-globe.gl, `earth-day.jpg` local texture (1600×800 equirectangular), animated arcs flying from home location to each threat country, ranked sidebar. |
+| `src/screens/GlobeScreen.tsx` | 170 | Threat Map — react-globe.gl, `earth-day.jpg` local texture (1600×800 equirectangular), animated arcs, ranked sidebar. |
+| `src/components/ActivityRow.tsx` | 128 | Expandable verdict card. Block dot/badge → red. Technical-details panel includes Score (`composite_score`). `isNew` prop applies `card-flash` CSS. Relative timestamps via `useNow`. |
 | `src/components/Sparkline.tsx` | 58 | SVG path sparkline with gradient fill. |
 | `src/components/DetectorChart.tsx` | 50 | Horizontal bar chart for detector breakdown. |
 | `src/components/TopApps.tsx` | 73 | Top flagged apps with hue-from-name coloring, log-scale bars, B/A badges. |
-| `src/lib/db.ts` | 95 | TypeScript wrappers for all Tauri commands. `isTauri()` guard — all calls no-op in browser preview. |
+| `src/hooks/useNow.ts` | 11 | `useNow(intervalMs)` — returns live `Date.now()`, used by ActivityRow + BlockRow. |
+| `src/lib/db.ts` | 146 | TypeScript wrappers for all Tauri commands. `ActivityItem` includes `composite_score: number \| null`. |
+| `src/lib/time.ts` | 11 | `relativeTime(ts_ms, now?)` — optional `now` param enables live drift via `useNow`. |
 | `src/lib/countries.ts` | 196 | 170-entry ISO-2 → `{lat, lng, name}` centroid map for globe ring placement. |
-| `src/index.css` | 81 | Tailwind base + custom animations: `shield-pulse`, `bar-grow`, `activity-row` stagger. |
+| `src/index.css` | 90 | Tailwind base + custom animations: `shield-pulse`, `bar-grow`, `activity-row` stagger, `card-flash` (new-item green fade). |
 | `public/earth-day.jpg` | — | 1600×800 equirectangular day-side texture (238KB), local copy from node_modules to avoid protocol-relative URL failure in Tauri webview. |
 
 **Verified in real Tauri window (2026-08-01):** All 4 screens render with real SQLite data. Globe renders with visible continents, auto-rotates, pulsing rings match real `get_threat_countries` output. Texture URL fix confirmed — switching from `//unpkg.com/...` to `/earth-day.jpg` resolved the near-black globe that appeared only in the Tauri context (not the browser preview).
