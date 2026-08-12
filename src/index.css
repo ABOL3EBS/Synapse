@@ -63,6 +63,15 @@ body {
   animation: slide-up 0.3s ease both;
 }
 
+/* New-item flash — card background pulses green then fades to white */
+@keyframes card-flash {
+  0%   { background-color: rgba(16, 185, 129, 0.22); }
+  100% { background-color: rgb(255, 255, 255); }
+}
+.card-flash {
+  animation: card-flash 1.4s ease both;
+}
+
 /* Chart fade-in */
 @keyframes fade-in {
   from { opacity: 0; }

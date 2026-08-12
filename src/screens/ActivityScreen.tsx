@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import ActivityRow from "../components/ActivityRow";
 import { getActivityFeed, isTauri, type ActivityItem } from "../lib/db";
 
@@ -8,11 +8,30 @@ export default function ActivityScreen() {
   const [items, setItems] = useState<ActivityItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
+  const [flashIds, setFlashIds] = useState<ReadonlySet<number>>(new Set());
+  const seenIds = useRef<Set<number>>(new Set());
+  const isFirstLoad = useRef(true);
 
   useEffect(() => {
     const load = () =>
       getActivityFeed(50)
-        .then((data) => { setItems(data); setLoading(false); })
+        .then((data) => {
+          if (isFirstLoad.current) {
+            isFirstLoad.current = false;
+            data.forEach((i) => seenIds.current.add(i.id));
+          } else {
+            const fresh = new Set(
+              data.filter((i) => !seenIds.current.has(i.id)).map((i) => i.id)
+            );
+            data.forEach((i) => seenIds.current.add(i.id));
+            if (fresh.size > 0) {
+              setFlashIds(fresh);
+              setTimeout(() => setFlashIds(new Set()), 1000);
+            }
+          }
+          setItems(data);
+          setLoading(false);
+        })
         .catch(() => { setError(true); setLoading(false); });
 
     load();
@@ -56,7 +75,7 @@ export default function ActivityScreen() {
             className="activity-row"
             style={{ animationDelay: `${Math.min(i * 40, 400)}ms` }}
           >
-            <ActivityRow item={item} />
+            <ActivityRow item={item} isNew={flashIds.has(item.id)} />
           </div>
         ))}
       </div>

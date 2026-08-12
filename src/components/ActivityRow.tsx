@@ -15,6 +15,7 @@ const DETECTOR_LABEL: Record<string, string> = {
 
 interface Props {
   item: ActivityItem;
+  isNew?: boolean;
 }
 
 const VERDICT_DOT: Record<ActivityItem["verdict"], string> = {
@@ -35,7 +36,7 @@ const VERDICT_LABEL_CLASS: Record<ActivityItem["verdict"], string> = {
   Allow: "text-navy/40 bg-navy/5",
 };
 
-export default function ActivityRow({ item }: Props) {
+export default function ActivityRow({ item, isNew }: Props) {
   const [expanded, setExpanded] = useState(false);
   const [techOpen, setTechOpen] = useState(false);
   const now = useNow();
@@ -45,7 +46,7 @@ export default function ActivityRow({ item }: Props) {
   const remoteIp = item.dns_name ?? item.remote_ip_text;
 
   return (
-    <div className="bg-white rounded-2xl shadow-card border border-black/[0.04] overflow-hidden">
+    <div className={`rounded-2xl shadow-card border border-black/[0.04] overflow-hidden${isNew ? " card-flash" : " bg-white"}`}>
       {/* Main row */}
       <button
         className="w-full text-left px-4 py-3.5 flex items-start gap-3"
