@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { getProtectionStatus, type ProtectionStatus } from "../lib/db";
 
-const REFRESH_MS = 30_000;
+const REFRESH_MS = 10_000;
 
 export default function ProtectionScreen() {
   const [status, setStatus] = useState<ProtectionStatus | null>(null);

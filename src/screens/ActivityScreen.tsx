@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import ActivityRow from "../components/ActivityRow";
 import { getActivityFeed, isTauri, type ActivityItem } from "../lib/db";
 
-const REFRESH_MS = 30_000;
+const REFRESH_MS = 5_000;
 
 export default function ActivityScreen() {
   const [items, setItems] = useState<ActivityItem[]>([]);
