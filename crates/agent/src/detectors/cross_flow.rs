@@ -332,28 +332,30 @@ fn compute_beacon_score(
 }
 
 // Connection-diversity: distinct remote IPs from one PID in pid_diversity_window_secs.
-// Returns (score, confidence, evidence, cap_hit).
-// cap_hit = true means caller should emit an autonomous-override warn!.
+// Returns (score, confidence, evidence).
 //
-// Score×confidence arithmetic (override_threshold = 0.85):
+// Score×confidence arithmetic (override_threshold = 0.85, block_threshold = 0.70):
 //   >20 tier: 0.30×0.40 = 0.12 — below alert; browser page-loads stay quiet
 //   >50 tier: 0.50×0.55 = 0.275 — below alert; legitimate multi-host tools stay quiet
-//   cap-hit:  0.90×0.95 = 0.855 ≥ 0.85 — crosses override_threshold → autonomous Block
+//   cap-hit:  0.65×0.75 = 0.4875 — elevated signal, but requires corroboration to block;
+//             cannot reach override_threshold (0.85) alone (intentional: cap is a
+//             memory bound, not a detection verdict — we stopped counting, not proved malice)
 fn compute_diversity_score(
     connections: &VecDeque<(IpAddr, Instant)>,
     pid: u32,
     cfg: &CrossFlowConfig,
     at_cap: bool,
-) -> Option<(f32, f32, Evidence, bool)> {
+) -> Option<(f32, f32, Evidence)> {
     if at_cap {
         let ev = Evidence {
             description: format!(
-                "Connection-diversity cap hit: {}+ distinct IPs from pid={} in <{}s",
+                "Connection-diversity tracking saturated: {}+ connections from pid={} in <{}s \
+                 — corroboration required for enforcement",
                 cfg.max_pid_entries, pid, cfg.pid_diversity_window_secs
             ),
             detail: Some(format!("pid={pid}")),
         };
-        return Some((0.90, 0.95, ev, true));
+        return Some((0.65, 0.75, ev));
     }
     let now = Instant::now();
     let window = Duration::from_secs(cfg.pid_diversity_window_secs);
@@ -372,7 +374,7 @@ fn compute_diversity_score(
             ),
             detail: Some(format!("pid={pid}")),
         };
-        Some((0.50, 0.55, ev, false))
+        Some((0.50, 0.55, ev))
     } else if count > cfg.pid_diversity_threshold_medium {
         let ev = Evidence {
             description: format!(
@@ -381,7 +383,7 @@ fn compute_diversity_score(
             ),
             detail: Some(format!("pid={pid}")),
         };
-        Some((0.30, 0.40, ev, false))
+        Some((0.30, 0.40, ev))
     } else {
         None
     }
@@ -528,19 +530,9 @@ impl Detector for CrossFlowDetector {
 
         // Connection diversity for the flow's PID.
         if let (Some(conns), Some(pid)) = (snap.pid_conns.as_ref(), flow.pid) {
-            if let Some((s, c, ev, cap_hit)) =
+            if let Some((s, c, ev)) =
                 compute_diversity_score(conns, pid, &snap.cfg, snap.pid_at_cap)
             {
-                if cap_hit {
-                    // Emitted at warn so it's distinct in operator logs.
-                    // Known FP: nmap/masscan from the same user; see STATUS.md.
-                    log::warn!(
-                        "[BLOCK] AUTONOMOUS OVERRIDE: connection-diversity cap hit \
-                         (512+ distinct IPs from pid={pid} in <10s) — \
-                         if this was your own scan/audit tool, \
-                         pause the agent before running network scans"
-                    );
-                }
                 if s > max_score {
                     max_score = s;
                     max_conf = c;
@@ -1012,10 +1004,9 @@ mod tests {
         let cfg = CrossFlowConfig::default();
         let result = compute_diversity_score(&conns, 42, &cfg, false);
         assert!(result.is_some());
-        let (score, conf, _, cap_hit) = result.unwrap();
+        let (score, conf, _) = result.unwrap();
         assert!((score - 0.30).abs() < 1e-6);
         assert!((conf - 0.40).abs() < 1e-6);
-        assert!(!cap_hit);
     }
 
     #[test]
@@ -1025,39 +1016,53 @@ mod tests {
         let cfg = CrossFlowConfig::default();
         let result = compute_diversity_score(&conns, 42, &cfg, false);
         assert!(result.is_some());
-        let (score, conf, _, cap_hit) = result.unwrap();
+        let (score, conf, _) = result.unwrap();
         assert!((score - 0.50).abs() < 1e-6);
         assert!((conf - 0.55).abs() < 1e-6);
-        assert!(!cap_hit);
     }
 
     #[test]
     fn test_diversity_cap_hit_tier() {
-        // at_cap=true → Critical tier regardless of distinct-IP count.
+        // at_cap=true → elevated signal (0.65×0.75) that requires corroboration.
+        // The cap is a memory bound, not a detection verdict — we stopped counting,
+        // not proved malice. Score must be below override_threshold alone.
         let conns = make_diversity_deque(512);
         let cfg = CrossFlowConfig::default();
         let result = compute_diversity_score(&conns, 99, &cfg, true);
         assert!(result.is_some());
-        let (score, conf, _, cap_hit) = result.unwrap();
-        assert!((score - 0.90).abs() < 1e-6, "cap-hit score must be 0.90");
+        let (score, conf, ev) = result.unwrap();
         assert!(
-            (conf - 0.95).abs() < 1e-6,
-            "cap-hit confidence must be 0.95"
+            (score - 0.65).abs() < 1e-6,
+            "cap-hit score must be 0.65, got {score}"
         );
-        assert!(cap_hit);
+        assert!(
+            (conf - 0.75).abs() < 1e-6,
+            "cap-hit confidence must be 0.75, got {conf}"
+        );
+        assert!(
+            ev.description.contains("corroboration"),
+            "cap-hit evidence must mention corroboration requirement"
+        );
     }
 
-    // Explicit arithmetic check: 0.90 × 0.95 = 0.855 ≥ override_threshold (0.85).
-    // If this fails, the cap-hit tier no longer triggers an autonomous Block.
+    // Explicit arithmetic check: 0.65 × 0.75 = 0.4875, which is:
+    //   - below block_threshold (0.70) alone → cannot block without corroboration
+    //   - below override_threshold (0.85) → cannot trigger autonomous override
+    // This test is the canary: if it fails, the cap-hit path became dangerous again.
     #[test]
-    fn test_cap_hit_override_threshold_arithmetic() {
-        let score = 0.90_f32;
-        let confidence = 0.95_f32;
+    fn test_cap_hit_cannot_trigger_autonomous_block() {
+        let score = 0.65_f32;
+        let confidence = 0.75_f32;
         let product = score * confidence;
         assert!(
-            product >= 0.85,
-            "cap-hit product {product:.4} must be ≥ 0.85 (override_threshold); \
-             if this fails, cap-hit no longer triggers autonomous block"
+            product < 0.70,
+            "cap-hit product {product:.4} must be below block_threshold (0.70); \
+             cap-hit must require corroboration, not block autonomously"
+        );
+        assert!(
+            product < 0.85,
+            "cap-hit product {product:.4} must be below override_threshold (0.85); \
+             the cap is a memory bound, not a detection verdict"
         );
     }
 
