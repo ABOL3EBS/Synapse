@@ -121,15 +121,20 @@ impl Detector for FlowBehavior {
             0.0
         };
 
-        // Resolve the actual remote port. Canonical b_port is the port of the
-        // numerically larger IP — for outbound connections that's the LOCAL
-        // ephemeral port, not the remote service port. Use local_port to
-        // disambiguate.
-        let remote_port = if flow.local_port == flow.b_port {
-            flow.a_port
-        } else {
-            flow.b_port
-        };
+        // Safe to .expect() here: run_detectors() wraps every evaluate() call in
+        // catch_unwind, so a panic becomes DetectorFinding::errored — not an agent
+        // crash. The two call sites (process_expired_flows / process_re_evaluate_flows)
+        // also guard resolved=None before calling run_detectors, so this is unreachable
+        // in production. Do NOT convert to warn!+skip — that would silently swallow a
+        // real bug; catch_unwind is the right safety net for detector panics.
+        let remote_port = flow
+            .resolved
+            .as_ref()
+            .expect(
+                "FlowBehavior::evaluate requires a resolved flow; \
+                 process_expired_flows and process_re_evaluate_flows guard against resolved=None",
+            )
+            .remote_port;
 
         let mut evidence = Vec::new();
         let mut total_score = 0.0f32;
@@ -241,7 +246,8 @@ impl Detector for FlowBehavior {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::IpAddr;
+    use std::net::{IpAddr, Ipv4Addr};
+    use synapse_common::ResolvedFlow;
 
     fn make_flow_with_behavior(
         packet_count: u64,
@@ -251,8 +257,8 @@ mod tests {
     ) -> FlowRecord {
         FlowRecord {
             flow_id: 1,
-            a_ip: IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
-            b_ip: IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1)),
+            a_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            b_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
             a_port: 443,
             b_port: 50000,
             protocol,
@@ -267,6 +273,12 @@ mod tests {
             asn: None,
             reputation_score: None,
             flow_age: std::time::Duration::from_secs(flow_age_secs),
+            resolved: Some(ResolvedFlow {
+                local_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+                local_port: 50000,
+                remote_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                remote_port: 443,
+            }),
         }
     }
 
@@ -321,36 +333,63 @@ mod tests {
     #[test]
     fn test_standard_port_high_bpp() {
         let detector = FlowBehavior;
-        // 1500 bytes/packet on port 443 — normal TLS, should score 0 for bpp.
+        // bpp=1500 on resolved.remote_port=443 (HIGH_MTU_PORT) — must not trigger bpp heuristic.
         let flow = make_flow_with_behavior(100, 150_000, 5, 6);
-        // b_port defaults to 50000 — override to 443.
-        let mut flow = flow;
-        flow.b_port = 443;
         let finding = detector.evaluate(&flow);
-        // bpp=1500 on port 443 should not trigger bpp heuristic.
         assert!(
             !finding
                 .evidence
                 .iter()
                 .any(|e| e.description.contains("bytes/packet")),
-            "Standard port 443 should be exempt from bpp > 1400 heuristic"
+            "resolved.remote_port=443 must be exempt from bpp > 1400 heuristic"
+        );
+    }
+
+    #[test]
+    fn test_resolved_remote_port_wins_over_disambiguation() {
+        let detector = FlowBehavior;
+        // bpp=1500 > 1400. Disambiguation: local_port(50000)==b_port(50000) → a_port=8080
+        // (not in HIGH_MTU_PORTS) → bpp heuristic fires (score 0.2).
+        // With resolved.remote_port=443 (HIGH_MTU_PORT) → bpp heuristic must be silent.
+        let mut flow = make_flow_with_behavior(100, 150_000, 5, 6);
+        flow.a_port = 8080;
+        flow.b_port = 50000;
+        flow.local_port = 50000;
+        flow.resolved = Some(ResolvedFlow {
+            local_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            local_port: 50000,
+            remote_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            remote_port: 443,
+        });
+        let finding = detector.evaluate(&flow);
+        assert!(
+            !finding
+                .evidence
+                .iter()
+                .any(|e| e.description.contains("bytes/packet")),
+            "resolved.remote_port=443 must exempt from bpp heuristic; \
+             disambiguation would give 8080 which is not exempt"
         );
     }
 
     #[test]
     fn test_non_standard_port_high_bpp() {
         let detector = FlowBehavior;
-        // 1500 bytes/packet on port 8080 — non-standard, should trigger bpp heuristic.
-        let flow = make_flow_with_behavior(100, 150_000, 5, 6);
-        let mut flow = flow;
-        flow.b_port = 8080;
+        // bpp=1500 on resolved.remote_port=8080 (non-standard) — must trigger bpp heuristic.
+        let mut flow = make_flow_with_behavior(100, 150_000, 5, 6);
+        flow.resolved = Some(ResolvedFlow {
+            local_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            local_port: 50000,
+            remote_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            remote_port: 8080,
+        });
         let finding = detector.evaluate(&flow);
         assert!(
             finding
                 .evidence
                 .iter()
                 .any(|e| e.description.contains("bytes/packet")),
-            "Non-standard port with bpp > 1400 should trigger heuristic"
+            "resolved.remote_port=8080 with bpp > 1400 must trigger heuristic"
         );
     }
 }

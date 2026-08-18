@@ -1,7 +1,7 @@
 use log::info;
 use rusqlite::Connection;
 
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Apply the schema to an open connection. Idempotent — safe to call on
 /// every startup. Uses PRAGMA user_version for lightweight migration tracking.
@@ -53,9 +53,17 @@ pub fn apply_schema(conn: &Connection) -> Result<(), String> {
     if version < 4 {
         conn.execute_batch(V4_DDL)
             .map_err(|e| format!("schema v4: {e}"))?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+        conn.pragma_update(None, "user_version", 4u32)
             .map_err(|e| format!("set user_version v4: {e}"))?;
         info!("storage: schema v4 applied (dedup historical verdicts + unique 5-tuple index)");
+    }
+
+    if version < 5 {
+        conn.execute_batch(V5_DDL)
+            .map_err(|e| format!("schema v5: {e}"))?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(|e| format!("set user_version v5: {e}"))?;
+        info!("storage: schema v5 applied (verdicts.remote_ip_text)");
     }
 
     Ok(())
@@ -194,6 +202,18 @@ const V3_DDL: &str = "
 -- which canonical endpoint is remote without a private/public heuristic.
 -- NULL for existing rows (rows written before V3 — treated as unknown by UI).
 ALTER TABLE verdicts ADD COLUMN local_ip_text TEXT;
+";
+
+// ---------------------------------------------------------------------------
+// V5 DDL — add remote_ip_text to verdicts for authoritative direction storage
+// ---------------------------------------------------------------------------
+
+const V5_DDL: &str = "
+-- remote_ip_text: the remote endpoint's IP, persisted verbatim from
+-- resolved.remote_ip at verdict time. No re-derivation. NULL for rows
+-- written before V5; dashboard falls back to pick_remote() (using
+-- local_ip_text from V3) for those rows until they age out.
+ALTER TABLE verdicts ADD COLUMN remote_ip_text TEXT;
 ";
 
 // ---------------------------------------------------------------------------

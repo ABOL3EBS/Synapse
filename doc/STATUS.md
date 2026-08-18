@@ -1,6 +1,52 @@
 # Implementation Status — Synapse IPS
 
-**Last verified:** 2026-08-11. Ground-truth ledger — if this file and the architecture doc disagree, this file wins.
+**Last verified:** 2026-08-18. Ground-truth ledger — if this file and the architecture doc disagree, this file wins.
+
+## Latest change (2026-08-18) — Steps A–F complete: canonical-vs-directional field migration
+
+**Migration closed.** The recurring bug class where `FlowRecord.a_ip`/`b_ip` canonical fields were treated as directional (`src`/`dst`) is now structurally prevented across all layers — agent, detectors, storage, and dashboard.
+
+### What changed
+
+| Step | Layer | Change |
+|---|---|---|
+| A | `FlowRecord` / `flow/mod.rs` | Added `ResolvedFlow { local_ip, local_port, remote_ip, remote_port }` — direction resolved once at flow creation, stored on the record |
+| B | `FlowBehavior` | Extract `remote_port` from `flow.resolved` (safe `.expect()` — catch_unwind protection documented) |
+| C | `FlowFeatures::from_flow()` | Interim: `Option<Self>` + `warn!` for `resolved=None`; call sites guard before calling |
+| D | `FlowFeatures::from_flow()` | Final: signature changed to `from_flow(&FlowRecord, &ResolvedFlow) -> Self` — compile error to call without direction resolved. No more `Option<Self>`. |
+| E | `DnsTunnelDetector` | **Security-relevant false negative fixed** — `b_port` replaced with `resolved.remote_port` at both port check sites. Silent zero-score on all DNS flows where local IP > DNS server IP. Test fixture bug fixed (`b_port: 53` → `50000`). Regression test added. |
+| F | Storage + dashboard | `VerdictDecided` carries `remote_ip: IpAddr`. Schema V5 adds `remote_ip_text` column. Dashboard reads it verbatim (no re-derivation); `pick_remote()` fallback for NULL pre-V5 rows. |
+
+### Step F detail
+
+- `StorageEvent::VerdictDecided` gains `remote_ip: IpAddr` field.
+- `crates/agent/src/storage/schema.rs`: `SCHEMA_VERSION = 5`; idempotent V5 migration adds `ALTER TABLE verdicts ADD COLUMN remote_ip_text TEXT`.
+- `crates/agent/src/storage/mod.rs`: flush handler computes `remote_ip.to_string()` and includes it as `?25` in INSERT + ON CONFLICT DO UPDATE.
+- `capture.rs`: both `VerdictDecided` emit sites (Alert and Block paths in `handle_verdict()`) pass `remote_ip: remote` — already had `let remote = resolved.remote_ip` computed at line 1070.
+- `src-tauri/src/lib.rs`: SELECT now fetches `v.remote_ip_text` (column 10). Mapper uses `stored_remote.unwrap_or_else(|| pick_remote(...))` — V5+ rows never re-derive; pre-V5 rows fall back to `pick_remote()` using `local_ip_text` (V3+).
+
+### New tests (Step F)
+
+- `test_verdict_remote_ip_text_roundtrip` — persists a `VerdictDecided` event and reads `remote_ip_text` back verbatim.
+- `test_swap_case_remote_ip_text_correct` — constructs the swap-case flow (`local=192.168.1.1 > remote=8.8.8.8`, so `a_ip=8.8.8.8` canonical), confirms `remote_ip_text = "8.8.8.8"` (not `b_ip_text = "192.168.1.1"` which is the local machine). This is the test that closes the dashboard's instance of the bug class.
+
+**Final test count:** 189 workspace tests, 0 failures. `cargo clippy -- -D warnings` clean. `cargo fmt --check` clean.
+
+---
+
+## Previous change (2026-08-18) — Step E: DnsTunnelDetector direction bug fix (security-relevant false negative)
+
+**Finding type:** Silent false negative on an entire class of DNS flows — found via structural audit (Steps A–D), not a live incident.
+
+**Root cause:** `DnsTunnelDetector::evaluate()` used `flow.b_port` to identify DNS flows (port 53) and DoH flows (port 443). `b_port` is the canonically *larger* port — it is the DNS server port only when the DNS server IP is numerically larger than the local IP. When local IP > DNS server IP (e.g., `local=10.0.0.100 > dns=8.8.8.8`), canonical ordering puts the DNS server at `a_ip`/`a_port=53`; `b_port` becomes the local ephemeral port (e.g., 50000). Both port checks then fail silently: `is_dns_flow(17, 50000) = false` → "Not a DNS flow" → score 0.0. All DNS tunnel analysis dropped for that flow class. Same bug class as the `src_ip`/`dst_ip` enforcement error (2026-07-25) — canonical field treated as directional without going through `resolved`.
+
+**Fix:** Extract `remote_port` from `flow.resolved` at the top of `evaluate()` (`.expect()` — safe behind `catch_unwind` in `worker_loop`, same reasoning as `FlowBehavior`). Both port checks now use `remote_port` instead of `b_port`. Comment at each site documents why `.expect()` is correct.
+
+**Test fixture fix:** `make_dns_flow` had `b_port: 53` — structurally wrong (b_ip is the local side; b_port should be the local ephemeral port). Changed to `b_port: 50000`. This masked the bug in every existing test. `test_doh_port_443_early_return` updated to set `resolved.remote_port=443` rather than overriding `b_port`.
+
+**New regression test:** `test_dns_flow_local_ip_larger_than_server` — constructs the exact failure case (`local=10.0.0.100 > dns=8.8.8.8`, `b_port=50000`), confirms `score > 0` and no "Not a DNS flow" evidence. This test would have caught the bug from the start.
+
+**Files:** `crates/agent/src/detectors/dns_tunnel.rs`. 8 tests → 8 tests (1 new). 222 total workspace tests, 0 failures.
 
 ## Latest change (2026-08-12) — dashboard UI polish (5 groups)
 
@@ -275,9 +321,11 @@ This is a **fixable verification gap**, not an accepted limitation like the VPN-
 
 1. **VPN gateway itself is not visible to CrossFlow.** `detect_vpn_gateway_peers()` adds VPN tunnel endpoint IPs (gateway IPs of routes via `utun*/ppp*/tun*` interfaces) to `cf_excluded`. CrossFlow cannot detect these IPs as lateral-movement sources. This is the same accepted trade-off as excluding the physical default gateway: the VPN gateway is trusted infrastructure, and the alternative (false-positive blocks on every DNS/data flow to the VPN server) is more harmful than the detection gap. **Scope preserved:** lateral movement from any other LAN device still routes through the physical interface (`en0`/Wi-Fi), never through the tunnel — those devices remain fully visible to CrossFlow. The accepted blind spot is limited to the VPN server's own tunnel endpoint IP. Diagnosed in incident #5 (2026-08-09); prior incidents #1–#4 involved the physical gateway via a different failure mode (detection-function failure, not routing-table topology).
 
-2. **Three `?` crash sites in helper reconnect loop** (`main.rs` ~lines 370, 396, 402) — `accept()`, `send_fd()`, `try_clone()` failures propagate via `?` and terminate the helper. Diagnostic wrapper (2026-07-24) logs the error before exit, but does not prevent or recover from the failure. Deliberately left as-is pending real error evidence — generic "catch everything and continue" hardening would mask the actual failure mode.
+2. **UDP flow can retain a stale `resolved.local_ip` for up to 5 s if DHCP lease changes without interface teardown.** Narrow, bounded, and accepted: the window is at most one `expiry_secs = 5` idle cycle, and frozen-at-creation is still more correct than re-deriving from the current `local_ip` ArcSwap snapshot (canonical `a_ip`/`b_ip` ordering was established at creation time). Follow-on fix: signal a flow-flush from the `own-ips-refresh` thread on detected local-IP change to close this window to ≤ one 5 s refresh cycle.
 
-2. **Helper reconnect crash — root cause unconfirmed.** Helper crashed once during 3-cycle verification (2026-07-23, observed in cycle 2→3 transition). Diagnostic wrapper added (2026-07-24) to log fatal errors. Not reproduced across 6 reconnect cycles post-wrapper (two clean 3-cycle runs). Root cause remains unknown — may be low-probability timing-dependent condition that simply didn't trigger in subsequent runs.
+3. **Three `?` crash sites in helper reconnect loop** (`main.rs` ~lines 370, 396, 402) — `accept()`, `send_fd()`, `try_clone()` failures propagate via `?` and terminate the helper. Diagnostic wrapper (2026-07-24) logs the error before exit, but does not prevent or recover from the failure. Deliberately left as-is pending real error evidence — generic "catch everything and continue" hardening would mask the actual failure mode.
+
+4. **Helper reconnect crash — root cause unconfirmed.** Helper crashed once during 3-cycle verification (2026-07-23, observed in cycle 2→3 transition). Diagnostic wrapper added (2026-07-24) to log fatal errors. Not reproduced across 6 reconnect cycles post-wrapper (two clean 3-cycle runs). Root cause remains unknown — may be low-probability timing-dependent condition that simply didn't trigger in subsequent runs.
 
 ## Known shortcomings (working but fragile)
 

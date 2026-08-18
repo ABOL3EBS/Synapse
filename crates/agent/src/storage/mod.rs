@@ -46,6 +46,9 @@ pub enum StorageEvent {
     VerdictDecided {
         flow: Box<FlowRecord>,
         local_ip: std::net::IpAddr,
+        /// Direction-resolved remote endpoint, persisted verbatim from resolved.remote_ip.
+        /// Stored as remote_ip_text so the dashboard never re-derives direction.
+        remote_ip: std::net::IpAddr,
         verdict: String,
         reason: String,
         composite_score: f32,
@@ -313,6 +316,7 @@ fn flush(
             StorageEvent::VerdictDecided {
                 flow,
                 local_ip,
+                remote_ip,
                 verdict,
                 reason,
                 composite_score,
@@ -322,6 +326,7 @@ fn flush(
                 let (a_blob, a_text) = ip_to_parts(flow.a_ip);
                 let (b_blob, b_text) = ip_to_parts(flow.b_ip);
                 let local_ip_text = local_ip.to_string();
+                let remote_ip_text = remote_ip.to_string();
                 let flow_age_ms = flow.flow_age.as_millis() as i64;
                 let verdict_id: i64 = match tx.query_row(
                     "INSERT INTO verdicts
@@ -329,9 +334,9 @@ fn flush(
                       a_port, b_port, protocol, pid, process_path, process_start,
                       dns_name, country_code, asn, reputation_score,
                       verdict, reason, composite_score, ttl_ms, flow_age_ms,
-                      pkt_count, byte_count, local_ip_text)
+                      pkt_count, byte_count, local_ip_text, remote_ip_text)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,
-                             ?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)
+                             ?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)
                      ON CONFLICT(a_ip_text, a_port, b_ip_text, b_port, protocol, verdict)
                      DO UPDATE SET
                        ts_ms            = excluded.ts_ms,
@@ -349,7 +354,8 @@ fn flush(
                        country_code     = excluded.country_code,
                        asn              = excluded.asn,
                        reputation_score = excluded.reputation_score,
-                       local_ip_text    = excluded.local_ip_text
+                       local_ip_text    = excluded.local_ip_text,
+                       remote_ip_text   = excluded.remote_ip_text
                      RETURNING id",
                     params![
                         ts_ms,
@@ -376,6 +382,7 @@ fn flush(
                         flow.packet_count as i64,
                         flow.byte_count as i64,
                         local_ip_text,
+                        remote_ip_text,
                     ],
                     |r| r.get(0),
                 ) {
@@ -664,7 +671,7 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
     use std::net::{IpAddr, Ipv4Addr};
-    use synapse_common::FlowRecord;
+    use synapse_common::{FlowRecord, ResolvedFlow};
 
     fn make_test_flow() -> FlowRecord {
         FlowRecord {
@@ -685,6 +692,13 @@ mod tests {
             asn: None,
             reputation_score: None,
             flow_age: std::time::Duration::from_secs(1),
+            // a_port=50000=local_port → a_ip is local, b_ip is remote.
+            resolved: Some(ResolvedFlow {
+                local_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                local_port: 50000,
+                remote_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                remote_port: 443,
+            }),
         }
     }
 
@@ -722,6 +736,7 @@ mod tests {
             tx.send(StorageEvent::VerdictDecided {
                 flow: Box::new(make_test_flow()),
                 local_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+                remote_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
                 verdict: "Alert".to_string(),
                 reason: "failure test".to_string(),
                 composite_score: 0.4,
@@ -813,6 +828,7 @@ mod tests {
                     ..flow.clone()
                 }),
                 local_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+                remote_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
                 verdict: "Alert".to_string(),
                 reason: format!("tick {tick_ts}"),
                 composite_score: 0.6,
@@ -867,6 +883,7 @@ mod tests {
         tx.send(StorageEvent::VerdictDecided {
             flow: Box::new(flow.clone()),
             local_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+            remote_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
             verdict: "Alert".to_string(),
             reason: "alert".to_string(),
             composite_score: 0.6,
@@ -878,6 +895,7 @@ mod tests {
         tx.send(StorageEvent::VerdictDecided {
             flow: Box::new(flow.clone()),
             local_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+            remote_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
             verdict: "Block".to_string(),
             reason: "block".to_string(),
             composite_score: 0.9,
@@ -921,5 +939,148 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].event_id, "evt-2");
         let _ = std::fs::remove_file(dir);
+    }
+
+    /// Verify remote_ip_text is persisted verbatim and reads back from the verdicts table.
+    ///
+    /// This closes the storage side of Step F: the dashboard can now read
+    /// remote_ip_text directly without re-deriving direction from a/b canonical ordering.
+    #[test]
+    fn test_verdict_remote_ip_text_roundtrip() {
+        let db_path =
+            std::env::temp_dir().join(format!("synapse_remote_ip_{}.db", std::process::id()));
+        let spool_path = db_path.with_extension("spool");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&spool_path);
+
+        let worker = StorageWorker::start(db_path.clone()).expect("worker should start");
+        let tx = worker.event_tx();
+
+        tx.send(StorageEvent::VerdictDecided {
+            flow: Box::new(make_test_flow()),
+            local_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            remote_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            verdict: "Alert".to_string(),
+            reason: "roundtrip test".to_string(),
+            composite_score: 0.5,
+            ttl_ms: None,
+            findings: vec![],
+        })
+        .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        drop(tx);
+        worker.shutdown();
+
+        let conn = Connection::open(&db_path).unwrap();
+        let remote_ip_text: String = conn
+            .query_row("SELECT remote_ip_text FROM verdicts LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            remote_ip_text, "8.8.8.8",
+            "remote_ip_text must be persisted verbatim from VerdictDecided.remote_ip"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&spool_path);
+    }
+
+    /// Regression: local IP numerically larger than remote IP (swap-case).
+    ///
+    /// Canonical ordering: local=192.168.1.1 > remote=8.8.8.8, so
+    /// a_ip=8.8.8.8 (remote, smaller), b_ip=192.168.1.1 (local, larger).
+    /// Without remote_ip_text, the old pick_remote() heuristic with NO
+    /// local_ip_text would return b_ip_text ("192.168.1.1" — the local endpoint)
+    /// as the "remote" IP shown on the dashboard. The dashboard bug was that for
+    /// pre-V3 rows (NULL local_ip_text), pick_remote() defaulted to b (canonical
+    /// larger = local in this case), showing the user their own IP as the threat.
+    ///
+    /// With remote_ip_text stored directly, the dashboard never re-derives: it
+    /// reads "8.8.8.8" verbatim regardless of canonical ordering.
+    #[test]
+    fn test_swap_case_remote_ip_text_correct() {
+        let db_path = std::env::temp_dir().join(format!("synapse_swap_{}.db", std::process::id()));
+        let spool_path = db_path.with_extension("spool");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&spool_path);
+
+        let worker = StorageWorker::start(db_path.clone()).expect("worker should start");
+        let tx = worker.event_tx();
+
+        // Swap case: local=192.168.1.1 (0xC0A80101) > remote=8.8.8.8 (0x08080808)
+        // Canonical: a_ip=8.8.8.8 (smaller=remote), b_ip=192.168.1.1 (larger=local)
+        let swap_flow = FlowRecord {
+            flow_id: 42,
+            a_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            b_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            a_port: 443,
+            b_port: 50000,
+            protocol: 6,
+            local_port: 50000,
+            pid: None,
+            packet_count: 10,
+            byte_count: 2048,
+            dns_name: None,
+            process_path: None,
+            process_start_time: None,
+            country_code: None,
+            asn: None,
+            reputation_score: None,
+            flow_age: std::time::Duration::from_secs(2),
+            resolved: Some(ResolvedFlow {
+                local_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+                local_port: 50000,
+                remote_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                remote_port: 443,
+            }),
+        };
+
+        tx.send(StorageEvent::VerdictDecided {
+            flow: Box::new(swap_flow),
+            local_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            remote_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            verdict: "Alert".to_string(),
+            reason: "swap-case test".to_string(),
+            composite_score: 0.4,
+            ttl_ms: None,
+            findings: vec![],
+        })
+        .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        drop(tx);
+        worker.shutdown();
+
+        let conn = Connection::open(&db_path).unwrap();
+        let (a_text, b_text, local_text, remote_text): (String, String, String, String) = conn
+            .query_row(
+                "SELECT a_ip_text, b_ip_text, local_ip_text, remote_ip_text FROM verdicts LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+
+        // Canonical ordering: a=remote(8.8.8.8), b=local(192.168.1.1)
+        assert_eq!(a_text, "8.8.8.8", "a_ip_text must be the remote endpoint");
+        assert_eq!(
+            b_text, "192.168.1.1",
+            "b_ip_text must be the local endpoint"
+        );
+        assert_eq!(local_text, "192.168.1.1");
+        assert_eq!(
+            remote_text, "8.8.8.8",
+            "remote_ip_text must be 8.8.8.8 — the REMOTE endpoint, not the \
+             canonical b_ip (which is the local machine in the swap case)"
+        );
+        assert_ne!(
+            remote_text, b_text,
+            "remote_ip_text must NOT equal b_ip_text in the swap case: \
+             b is the local endpoint when local IP > remote IP"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&spool_path);
     }
 }

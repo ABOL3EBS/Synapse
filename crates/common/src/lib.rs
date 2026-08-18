@@ -13,7 +13,7 @@ use std::time::Duration;
 pub use types::{
     BlockId, DecisionConfig, DesiredFirewallState, DetectorConfig, DetectorFinding, DetectorId,
     DetectorStatus, EnforcementReceipt, EnrichmentKind, EnrichmentRequest, EnrichmentResult,
-    Evidence, FlowFeatures, FlowRecord, PortPidCache, ReconciliationReport, Severity,
+    Evidence, FlowFeatures, FlowRecord, PortPidCache, ReconciliationReport, ResolvedFlow, Severity,
     ValidatedBlock, ValidationError, Verdict,
 };
 pub use types::{MAX_BLOCK_TTL, MAX_CONCURRENT_BLOCKS, MIN_BLOCK_TTL};

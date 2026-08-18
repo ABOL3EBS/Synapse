@@ -392,13 +392,14 @@ impl Detector for DnsAnalyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::IpAddr;
+    use std::net::{IpAddr, Ipv4Addr};
+    use synapse_common::ResolvedFlow;
 
     fn make_flow_with_dns(dns_name: Option<String>) -> FlowRecord {
         FlowRecord {
             flow_id: 1,
-            a_ip: IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
-            b_ip: IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1)),
+            a_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            b_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
             a_port: 443,
             b_port: 50000,
             protocol: 6,
@@ -413,6 +414,12 @@ mod tests {
             asn: None,
             reputation_score: None,
             flow_age: std::time::Duration::from_secs(5),
+            resolved: Some(ResolvedFlow {
+                local_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+                local_port: 50000,
+                remote_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                remote_port: 443,
+            }),
         }
     }
 

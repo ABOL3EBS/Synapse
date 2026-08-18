@@ -329,7 +329,8 @@ impl Detector for ProcessCorrelator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::IpAddr;
+    use std::net::{IpAddr, Ipv4Addr};
+    use synapse_common::ResolvedFlow;
 
     fn make_flow_with_process(
         process_path: Option<String>,
@@ -338,7 +339,7 @@ mod tests {
     ) -> FlowRecord {
         FlowRecord {
             flow_id: 1,
-            a_ip: IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1)),
+            a_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
             b_ip,
             a_port: 50000,
             b_port: 443,
@@ -354,6 +355,13 @@ mod tests {
             asn: None,
             reputation_score: None,
             flow_age: std::time::Duration::from_secs(5),
+            // a_port=50000=local_port → a_ip is local, b_ip is remote.
+            resolved: Some(ResolvedFlow {
+                local_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+                local_port: 50000,
+                remote_ip: b_ip,
+                remote_port: 443,
+            }),
         }
     }
 

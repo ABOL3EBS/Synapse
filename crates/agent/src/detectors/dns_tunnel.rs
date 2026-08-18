@@ -136,8 +136,25 @@ impl Detector for DnsTunnelDetector {
     fn evaluate(&self, flow: &FlowRecord) -> DetectorFinding {
         let start = Instant::now();
 
+        // Safe to .expect() here: worker_loop() in run_detector_with_timeout wraps
+        // every evaluate() call in catch_unwind, so a panic becomes
+        // DetectorFinding::errored — not an agent crash. The call sites
+        // (process_expired_flows / process_re_evaluate_flows) also guard
+        // resolved=None before calling run_detectors. Do NOT convert to warn!+skip
+        // — catch_unwind is the right net for detector panics.
+        let remote_port = flow
+            .resolved
+            .as_ref()
+            .expect(
+                "DnsTunnelDetector::evaluate requires a resolved flow; \
+                 process_expired_flows and process_re_evaluate_flows guard against resolved=None",
+            )
+            .remote_port;
+
         // DNS-over-HTTPS (port 443) is encrypted — tunnel detection is inapplicable.
-        if flow.protocol == 17 && flow.b_port == 443 {
+        // Uses remote_port (from resolved) not b_port: b_port is the canonically larger
+        // port, which is the local ephemeral port whenever DNS server IP < local IP.
+        if flow.protocol == 17 && remote_port == 443 {
             return DetectorFinding {
                 detector_id: self.id(),
                 detector_version: self.version().to_string(),
@@ -154,7 +171,7 @@ impl Detector for DnsTunnelDetector {
         }
 
         // Short-circuit: not a DNS flow (UDP/53).
-        if !Self::is_dns_flow(flow.protocol, flow.b_port) {
+        if !Self::is_dns_flow(flow.protocol, remote_port) {
             return DetectorFinding {
                 detector_id: self.id(),
                 detector_version: self.version().to_string(),
@@ -267,8 +284,12 @@ impl Detector for DnsTunnelDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::IpAddr;
+    use std::net::{IpAddr, Ipv4Addr};
+    use synapse_common::ResolvedFlow;
 
+    // Canonical ordering: 8.8.8.8 < 192.168.1.1 → a_ip=DNS server, b_ip=local.
+    // b_port=50000 is the local ephemeral port; a_port=53 is the DNS server port.
+    // resolved.remote_port=53 is the direction-resolved remote port used by evaluate().
     fn make_dns_flow(
         dns_name: Option<String>,
         packet_count: u64,
@@ -277,11 +298,11 @@ mod tests {
     ) -> FlowRecord {
         FlowRecord {
             flow_id: 1,
-            a_ip: IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
-            b_ip: IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1)),
+            a_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            b_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
             a_port: 53,
-            b_port: 53,
-            protocol: 17, // UDP
+            b_port: 50000, // local ephemeral port — b_ip is the local side
+            protocol: 17,  // UDP
             local_port: 50000,
             pid: Some(42),
             packet_count,
@@ -293,6 +314,12 @@ mod tests {
             asn: None,
             reputation_score: None,
             flow_age: std::time::Duration::from_secs(flow_age_secs),
+            resolved: Some(ResolvedFlow {
+                local_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+                local_port: 50000,
+                remote_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                remote_port: 53,
+            }),
         }
     }
 
@@ -369,7 +396,13 @@ mod tests {
         let detector = DnsTunnelDetector;
         let flow = make_dns_flow(Some("data.example.com".to_string()), 100, 15000, 3);
         let mut flow = flow;
-        flow.b_port = 443; // DNS-over-HTTPS
+        // Set remote_port=443 via resolved — evaluate() reads remote_port, not b_port.
+        flow.resolved = Some(ResolvedFlow {
+            local_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            local_port: 50000,
+            remote_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            remote_port: 443,
+        });
         let finding = detector.evaluate(&flow);
         assert_eq!(
             finding.score, 0.0,
@@ -383,5 +416,61 @@ mod tests {
             .evidence
             .iter()
             .any(|e| e.description.contains("DNS-over-HTTPS")));
+    }
+
+    /// Regression: local IP numerically larger than DNS server IP.
+    ///
+    /// Canonical ordering: local=10.0.0.100 > remote=8.8.8.8, so
+    /// a_ip=8.8.8.8 (smaller), a_port=53, b_ip=10.0.0.100, b_port=50000
+    /// (local ephemeral). The old code checked b_port==53 → false → "Not a
+    /// DNS flow". The fix uses resolved.remote_port=53 → correctly identifies
+    /// the flow as DNS and evaluates it.
+    #[test]
+    fn test_dns_flow_local_ip_larger_than_server() {
+        let detector = DnsTunnelDetector;
+        // High-entropy subdomain so evaluation produces a nonzero score,
+        // proving the detector ran analysis rather than returning early.
+        let flow = FlowRecord {
+            flow_id: 99,
+            a_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), // DNS server — smaller
+            b_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 100)), // local — larger
+            a_port: 53,
+            b_port: 50000, // local ephemeral — NOT the DNS port
+            protocol: 17,
+            local_port: 50000,
+            pid: Some(42),
+            packet_count: 20,
+            byte_count: 5000,
+            dns_name: Some("a7Bx9mK2qZ4wN8pL3vR6yH1jF5dT0gS.example.com".to_string()),
+            process_path: None,
+            process_start_time: None,
+            country_code: None,
+            asn: None,
+            reputation_score: None,
+            flow_age: std::time::Duration::from_secs(5),
+            resolved: Some(ResolvedFlow {
+                local_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 100)),
+                local_port: 50000,
+                remote_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                remote_port: 53,
+            }),
+        };
+
+        let finding = detector.evaluate(&flow);
+        assert!(
+            finding.score > 0.0,
+            "DNS tunnel detector must evaluate (not short-circuit) when local IP > DNS server IP; \
+             b_port={} is the local ephemeral port, resolved.remote_port=53 is the DNS port. \
+             Got score={}",
+            flow.b_port,
+            finding.score,
+        );
+        assert!(
+            finding
+                .evidence
+                .iter()
+                .all(|e| e.description != "Not a DNS flow"),
+            "must not produce 'Not a DNS flow' evidence for a real DNS flow"
+        );
     }
 }

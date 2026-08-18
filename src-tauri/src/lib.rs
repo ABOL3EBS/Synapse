@@ -149,7 +149,7 @@ fn get_activity_feed(limit: i64, state: tauri::State<DbState>) -> Vec<ActivityIt
     let mut stmt = match conn.prepare(
         "SELECT v.id, v.ts_ms, v.process_path, v.verdict,
                 v.a_ip_text, v.b_ip_text, v.local_ip_text, v.country_code, v.dns_name,
-                v.composite_score
+                v.composite_score, v.remote_ip_text
          FROM verdicts v
          ORDER BY v.ts_ms DESC
          LIMIT ?1",
@@ -171,7 +171,12 @@ fn get_activity_feed(limit: i64, state: tauri::State<DbState>) -> Vec<ActivityIt
             let a_ip_text: String = r.get(4)?;
             let b_ip_text: String = r.get(5)?;
             let local_ip_text: Option<String> = r.get(6)?;
-            let remote_ip_text = pick_remote(&a_ip_text, &b_ip_text, local_ip_text.as_deref());
+            // Column 10: remote_ip_text (V5+). Non-NULL means direction was resolved
+            // at write time — use it verbatim. NULL for pre-V5 rows: fall back to
+            // pick_remote() which uses local_ip_text (V3+) to derive direction.
+            let stored_remote: Option<String> = r.get(10)?;
+            let remote_ip_text = stored_remote
+                .unwrap_or_else(|| pick_remote(&a_ip_text, &b_ip_text, local_ip_text.as_deref()));
             Ok(ActivityItem {
                 id: r.get(0)?,
                 ts_ms: r.get(1)?,

@@ -375,6 +375,13 @@ mod tests {
             asn: None,
             reputation_score: None,
             flow_age: std::time::Duration::from_secs(5),
+            // b_port=50000=local_port → b_ip is local, a_ip is remote.
+            resolved: Some(synapse_common::ResolvedFlow {
+                local_ip: IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1)),
+                local_port: 50000,
+                remote_ip: IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
+                remote_port: 443,
+            }),
         }
     }
 

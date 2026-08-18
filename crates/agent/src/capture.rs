@@ -21,7 +21,9 @@ use std::time::Instant;
 use arc_swap::ArcSwap;
 
 use log::{debug, error, info, warn};
-use synapse_common::{EnforcementCommand, EnrichmentKind, EnrichmentRequest, PacketInfo};
+use synapse_common::{
+    EnforcementCommand, EnrichmentKind, EnrichmentRequest, PacketInfo, ResolvedFlow,
+};
 
 use crate::detectors;
 use crate::detectors::cross_flow::CrossFlowState;
@@ -234,22 +236,6 @@ pub fn determine_remote_endpoint(
         (src_ip, src_port) // inbound: remote is src
     } else {
         (dst_ip, dst_port) // neither matches — outbound default
-    }
-}
-
-/// Determine which IP is the remote endpoint for enforcement.
-/// Mirrors the is_local() pattern from determine_local_port().
-/// Never assume a_ip or b_ip means "remote" — canonical ordering
-/// discards direction.
-pub fn determine_remote_ip(a_ip: IpAddr, b_ip: IpAddr, local_ip: IpAddr) -> IpAddr {
-    if a_ip == local_ip {
-        b_ip
-    } else if b_ip == local_ip {
-        a_ip
-    } else {
-        // Neither matches local — default to b_ip (the larger address,
-        // which is more likely to be external on a home network).
-        b_ip
     }
 }
 
@@ -1011,23 +997,13 @@ impl CaptureEngine {
     /// Run detectors + decision engine on expired flows.
     /// Verbatim extraction from main.rs lines 456-527.
     pub fn process_expired_flows(&mut self, expired: &[u64]) {
-        // P1: Lock-free snapshot via arc_swap — no mutex contention on hot path.
-        // R10: If local_ip is unknown, skip all expired flow processing —
-        // direction resolution requires a known local IP.
-        let local_ip = match **self.caches.local_ip.load() {
-            Some(ip) => ip,
-            None => {
-                warn!(
-                    "local_ip unknown — skipping expired flow processing ({} flows skipped)",
-                    expired.len()
-                );
-                return;
-            }
-        };
-
         for &flow_id in expired {
             if let Some(flow_ref) = self.tracker.get(flow_id) {
                 let common_flow: synapse_common::FlowRecord = flow_ref.clone().into();
+                let Some(resolved) = common_flow.resolved.clone() else {
+                    warn!("[SKIP] flow={} expired — resolved=None (startup window), detectors not run", flow_id);
+                    continue;
+                };
                 let common_flow = std::sync::Arc::new(common_flow);
                 let (findings, cb_transitions) = detectors::run_detectors(
                     &self.detectors,
@@ -1037,9 +1013,9 @@ impl CaptureEngine {
                     &self.config.cb_config,
                 );
                 self.emit_cb_transitions(cb_transitions);
-                let features = synapse_common::FlowFeatures::from_flow(&common_flow);
+                let features = synapse_common::FlowFeatures::from_flow(&common_flow, &resolved);
                 let (verdict, score) = self.decision_engine.evaluate(&features, &findings);
-                self.handle_verdict(flow_id, &common_flow, &findings, score, verdict, local_ip);
+                self.handle_verdict(flow_id, &common_flow, &findings, score, verdict);
             }
         }
     }
@@ -1047,25 +1023,13 @@ impl CaptureEngine {
     /// Re-run detectors on active flows due for periodic re-evaluation.
     /// Verbatim extraction from main.rs lines 528-602.
     pub fn process_re_evaluate_flows(&mut self, re_evaluate: &[u64]) {
-        // Temporarily take local_ip to avoid borrow conflicts.
-        // R9: Recover from mutex poison — keep last-known value rather than aborting.
-        // P1: Lock-free snapshot via arc_swap.
-        // R10: If local_ip is unknown, skip all re-evaluation —
-        // direction resolution requires a known local IP.
-        let local_ip = match **self.caches.local_ip.load() {
-            Some(ip) => ip,
-            None => {
-                warn!(
-                    "local_ip unknown — skipping re-evaluation ({} flows skipped)",
-                    re_evaluate.len()
-                );
-                return;
-            }
-        };
-
         for &flow_id in re_evaluate {
             if let Some(flow_ref) = self.tracker.get(flow_id) {
                 let common_flow: synapse_common::FlowRecord = flow_ref.clone().into();
+                let Some(resolved) = common_flow.resolved.clone() else {
+                    warn!("[SKIP] flow={} re-eval — resolved=None (startup window), detectors not run", flow_id);
+                    continue;
+                };
                 let common_flow = std::sync::Arc::new(common_flow);
                 let (findings, cb_transitions) = detectors::run_detectors(
                     &self.detectors,
@@ -1075,9 +1039,9 @@ impl CaptureEngine {
                     &self.config.cb_config,
                 );
                 self.emit_cb_transitions(cb_transitions);
-                let features = synapse_common::FlowFeatures::from_flow(&common_flow);
+                let features = synapse_common::FlowFeatures::from_flow(&common_flow, &resolved);
                 let (verdict, score) = self.decision_engine.evaluate(&features, &findings);
-                self.handle_verdict(flow_id, &common_flow, &findings, score, verdict, local_ip);
+                self.handle_verdict(flow_id, &common_flow, &findings, score, verdict);
                 self.tracker.mark_evaluated(flow_id);
             }
         }
@@ -1095,22 +1059,28 @@ impl CaptureEngine {
         findings: &[synapse_common::DetectorFinding],
         composite_score: f32,
         verdict: synapse_common::Verdict,
-        local_ip: IpAddr,
     ) {
-        let a_ip = flow.a_ip;
-        let b_ip = flow.b_ip;
+        // ResolvedFlow is set once at flow creation using per-packet direction.
+        // None means the flow was created in the startup window before own-ips
+        // was detected — direction is unknown, enforcing would risk a wrong target.
+        let Some(ref resolved) = flow.resolved else {
+            warn!("[SKIP] flow={} — resolved=None (startup window)", flow_id);
+            return;
+        };
+        let remote = resolved.remote_ip;
+        let local_ip = resolved.local_ip;
 
         match verdict {
             synapse_common::Verdict::Allow => {
                 info!("[ALLOW] flow={}", flow_id);
             }
             synapse_common::Verdict::Alert { ref reason } => {
-                let remote = determine_remote_ip(a_ip, b_ip, local_ip);
                 info!("[ALERT] flow={} remote={} {}", flow_id, remote, reason);
                 if let Some(ref tx) = self.storage_tx {
                     let _ = tx.send(StorageEvent::VerdictDecided {
                         flow: Box::new(flow.clone()),
                         local_ip,
+                        remote_ip: remote,
                         verdict: "Alert".to_string(),
                         reason: reason.clone(),
                         composite_score,
@@ -1120,7 +1090,6 @@ impl CaptureEngine {
                 }
             }
             synapse_common::Verdict::Block { ttl, ref reason } => {
-                let remote = determine_remote_ip(a_ip, b_ip, local_ip);
                 if let Some(skip_reason) = self.should_skip_block(remote) {
                     warn!("[SKIP] flow={} — {skip_reason}", flow_id);
                 } else {
@@ -1141,6 +1110,7 @@ impl CaptureEngine {
                             let _ = tx.send(StorageEvent::VerdictDecided {
                                 flow: Box::new(flow.clone()),
                                 local_ip,
+                                remote_ip: remote,
                                 verdict: "Block".to_string(),
                                 reason: reason.clone(),
                                 composite_score,
@@ -1389,6 +1359,19 @@ impl CaptureEngine {
                         }
                     }
 
+                    // Freeze direction-resolved endpoints on the flow record.
+                    // Uses per-packet src/dst (genuine wire direction), not canonical
+                    // a_ip/b_ip. See ResolvedFlow doc comment for safety analysis.
+                    self.tracker.set_resolved(
+                        flow_id,
+                        ResolvedFlow {
+                            local_ip: current_local_ip,
+                            local_port,
+                            remote_ip,
+                            remote_port,
+                        },
+                    );
+
                     let request = EnrichmentRequest {
                         flow_id,
                         src_ip: info_pkt.src_ip,
@@ -1571,67 +1554,6 @@ mod tests {
         assert!(
             !ip.is_loopback(),
             "local IP must not be loopback (127.x.x.x)"
-        );
-    }
-
-    /// Regression test: local IP numerically larger than remote IP.
-    #[test]
-    fn test_determine_remote_ip_local_larger_than_remote() {
-        let local_ip = detect_local_ip()
-            .expect("detect_local_ip() failed — cannot run this test without a network interface");
-
-        let remote = determine_remote_ip(
-            IpAddr::V4(Ipv4Addr::new(52, 73, 240, 202)),
-            local_ip,
-            local_ip,
-        );
-        assert_eq!(
-            remote,
-            IpAddr::V4(Ipv4Addr::new(52, 73, 240, 202)),
-            "must return remote IP (52.73.240.202), not local IP ({local_ip})"
-        );
-    }
-
-    /// Regression test: local IP numerically smaller than remote IP.
-    #[test]
-    fn test_determine_remote_ip_local_smaller_than_remote() {
-        let local_ip = detect_local_ip()
-            .expect("detect_local_ip() failed — cannot run this test without a network interface");
-
-        let remote = determine_remote_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), local_ip, local_ip);
-        assert_eq!(
-            remote,
-            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-            "must return remote IP (8.8.8.8), not local IP ({local_ip})"
-        );
-    }
-
-    /// Test determine_remote_ip() when a_ip is local — returns b_ip.
-    #[test]
-    fn test_determine_remote_ip_a_ip_is_local() {
-        let local_ip = detect_local_ip()
-            .expect("detect_local_ip() failed — cannot run this test without a network interface");
-
-        let remote =
-            determine_remote_ip(local_ip, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), local_ip);
-        assert_eq!(remote, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)));
-    }
-
-    /// Test determine_remote_ip() when neither IP matches local (fallback to b_ip).
-    #[test]
-    fn test_determine_remote_ip_neither_matches_fallback() {
-        let local_ip = detect_local_ip()
-            .expect("detect_local_ip() failed — cannot run this test without a network interface");
-
-        let remote = determine_remote_ip(
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
-            local_ip,
-        );
-        assert_eq!(
-            remote,
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
-            "fallback should return b_ip (the larger address)"
         );
     }
 
@@ -2198,5 +2120,205 @@ mod tests {
                 "own IP must not appear in vpn_peers after filtering: {ip}"
             );
         }
+    }
+
+    /// Verify that handle_verdict() with resolved=None skips enforcement entirely.
+    ///
+    /// The packet loop guards against resolved=None in production (it skips
+    /// packets when local_ip is unknown, so set_resolved is always called with
+    /// a real IP). This test exercises handle_verdict() in isolation so that
+    /// any future code path that bypasses the packet-loop invariant cannot
+    /// silently enforce against a wrong target. Three properties verified:
+    ///
+    /// 1. No enforcement command is sent (socket read end gets no bytes).
+    /// 2. No panic — the function returns cleanly.
+    /// 3. (Implicitly) No storage event fires — storage_tx is None, and the
+    ///    function returns before the storage branches.
+    #[test]
+    fn test_resolved_flow_none_does_not_enforce() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+
+        // Socket pair: write_half → CaptureEngine, read_half → test assertion.
+        let (write_half, mut read_half) = UnixStream::pair().expect("UnixStream::pair");
+        read_half
+            .set_nonblocking(true)
+            .expect("set_nonblocking on read_half");
+
+        let excluded: Arc<ArcSwap<HashSet<IpAddr>>> =
+            Arc::new(ArcSwap::from_pointee(HashSet::new()));
+        let init = CaptureInit {
+            bpf_fd: -1,
+            buf: vec![0u8; 4096],
+            write_half,
+            caches: NetworkCaches {
+                local_ip: Arc::new(ArcSwap::from_pointee(Some(IpAddr::V4(Ipv4Addr::new(
+                    192, 168, 1, 1,
+                ))))),
+                own_ips: Arc::new(ArcSwap::from_pointee(HashSet::new())),
+                port_pid: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            },
+            config: CaptureConfig {
+                poll_timeout_ms: 100,
+                detector_timeout: std::time::Duration::from_millis(100),
+                cb_config: detectors::CircuitBreakerConfig::default(),
+                gateway_ip: None,
+            },
+            enrich_pool: crate::enrichment::EnrichmentPool::new(None, None, 1),
+            tracker: crate::flow::FlowTracker::new(crate::flow::FlowConfig::default()),
+            decision_engine: crate::decision::DecisionEngine::new(
+                synapse_common::DecisionConfig::default(),
+            ),
+            detectors: vec![],
+            cross_flow_state: Arc::new(std::sync::Mutex::new(
+                detectors::cross_flow::CrossFlowState::new(
+                    detectors::cross_flow::CrossFlowConfig::default(),
+                    Arc::clone(&excluded),
+                ),
+            )),
+            storage_tx: None,
+        };
+
+        let mut engine = CaptureEngine::new(init);
+
+        // FlowRecord with resolved: None — the case the packet loop prevents in
+        // production but which future refactors could accidentally introduce.
+        let flow = synapse_common::FlowRecord {
+            flow_id: 1,
+            a_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+            b_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            a_port: 443,
+            b_port: 50001,
+            protocol: 6,
+            local_port: 50001,
+            pid: None,
+            packet_count: 5,
+            byte_count: 500,
+            dns_name: None,
+            process_path: None,
+            process_start_time: None,
+            country_code: None,
+            asn: None,
+            reputation_score: None,
+            flow_age: std::time::Duration::from_secs(2),
+            resolved: None,
+        };
+
+        // Block verdict — the highest-severity path. If the resolved=None guard
+        // were absent, this would attempt to send an EnforcementCommand on the socket.
+        let verdict = synapse_common::Verdict::Block {
+            ttl: std::time::Duration::from_secs(60),
+            reason: "test block — must not reach enforcement".to_string(),
+        };
+
+        // Must not panic.
+        engine.handle_verdict(1, &flow, &[], 0.9, verdict);
+
+        // Nothing must have been written to the socket.
+        let mut buf = [0u8; 64];
+        let result = read_half.read(&mut buf);
+        assert!(
+            matches!(&result, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "handle_verdict must send no enforcement command when resolved=None; \
+             socket read returned: {result:?}"
+        );
+    }
+
+    /// Verify that process_expired_flows skips detector evaluation for flows with resolved=None.
+    ///
+    /// The packet loop prevents resolved=None in production (it skips packets when
+    /// local_ip is unknown). This test bypasses that invariant by inserting a flow
+    /// via tracker.update() without calling set_resolved(), then running
+    /// process_expired_flows on it. A SentinelDetector asserts it is never called.
+    ///
+    /// Without the resolved=None guard, FlowBehavior::evaluate() would panic (its
+    /// .expect() fires), caught by run_detectors' catch_unwind. With the guard,
+    /// the flow is skipped before run_detectors — SentinelDetector::evaluate is
+    /// never scheduled, and was_called stays false.
+    #[test]
+    fn test_detector_path_resolved_none_skipped() {
+        use std::os::unix::net::UnixStream;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct SentinelDetector {
+            was_called: Arc<AtomicBool>,
+        }
+        impl synapse_common::Detector for SentinelDetector {
+            fn id(&self) -> synapse_common::DetectorId {
+                synapse_common::DetectorId::Custom(0xDD)
+            }
+            fn version(&self) -> &str {
+                "test"
+            }
+            fn evaluate(
+                &self,
+                _flow: &synapse_common::FlowRecord,
+            ) -> synapse_common::DetectorFinding {
+                self.was_called.store(true, Ordering::SeqCst);
+                synapse_common::DetectorFinding::timed_out(self.id(), self.version(), 0)
+            }
+        }
+
+        let was_called = Arc::new(AtomicBool::new(false));
+        let (write_half, _read_half) = UnixStream::pair().expect("UnixStream::pair");
+        let excluded: Arc<ArcSwap<HashSet<IpAddr>>> =
+            Arc::new(ArcSwap::from_pointee(HashSet::new()));
+        let init = CaptureInit {
+            bpf_fd: -1,
+            buf: vec![0u8; 4096],
+            write_half,
+            caches: NetworkCaches {
+                local_ip: Arc::new(ArcSwap::from_pointee(Some(IpAddr::V4(Ipv4Addr::new(
+                    192, 168, 1, 1,
+                ))))),
+                own_ips: Arc::new(ArcSwap::from_pointee(HashSet::new())),
+                port_pid: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            },
+            config: CaptureConfig {
+                poll_timeout_ms: 100,
+                detector_timeout: std::time::Duration::from_millis(100),
+                cb_config: detectors::CircuitBreakerConfig::default(),
+                gateway_ip: None,
+            },
+            enrich_pool: crate::enrichment::EnrichmentPool::new(None, None, 1),
+            tracker: crate::flow::FlowTracker::new(crate::flow::FlowConfig::default()),
+            decision_engine: crate::decision::DecisionEngine::new(
+                synapse_common::DecisionConfig::default(),
+            ),
+            detectors: vec![Arc::new(SentinelDetector {
+                was_called: Arc::clone(&was_called),
+            })],
+            cross_flow_state: Arc::new(std::sync::Mutex::new(
+                detectors::cross_flow::CrossFlowState::new(
+                    detectors::cross_flow::CrossFlowConfig::default(),
+                    Arc::clone(&excluded),
+                ),
+            )),
+            storage_tx: None,
+        };
+        let mut engine = CaptureEngine::new(init);
+
+        // Insert a flow via tracker.update() WITHOUT calling set_resolved().
+        // This leaves resolved=None — the state the packet loop prevents in production.
+        let info = synapse_common::PacketInfo {
+            src_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            src_port: 443,
+            dst_port: 50001,
+            protocol: 6,
+            length: 100,
+        };
+        let flow_id = match engine.tracker.update(&info, 50001, None) {
+            crate::flow::FlowUpdate::NewFlow(id) => id,
+            other => panic!("expected NewFlow, got {other:?}"),
+        };
+
+        engine.process_expired_flows(&[flow_id]);
+
+        assert!(
+            !was_called.load(Ordering::SeqCst),
+            "SentinelDetector::evaluate must not be called for resolved=None flows; \
+             the guard in process_expired_flows must skip them before run_detectors"
+        );
     }
 }

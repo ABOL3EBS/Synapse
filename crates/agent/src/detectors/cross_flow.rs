@@ -607,6 +607,13 @@ mod tests {
             asn: None,
             reputation_score: None,
             flow_age: std::time::Duration::from_secs(5),
+            // a_port=50000=local_port → a_ip is local, b_ip is remote.
+            resolved: Some(synapse_common::ResolvedFlow {
+                local_ip: a_ip,
+                local_port: 50000,
+                remote_ip: b_ip,
+                remote_port: 443,
+            }),
         }
     }
 

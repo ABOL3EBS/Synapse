@@ -376,14 +376,52 @@ pub trait Detector: Send + Sync {
     fn evaluate(&self, flow: &FlowRecord) -> DetectorFinding;
 }
 
+/// Direction-resolved endpoints for a flow, frozen at flow creation time.
+///
+/// Constructed once using per-packet `src_ip`/`dst_ip` fields (which carry genuine
+/// direction from the wire) and stored for the flow's lifetime. Any code that needs
+/// "local port", "remote IP", or "remote port" for enforcement, directional scoring,
+/// or logging must read from here — never re-derive from the canonical `a_ip`/`b_ip`
+/// fields, which discard direction.
+///
+/// `resolved` is `Some` only when the own-ips ArcSwap was populated at the instant
+/// the first packet for this flow was processed. It is `None` for flows created during
+/// the startup window before the refresh thread fires (~5 s). Callers must handle `None`
+/// conservatively: skip enforcement and skip directional sub-detectors.
+///
+/// # Network-change safety
+///
+/// | Scenario                                   | Flow survives change? | `resolved` still correct? |
+/// |--------------------------------------------|----------------------|---------------------------|
+/// | TCP route flap, local IP unchanged         | Yes                  | Yes — IP did not change   |
+/// | TCP local IP changes (VPN connect/disc.)   | No — BPF on en0 stops seeing packets → 5 s expiry | N/A |
+/// | UDP, local IP unchanged                    | Yes                  | Yes                       |
+/// | UDP, DHCP lease change WITH iface teardown | No — packets stop → 5 s expiry | N/A       |
+/// | UDP, DHCP change WITHOUT iface teardown    | **Yes (rare)**       | **Stale** — bounded, accepted |
+///
+/// The rare UDP/DHCP-without-teardown case is a known, bounded limitation: the window
+/// is at most `expiry_secs = 5` seconds. Even in that window, frozen-at-creation is
+/// more correct than re-deriving from the current `local_ip` ArcSwap snapshot, because
+/// the canonical ordering was established at creation time.
+///
+/// TODO: signal a flow-flush from the `own-ips-refresh` thread on detected local-IP
+/// change to close this window completely.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedFlow {
+    pub local_ip: IpAddr,
+    pub local_port: u16,
+    pub remote_ip: IpAddr,
+    pub remote_port: u16,
+}
+
 /// Reference to a flow record passed to detectors.
 /// Extracted from the flow tracker — contains everything a detector needs
 /// without giving it mutable access to the tracker itself.
 ///
 /// **Field ordering is canonical, not directional.** `a_ip`/`a_port` are the
 /// numerically smaller endpoint; `b_ip`/`b_port` are the larger. This
-/// discards which side is local. Use `determine_remote_ip()` (agent) to
-/// resolve the actual remote endpoint before enforcement.
+/// discards which side is local. Use `flow.resolved` to get the actual local
+/// and remote endpoints — never re-derive from `a_ip`/`b_ip` directly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlowRecord {
     pub flow_id: u64,
@@ -403,6 +441,9 @@ pub struct FlowRecord {
     pub asn: Option<u32>,
     pub reputation_score: Option<f32>,
     pub flow_age: Duration,
+    /// Direction-resolved endpoints, frozen at flow creation. `None` during
+    /// the startup window before own-ips detection fires.
+    pub resolved: Option<ResolvedFlow>,
 }
 
 // ---------------------------------------------------------------------------
@@ -450,25 +491,16 @@ pub struct FlowFeatures {
 }
 
 impl FlowFeatures {
-    /// Extract features from a FlowRecord.
-    pub fn from_flow(flow: &FlowRecord) -> Self {
+    /// Extract features from a flow. Caller must supply `resolved` separately,
+    /// which forces direction to be resolved before this can be called — making
+    /// an unresolved flow a compile error rather than a runtime panic.
+    pub fn from_flow(flow: &FlowRecord, resolved: &ResolvedFlow) -> Self {
         let duration_ms = u64::try_from(flow.flow_age.as_millis()).unwrap_or(u64::MAX);
         let duration_sec = flow.flow_age.as_secs_f64();
         let packet_frequency = if duration_sec > 0.0 {
             flow.packet_count as f64 / duration_sec
         } else {
             0.0
-        };
-
-        // Compute remote port: the port that isn't local_port.
-        let remote_port = if flow.a_port == flow.local_port {
-            flow.b_port
-        } else if flow.b_port == flow.local_port {
-            flow.a_port
-        } else {
-            // local_port doesn't match either canonical port (ICMP or non-TCP/UDP).
-            // Fall back to b_port (existing behavior).
-            flow.b_port
         };
 
         Self {
@@ -478,7 +510,7 @@ impl FlowFeatures {
             duration_ms,
             packet_frequency,
             protocol: flow.protocol,
-            dst_port: remote_port,
+            dst_port: resolved.remote_port,
             has_dns_name: flow.dns_name.is_some(),
             has_process_path: flow.process_path.is_some(),
             reputation_score: flow.reputation_score,
@@ -813,9 +845,60 @@ mod tests {
             asn: None,
             reputation_score: None,
             flow_age: age,
+            resolved: Some(ResolvedFlow {
+                local_ip: IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+                local_port: 1000,
+                remote_ip: IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2)),
+                remote_port: 2000,
+            }),
         };
-        let features = FlowFeatures::from_flow(&flow);
+        let resolved = flow
+            .resolved
+            .as_ref()
+            .expect("test flow always has resolved: Some by construction");
+        let features = FlowFeatures::from_flow(&flow, resolved);
         assert_eq!(features.duration_ms, u64::MAX);
+    }
+
+    #[test]
+    fn test_flow_features_resolved_remote_port_wins() {
+        use std::time::Duration;
+        // a_port=8080 is the canonical "remote" by disambiguation (b_port=50000==local_port).
+        // resolved.remote_port=443 must override it — dst_port should be 443.
+        let flow = FlowRecord {
+            flow_id: 1,
+            a_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            b_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            a_port: 8080,
+            b_port: 50000,
+            protocol: 6,
+            local_port: 50000,
+            pid: None,
+            packet_count: 1,
+            byte_count: 100,
+            dns_name: None,
+            process_path: None,
+            process_start_time: None,
+            country_code: None,
+            asn: None,
+            reputation_score: None,
+            flow_age: Duration::from_secs(1),
+            resolved: Some(ResolvedFlow {
+                local_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+                local_port: 50000,
+                remote_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                remote_port: 443,
+            }),
+        };
+        let resolved = flow
+            .resolved
+            .as_ref()
+            .expect("test flow always has resolved: Some by construction");
+        let features = FlowFeatures::from_flow(&flow, resolved);
+        assert_eq!(
+            features.dst_port, 443,
+            "resolved.remote_port must override local_port disambiguation"
+        );
     }
 
     /// Verify that try_send on a full bounded channel returns Full immediately.
@@ -863,6 +946,12 @@ mod tests {
             asn: None,
             reputation_score: None,
             flow_age: Duration::from_secs(0),
+            resolved: Some(ResolvedFlow {
+                local_ip: IpAddr::V4(std::net::Ipv4Addr::new(2, 2, 2, 2)),
+                local_port: 50000,
+                remote_ip: IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)),
+                remote_port: 80,
+            }),
         };
 
         // Fill channel to capacity — no worker thread is consuming, so all

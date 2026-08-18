@@ -164,6 +164,9 @@ pub struct FlowRecord {
     /// When detectors were last run on this flow.
     /// Updated by mark_evaluated() after each detection pass.
     pub last_evaluated: Instant,
+    /// Direction-resolved endpoints, set once after flow creation via set_resolved().
+    /// `None` during the startup window before own-ips detection fires.
+    pub resolved: Option<synapse_common::ResolvedFlow>,
 }
 
 impl From<FlowRecord> for synapse_common::FlowRecord {
@@ -186,6 +189,7 @@ impl From<FlowRecord> for synapse_common::FlowRecord {
             asn: flow.asn,
             reputation_score: flow.reputation_score,
             flow_age: flow.first_seen.elapsed(),
+            resolved: flow.resolved,
         }
     }
 }
@@ -276,6 +280,7 @@ impl FlowTracker {
             asn: None,
             reputation_score: None,
             last_evaluated: now,
+            resolved: None,
         };
 
         self.index.insert(key, flow_id);
@@ -470,6 +475,15 @@ impl FlowTracker {
     /// Get a reference to a flow by ID.
     pub fn get(&self, flow_id: u64) -> Option<&FlowRecord> {
         self.flows.get(&flow_id)
+    }
+
+    /// Attach the direction-resolved endpoints to an existing flow.
+    /// Called once immediately after NewFlow, using per-packet src/dst info.
+    /// No-op if the flow has already been removed (race with expiry is benign).
+    pub fn set_resolved(&mut self, flow_id: u64, resolved: synapse_common::ResolvedFlow) {
+        if let Some(flow) = self.flows.get_mut(&flow_id) {
+            flow.resolved = Some(resolved);
+        }
     }
 
     /// Mark a flow as evaluated — bumps last_evaluated to now.

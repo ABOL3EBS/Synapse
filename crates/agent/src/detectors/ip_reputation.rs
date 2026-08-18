@@ -253,6 +253,7 @@ impl Detector for IpReputation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use synapse_common::ResolvedFlow;
 
     fn make_flow_with_ips(a_ip: IpAddr, b_ip: IpAddr, reputation: Option<f32>) -> FlowRecord {
         FlowRecord {
@@ -273,6 +274,13 @@ mod tests {
             asn: None,
             reputation_score: reputation,
             flow_age: std::time::Duration::from_secs(5),
+            // b_port=50000=local_port → b_ip is local, a_ip is remote.
+            resolved: Some(ResolvedFlow {
+                local_ip: b_ip,
+                local_port: 50000,
+                remote_ip: a_ip,
+                remote_port: 443,
+            }),
         }
     }
 
