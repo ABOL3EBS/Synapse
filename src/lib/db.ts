@@ -54,6 +54,12 @@ export interface CountryStat {
   count: number;
 }
 
+export interface DayStat {
+  /** 0 = today, 6 = six days ago */
+  day_offset: number;
+  count: number;
+}
+
 export interface ActiveBlock {
   ip_text: string;
   remaining_ms: number;
@@ -123,6 +129,11 @@ export function getTopApps(): Promise<TopApp[]> {
 export function getThreatCountries(): Promise<CountryStat[]> {
   if (!isTauri()) return Promise.reject(new Error("not-tauri"));
   return invoke<CountryStat[]>("get_threat_countries");
+}
+
+export function getWeeklyBlocks(): Promise<DayStat[]> {
+  if (!isTauri()) return Promise.reject(new Error("not-tauri"));
+  return invoke<DayStat[]>("get_weekly_blocks");
 }
 
 export function getActiveBlocks(): Promise<ActiveBlock[]> {

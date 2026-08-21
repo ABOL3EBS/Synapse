@@ -416,6 +416,57 @@ fn get_top_apps(state: tauri::State<DbState>) -> Vec<TopApp> {
 }
 
 // ---------------------------------------------------------------------------
+// Weekly blocks — 7-day bar strip
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DayStat {
+    /// 0 = today, 6 = six days ago (left-to-right order callers must reverse).
+    pub day_offset: i64,
+    pub count: i64,
+}
+
+#[tauri::command]
+fn get_weekly_blocks(state: tauri::State<DbState>) -> Vec<DayStat> {
+    let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(conn) = guard.as_ref() else {
+        return vec![];
+    };
+
+    let now = now_ms();
+    let day_ms: i64 = 24 * 60 * 60 * 1000;
+    let today_bucket = now / day_ms;
+    let since = now - 7 * day_ms;
+
+    let mut stmt = match conn.prepare(
+        "SELECT CAST(ts_ms / 86400000 AS INTEGER) as bucket, COUNT(*) as cnt
+         FROM verdicts
+         WHERE verdict = 'Block' AND ts_ms >= ?1
+         GROUP BY bucket",
+    ) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+
+    let mut map: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    if let Ok(rows) = stmt.query_map(rusqlite::params![since], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+    }) {
+        for (bucket, cnt) in rows.flatten() {
+            map.insert(bucket, cnt);
+        }
+    }
+
+    // day_offset 6 = oldest, 0 = today — callers render left-to-right
+    (0..7_i64)
+        .rev()
+        .map(|offset| DayStat {
+            day_offset: offset,
+            count: *map.get(&(today_bucket - offset)).unwrap_or(&0),
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Threat countries (globe)
 // ---------------------------------------------------------------------------
 
@@ -473,6 +524,7 @@ pub fn run() {
             get_detector_breakdown,
             get_top_apps,
             get_threat_countries,
+            get_weekly_blocks,
             settings::get_active_blocks,
             settings::request_unblock,
             settings::get_agent_status,
