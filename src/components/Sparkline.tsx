@@ -41,8 +41,8 @@ export default function Sparkline({ points }: Props) {
           >
             <defs>
               <linearGradient id="sparkline-area" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#10B981" stopOpacity="0.18" />
-                <stop offset="100%" stopColor="#10B981" stopOpacity="0" />
+                <stop offset="0%" stopColor="#1E3A8A" stopOpacity="0.13" />
+                <stop offset="100%" stopColor="#1E3A8A" stopOpacity="0" />
               </linearGradient>
             </defs>
 
@@ -59,7 +59,7 @@ export default function Sparkline({ points }: Props) {
 
             <path d={areaPath} fill="url(#sparkline-area)" />
             <path
-              d={linePath} fill="none" stroke="#10B981" strokeWidth="1.8"
+              d={linePath} fill="none" stroke="#1E3A8A" strokeWidth="1.8"
               strokeLinejoin="round" strokeLinecap="round"
               vectorEffect="non-scaling-stroke"
             />
@@ -106,9 +106,9 @@ export default function Sparkline({ points }: Props) {
                   width: sz,
                   height: sz,
                   borderRadius: "50%",
-                  backgroundColor: "#10B981",
+                  backgroundColor: "#1E3A8A",
                   border: isPeak ? "2px solid white" : "1.5px solid white",
-                  boxShadow: isPeak ? "0 0 0 3px rgba(16,185,129,0.2)" : "none",
+                  boxShadow: isPeak ? "0 0 0 3px rgba(30,58,138,0.18)" : "none",
                   transform: "translate(-50%, -50%)",
                   pointerEvents: "none",
                 }}

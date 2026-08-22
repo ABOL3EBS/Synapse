@@ -35,7 +35,7 @@ export default function DetectorChart({ stats }: Props) {
             </span>
             <div className="flex-1 h-2 bg-navy/5 rounded-full overflow-hidden">
               <div
-                className="h-full bg-emerald rounded-full bar-grow"
+                className="h-full bg-crimson rounded-full bar-grow"
                 style={{ width: `${pct}%`, animationDelay: `${i * 80}ms` }}
               />
             </div>

@@ -152,7 +152,7 @@ function StatCard({ label, value, accent }: {
   label: string; value: number; accent: "emerald" | "navy";
 }) {
   const animated = useCountUp(value);
-  const numColor = accent === "emerald" ? "text-emerald-dark" : "text-navy";
+  const numColor = "text-navy";
   return (
     <div
       className="bg-white rounded-2xl shadow-card border border-black/[0.04] px-4 py-4 flex flex-col gap-1"
@@ -206,9 +206,9 @@ function WeeklyBars({ days }: { days: DayStat[] }) {
           return (
             <div key={d.day_offset} className="flex-1 flex flex-col items-center gap-[3px] justify-end h-full">
               <span className="text-[9px] font-semibold text-navy/40 leading-none">{d.count}</span>
-              <div className="w-full rounded-t-[3px] overflow-hidden flex-1 relative bg-emerald/10">
+              <div className="w-full rounded-t-[3px] overflow-hidden flex-1 relative bg-crimson/10">
                 <div
-                  className="absolute bottom-0 left-0 right-0 rounded-t-[3px] bg-emerald bar-grow"
+                  className="absolute bottom-0 left-0 right-0 rounded-t-[3px] bg-crimson bar-grow"
                   style={{ height: `${pct}%` }}
                 />
               </div>

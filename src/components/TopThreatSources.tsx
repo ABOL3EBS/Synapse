@@ -48,7 +48,7 @@ export default function TopThreatSources({ sources }: Props) {
                   className="h-full rounded-full bar-grow"
                   style={{
                     width: `${pct}%`,
-                    background: "rgba(239,68,68,0.65)",
+                    background: "rgba(179,54,74,0.65)",
                     animationDelay: `${i * 80}ms`,
                   }}
                 />

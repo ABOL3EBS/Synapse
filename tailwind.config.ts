@@ -12,6 +12,11 @@ export default {
           dark: "#059669",
           light: "#D1FAE5",
         },
+        crimson: {
+          DEFAULT: "#B3364A",
+          dark: "#8F2A3A",
+          light: "#fde8eb",
+        },
         amber: {
           DEFAULT: "#F59E0B",
           light: "#FEF3C7",

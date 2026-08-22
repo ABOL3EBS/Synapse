@@ -54,7 +54,7 @@ export default function TopApps({ apps }: Props) {
             <div className="flex gap-1.5 shrink-0">
               {app.blocks > 0 && (
                 <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded-full
-                  bg-emerald-light text-emerald-dark">
+                  bg-crimson-light text-crimson-dark">
                   {app.blocks}B
                 </span>
               )}
@@ -70,7 +70,7 @@ export default function TopApps({ apps }: Props) {
       })}
       <div className="mt-3 pt-2 border-t border-black/[0.04] flex gap-3">
         <span className="text-[9px] text-navy/30">
-          <span className="font-semibold text-emerald-dark">B</span> = blocked
+          <span className="font-semibold text-crimson-dark">B</span> = blocked
         </span>
         <span className="text-[9px] text-navy/30">
           <span className="font-semibold text-amber-700">A</span> = flagged
