@@ -50,7 +50,7 @@ export default function ActivityScreen() {
       </header>
 
       {/* Feed */}
-      <div className="flex-1 scroll-area px-4 pb-4 space-y-2.5">
+      <div className="flex-1 scroll-area px-4 xl:px-6 pb-4 xl:pb-6 space-y-2.5 xl:space-y-3">
         {loading && <SkeletonFeed />}
 
         {error && (

@@ -49,21 +49,21 @@ export default function ActivityRow({ item, isNew }: Props) {
     <div className={`rounded-2xl shadow-card border border-black/[0.04] overflow-hidden${isNew ? " card-flash" : " bg-white"}`}>
       {/* Main row */}
       <button
-        className="w-full text-left px-4 py-3.5 flex items-start gap-3"
+        className="w-full text-left px-4 xl:px-5 py-3.5 xl:py-4 flex items-start gap-3 xl:gap-4"
         onClick={() => setExpanded((e) => !e)}
       >
         {/* Verdict dot */}
-        <span className={`mt-1.5 shrink-0 w-2 h-2 rounded-full ${VERDICT_DOT[item.verdict]}`} />
+        <span className={`mt-1.5 shrink-0 w-2 h-2 xl:w-2.5 xl:h-2.5 rounded-full ${VERDICT_DOT[item.verdict]}`} />
 
         {/* Content */}
         <div className="flex-1 min-w-0">
-          <p className="text-sm font-medium text-navy leading-snug">{sentence}</p>
-          <p className="text-xs text-navy/40 mt-0.5">{relativeTime(item.ts_ms, now)}</p>
+          <p className="text-sm xl:text-base font-medium text-navy leading-snug">{sentence}</p>
+          <p className="text-xs xl:text-sm text-navy/40 mt-0.5">{relativeTime(item.ts_ms, now)}</p>
         </div>
 
         {/* Verdict badge + chevron */}
         <div className="flex items-center gap-2 shrink-0">
-          <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${VERDICT_LABEL_CLASS[item.verdict]}`}>
+          <span className={`text-[10px] xl:text-xs font-semibold px-2 py-0.5 xl:px-2.5 xl:py-1 rounded-full ${VERDICT_LABEL_CLASS[item.verdict]}`}>
             {VERDICT_LABEL[item.verdict]}
           </span>
           <ChevronIcon open={expanded} />
@@ -72,8 +72,8 @@ export default function ActivityRow({ item, isNew }: Props) {
 
       {/* Expanded "Why?" panel */}
       {expanded && (
-        <div className="border-t border-black/[0.04] px-4 py-4 space-y-3">
-          <p className="text-sm text-navy/70 leading-relaxed">{whySentence}</p>
+        <div className="border-t border-black/[0.04] px-4 xl:px-5 py-4 xl:py-5 space-y-3">
+          <p className="text-sm xl:text-base text-navy/70 leading-relaxed">{whySentence}</p>
 
           {/* Technical details accordion */}
           <button

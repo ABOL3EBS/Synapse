@@ -137,16 +137,16 @@ export default function GlobeScreen() {
       </div>
 
       {/* Right panel */}
-      <div className="w-52 flex flex-col justify-center px-4 py-6 gap-4 border-l border-black/[0.04]">
+      <div className="w-52 xl:w-64 2xl:w-72 flex flex-col justify-center px-4 xl:px-6 2xl:px-8 py-6 xl:py-8 gap-4 xl:gap-6 border-l border-black/[0.04]">
         <div>
-          <p className="text-[10px] font-semibold uppercase tracking-widest text-navy/30 mb-3">
+          <p className="text-[10px] xl:text-xs font-semibold uppercase tracking-widest text-navy/30 mb-3 xl:mb-4">
             Threat Origins
           </p>
 
-          {error && <p className="text-xs text-navy/30">Couldn't load data.</p>}
+          {error && <p className="text-xs xl:text-sm text-navy/30">Couldn't load data.</p>}
 
           {!error && ranked.length === 0 && (
-            <p className="text-xs text-navy/30 leading-relaxed">
+            <p className="text-xs xl:text-sm text-navy/30 leading-relaxed">
               No geo-tagged threats yet. Country data appears once Synapse flags traffic to public
               IPs.
             </p>
@@ -157,12 +157,12 @@ export default function GlobeScreen() {
             const pct = (s.count / max) * 100;
             const name = COUNTRY_COORDS[s.country_code]?.name ?? countryName(s.country_code);
             return (
-              <div key={s.country_code} className="mb-3">
+              <div key={s.country_code} className="mb-3 xl:mb-4">
                 <div className="flex justify-between items-center mb-1">
-                  <span className="text-xs text-navy/70 font-medium truncate mr-2">{name}</span>
-                  <span className="text-[10px] text-navy/40 tabular-nums shrink-0">{s.count}</span>
+                  <span className="text-xs xl:text-sm text-navy/70 font-medium truncate mr-2">{name}</span>
+                  <span className="text-[10px] xl:text-xs text-navy/40 tabular-nums shrink-0">{s.count}</span>
                 </div>
-                <div className="h-1 rounded-full bg-navy/8 overflow-hidden">
+                <div className="h-1 xl:h-1.5 rounded-full bg-navy/8 overflow-hidden">
                   <div
                     className="h-full rounded-full bg-red-500 bar-grow"
                     style={{ width: `${pct}%`, animationDelay: `${i * 80}ms` }}
@@ -174,7 +174,7 @@ export default function GlobeScreen() {
         </div>
 
         {ranked.length > 0 && (
-          <p className="text-[9px] text-navy/25 leading-relaxed mt-auto">
+          <p className="text-[9px] xl:text-[11px] text-navy/25 leading-relaxed mt-auto">
             Countries where Synapse blocked or flagged traffic
           </p>
         )}
