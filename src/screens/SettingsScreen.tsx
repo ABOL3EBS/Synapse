@@ -65,18 +65,13 @@ export default function SettingsScreen() {
 
   return (
     <div className="h-full overflow-y-auto scroll-area">
-      {/* flex-col + min-h-full: fills the viewport; Active Blocks grows to consume remaining space. */}
-      <div className="max-w-4xl xl:max-w-6xl 2xl:max-w-7xl mx-auto px-6 py-5 flex flex-col gap-6 min-h-full">
-      {/* Active Blocks — flex-1 so it expands to fill space left by the two fixed sections below. */}
-      <section className="flex flex-col flex-1 min-h-[120px]">
-        <p className="text-[10px] font-semibold uppercase tracking-widest text-navy/30 mb-3">
-          Active Blocks
-        </p>
-        <div className="rounded-2xl border border-black/[0.04] bg-white divide-y divide-black/[0.04] overflow-hidden flex-1 flex flex-col">
+      <div className="max-w-4xl xl:max-w-6xl 2xl:max-w-7xl mx-auto px-6 py-5 flex flex-col gap-6">
+      {/* Active Blocks — sized to content; caps at max-h and scrolls internally once it exceeds that. */}
+      <section>
+        <SectionHeader icon={<ActiveBlocksIcon />} title="Active Blocks" accent="red" />
+        <div className="rounded-2xl border border-black/[0.04] bg-white divide-y divide-black/[0.04] overflow-y-auto overflow-x-hidden max-h-[440px]">
           {blocks.length === 0 ? (
-            <div className="flex-1 flex items-center justify-center">
-              <span className="text-sm text-navy/40">No active blocks</span>
-            </div>
+            <div className="py-7 px-5 text-center text-sm text-navy/40">No active blocks</div>
           ) : (
             blocks.map((block) => (
               <BlockRow
@@ -93,17 +88,21 @@ export default function SettingsScreen() {
 
       {/* Detection Thresholds */}
       <section>
-        <p className="text-[10px] font-semibold uppercase tracking-widest text-navy/30 mb-3">
-          Detection Thresholds
-        </p>
-        <div className="rounded-2xl border border-black/[0.04] bg-white divide-y divide-black/[0.04] overflow-hidden">
+        <SectionHeader icon={<ThresholdsIcon />} title="Detection Thresholds" accent="navy" />
+        <div className="rounded-2xl border border-black/[0.04] bg-white overflow-hidden">
           <ThresholdRow
             label="Block threshold"
             value={config?.block_threshold ?? 0.7}
+            accent="crimson"
           />
           <ThresholdRow
             label="Alert threshold"
             value={config?.alert_threshold ?? 0.3}
+            accent="amber"
+          />
+          <ThresholdRangeBar
+            alert={config?.alert_threshold ?? 0.3}
+            block={config?.block_threshold ?? 0.7}
           />
         </div>
         <p className="text-[10px] text-navy/30 mt-2 px-1">
@@ -113,9 +112,7 @@ export default function SettingsScreen() {
 
       {/* CrossFlow Exclusions */}
       <section>
-        <p className="text-[10px] font-semibold uppercase tracking-widest text-navy/30 mb-3">
-          CrossFlow Exclusions
-        </p>
+        <SectionHeader icon={<ExclusionsIcon />} title="CrossFlow Exclusions" accent="navy" />
         <div className="rounded-2xl border border-black/[0.04] bg-white divide-y divide-black/[0.04] overflow-hidden">
           {!config || config.cf_exclusions.length === 0 ? (
             <div className="px-4 py-4 text-sm text-navy/40 text-center">
@@ -234,14 +231,100 @@ function UnblockButton({
   );
 }
 
-function ThresholdRow({ label, value }: { label: string; value: number }) {
+const THRESHOLD_VALUE_COLOR: Record<"crimson" | "amber", string> = {
+  crimson: "text-crimson",
+  amber: "text-amber-700",
+};
+
+function ThresholdRow({
+  label,
+  value,
+  accent,
+}: {
+  label: string;
+  value: number;
+  accent: "crimson" | "amber";
+}) {
   return (
-    <div className="px-4 py-3 flex items-center">
+    <div className="px-4 py-3 flex items-center border-b border-black/[0.04]">
       <span className="text-sm text-navy flex-1">{label}</span>
-      <span className="text-sm font-semibold tabular-nums text-navy">
+      <span className={`text-sm font-semibold tabular-nums ${THRESHOLD_VALUE_COLOR[accent]}`}>
         {value.toFixed(2)}
       </span>
     </div>
+  );
+}
+
+// Read-only visualization of where the Alert/Block thresholds sit on the 0–1 scale.
+// No drag/input interaction — display only.
+function ThresholdRangeBar({ alert, block }: { alert: number; block: number }) {
+  const alertPct = Math.min(Math.max(alert, 0), 1) * 100;
+  const blockPct = Math.min(Math.max(block, 0), 1) * 100;
+  return (
+    <div className="px-4 pt-1.5 pb-4">
+      <div className="relative h-1.5 rounded-full bg-navy/5">
+        <div className="absolute inset-y-0 left-0 rounded-full bg-amber/25" style={{ width: `${alertPct}%` }} />
+        <div className="absolute inset-y-0 left-0 rounded-full bg-crimson/15" style={{ width: `${blockPct}%` }} />
+        <div
+          className="absolute -top-[3px] w-3 h-3 rounded-full bg-amber border-2 border-white shadow-[0_0_0_1px_rgba(0,0,0,0.06)] -translate-x-1/2"
+          style={{ left: `${alertPct}%` }}
+        />
+        <div
+          className="absolute -top-[3px] w-3 h-3 rounded-full bg-crimson border-2 border-white shadow-[0_0_0_1px_rgba(0,0,0,0.06)] -translate-x-1/2"
+          style={{ left: `${blockPct}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function SectionHeader({
+  icon,
+  title,
+  accent,
+}: {
+  icon: React.ReactNode;
+  title: string;
+  accent: "red" | "navy";
+}) {
+  const border = accent === "red" ? "border-crimson" : "border-navy";
+  const color = accent === "red" ? "text-crimson" : "text-navy";
+  return (
+    <div className={`flex items-center gap-2 mb-2.5 pl-2.5 border-l-[3px] ${border}`}>
+      <span className={color}>{icon}</span>
+      <p className="text-[10px] font-semibold uppercase tracking-widest text-navy/30">{title}</p>
+    </div>
+  );
+}
+
+function ActiveBlocksIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="9" />
+      <path d="M9 12l2 2 4-4" />
+    </svg>
+  );
+}
+
+function ThresholdsIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 21v-7M4 10V3M12 21v-11M12 6V3M20 21v-5M20 12V3" />
+      <circle cx="4" cy="12" r="2" />
+      <circle cx="12" cy="9" r="2" />
+      <circle cx="20" cy="14" r="2" />
+    </svg>
+  );
+}
+
+function ExclusionsIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M2 12h4l3 8 4-16 3 8h6" />
+    </svg>
   );
 }
 
