@@ -1,11 +1,13 @@
 import type { DetectorStat } from "../lib/db";
+import ChevronRight from "./ChevronRight";
 
 interface Props {
   stats: DetectorStat[];
+  onSelect?: (detectorId: string, label: string) => void;
 }
 
 // Strip version suffixes and format for display
-function friendlyName(raw: string): string {
+export function friendlyName(raw: string): string {
   const names: Record<string, string> = {
     CrossFlow: "Scan / Beacon",
     DnsAnalyzer: "DNS Analysis",
@@ -17,7 +19,7 @@ function friendlyName(raw: string): string {
   return names[raw] ?? raw;
 }
 
-export default function DetectorChart({ stats }: Props) {
+export default function DetectorChart({ stats, onSelect }: Props) {
   if (stats.length === 0) return null;
   const max = Math.max(...stats.map((s) => s.count), 1);
 
@@ -28,10 +30,18 @@ export default function DetectorChart({ stats }: Props) {
     <div className="space-y-2.5 chart-fade">
       {active.map((stat, i) => {
         const pct = (stat.count / max) * 100;
+        const label = friendlyName(stat.name);
         return (
-          <div key={stat.name} className="flex items-center gap-3">
+          <button
+            key={stat.name}
+            type="button"
+            onClick={() => onSelect?.(stat.name, label)}
+            className="group w-full flex items-center gap-3 -mx-2 px-2 py-0.5 rounded-lg
+              text-left bg-transparent border-0 cursor-pointer
+              hover:bg-navy/[0.03] transition-colors"
+          >
             <span className="text-xs text-navy/50 w-32 shrink-0 truncate">
-              {friendlyName(stat.name)}
+              {label}
             </span>
             <div className="flex-1 h-2 bg-navy/5 rounded-full overflow-hidden">
               <div
@@ -42,7 +52,8 @@ export default function DetectorChart({ stats }: Props) {
             <span className="text-xs font-semibold text-navy/40 w-10 text-right tabular-nums">
               {stat.count.toLocaleString()}
             </span>
-          </div>
+            <ChevronRight />
+          </button>
         );
       })}
 

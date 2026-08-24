@@ -1,10 +1,21 @@
 import { useEffect, useRef, useState } from "react";
 import ActivityRow from "../components/ActivityRow";
-import { getActivityFeed, isTauri, type ActivityItem } from "../lib/db";
+import {
+  getActivityFeed,
+  getActivityFeedFiltered,
+  isTauri,
+  type ActivityItem,
+  type ActivityFilter,
+} from "../lib/db";
 
 const REFRESH_MS = 5_000;
 
-export default function ActivityScreen() {
+interface Props {
+  filter: ActivityFilter;
+  onClearFilter: () => void;
+}
+
+export default function ActivityScreen({ filter, onClearFilter }: Props) {
   const [items, setItems] = useState<ActivityItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
@@ -13,8 +24,23 @@ export default function ActivityScreen() {
   const isFirstLoad = useRef(true);
 
   useEffect(() => {
-    const load = () =>
-      getActivityFeed(50)
+    // Switching filters is a fresh view, not an incremental update —
+    // reset new-item tracking so the whole result doesn't flash green.
+    isFirstLoad.current = true;
+    seenIds.current = new Set();
+    setLoading(true);
+
+    const load = () => {
+      const fetch = filter
+        ? getActivityFeedFiltered(
+            50,
+            filter.kind === "detector"
+              ? { detectorId: filter.id }
+              : { appName: filter.appName }
+          )
+        : getActivityFeed(50);
+
+      return fetch
         .then((data) => {
           if (isFirstLoad.current) {
             isFirstLoad.current = false;
@@ -33,11 +59,12 @@ export default function ActivityScreen() {
           setLoading(false);
         })
         .catch(() => { setError(true); setLoading(false); });
+    };
 
     load();
     const id = setInterval(load, REFRESH_MS);
     return () => clearInterval(id);
-  }, []);
+  }, [filter]);
 
   return (
     <div className="h-full flex flex-col">
@@ -47,6 +74,7 @@ export default function ActivityScreen() {
         <p className="text-xs text-navy/40 mt-0.5">
           What Synapse has seen on your network
         </p>
+        {filter && <FilterBanner filter={filter} onClear={onClearFilter} />}
       </header>
 
       {/* Feed */}
@@ -79,6 +107,28 @@ export default function ActivityScreen() {
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+function FilterBanner({ filter, onClear }: { filter: NonNullable<ActivityFilter>; onClear: () => void }) {
+  const source = filter.kind === "detector" ? "Detection Breakdown" : "Flagged Apps";
+  const value = filter.kind === "detector" ? filter.label : filter.appName;
+
+  return (
+    <div className="mt-3 inline-flex items-center gap-2 text-[10px] xl:text-xs font-semibold
+      px-2 py-0.5 xl:px-2.5 xl:py-1 rounded-full text-navy/60 bg-navy/5">
+      <span>
+        Filtered from Report → {source} → <span className="text-navy">{value}</span>
+      </span>
+      <button
+        type="button"
+        onClick={onClear}
+        aria-label="Clear filter"
+        className="text-navy/40 hover:text-navy/70 leading-none"
+      >
+        ×
+      </button>
     </div>
   );
 }

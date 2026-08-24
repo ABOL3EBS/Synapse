@@ -2,7 +2,13 @@
 
 **Last verified:** 2026-08-18. Ground-truth ledger — if this file and the architecture doc disagree, this file wins.
 
-## Latest change (2026-08-18) — Steps A–F complete: canonical-vs-directional field migration
+## Latest change (2026-08-24) — Report → Activity/Threat Map drill-down
+
+Report → Activity/Threat Map drill-down (Detection Breakdown, Flagged Apps, Top Threat Sources): implemented, builds/lints/typechecks clean. Globe camera fly-to on Top Threat Sources click: live-verified by user 2026-08-24. Detection Breakdown → Activity filter, Flagged Apps → Activity filter, context banner + clear button, nav-away filter reset: NOT yet live-verified — code complete and static checks pass, but no screenshot/manual confirmation has been done for these specific interactions.
+
+---
+
+## Previous change (2026-08-18) — Steps A–F complete: canonical-vs-directional field migration
 
 **Migration closed.** The recurring bug class where `FlowRecord.a_ip`/`b_ip` canonical fields were treated as directional (`src`/`dst`) is now structurally prevented across all layers — agent, detectors, storage, and dashboard.
 
@@ -387,6 +393,7 @@ This is a **fixable verification gap**, not an accepted limitation like the VPN-
 
 - AI post-analysis (UI layer only — event summarization, KPI explanations, report generation, recommendations)
 - Windows/Linux support (intentionally excluded — §1b)
+- CrossFlow scan-vs-beacon split as separately queryable data — Report's "Scan / Beacon" drill-down currently filters Activity by `detector_id = "CrossFlow"` as a whole (both sub-behaviors together); a real split needs a new `finding_kind` column + migration + `cross_flow.rs` changes to populate it, plus updated aggregation in `get_detector_breakdown`
 
 ## Audit fixes (2026-07-25)
 

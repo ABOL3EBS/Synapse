@@ -1,7 +1,9 @@
 import type { TopApp } from "../lib/db";
+import ChevronRight from "./ChevronRight";
 
 interface Props {
   apps: TopApp[];
+  onSelect?: (appName: string) => void;
 }
 
 function initial(name: string): string {
@@ -15,7 +17,7 @@ function appHue(name: string): number {
   return h % 360;
 }
 
-export default function TopApps({ apps }: Props) {
+export default function TopApps({ apps, onSelect }: Props) {
   if (apps.length === 0) return null;
   const maxTotal = Math.max(...apps.map((a) => a.blocks + a.alerts), 1);
 
@@ -27,7 +29,14 @@ export default function TopApps({ apps }: Props) {
         const hue = appHue(app.app_name);
 
         return (
-          <div key={app.app_name + i} className="flex items-center gap-3">
+          <button
+            key={app.app_name + i}
+            type="button"
+            onClick={() => onSelect?.(app.app_name)}
+            className="group w-full flex items-center gap-3 -mx-2 px-2 py-0.5 rounded-lg
+              text-left bg-transparent border-0 cursor-pointer
+              hover:bg-navy/[0.03] transition-colors"
+          >
             {/* App initial circle */}
             <div
               className="w-6 h-6 rounded-full shrink-0 flex items-center justify-center
@@ -65,7 +74,8 @@ export default function TopApps({ apps }: Props) {
                 </span>
               )}
             </div>
-          </div>
+            <ChevronRight />
+          </button>
         );
       })}
       <div className="mt-3 pt-2 border-t border-black/[0.04] flex gap-3">

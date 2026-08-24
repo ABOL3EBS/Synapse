@@ -19,6 +19,7 @@ import Sparkline from "../components/Sparkline";
 import DetectorChart from "../components/DetectorChart";
 import TopApps from "../components/TopApps";
 import TopThreatSources from "../components/TopThreatSources";
+import type { ActivityFilter } from "../lib/db";
 
 const REFRESH_MS = 30_000;
 
@@ -55,7 +56,12 @@ function buildSelectedDayLabels(points: ChartPoint[]): string[] {
   });
 }
 
-export default function StatsScreen() {
+interface Props {
+  onNavigateActivity: (filter: ActivityFilter) => void;
+  onNavigateGlobe: (countryCode: string) => void;
+}
+
+export default function StatsScreen({ onNavigateActivity, onNavigateGlobe }: Props) {
   const [stats,    setStats]    = useState<ThreatStats | null>(null);
   const [chart,    setChart]    = useState<ChartPoint[]>([]);
   const [detectors,setDetectors]= useState<DetectorStat[]>([]);
@@ -174,15 +180,24 @@ export default function StatsScreen() {
           <div className="max-w-4xl xl:max-w-6xl 2xl:max-w-7xl mx-auto">
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <Panel title="Detection breakdown" style={{ minHeight: PANEL_H }}>
-                <DetectorChart stats={detectors} />
+                <DetectorChart
+                  stats={detectors}
+                  onSelect={(id, label) => onNavigateActivity({ kind: "detector", id, label })}
+                />
                 {detectors.length === 0 && <Empty text="No findings yet" />}
               </Panel>
               <Panel title="Flagged apps" style={{ minHeight: PANEL_H }}>
-                <TopApps apps={topApps} />
+                <TopApps
+                  apps={topApps}
+                  onSelect={(appName) => onNavigateActivity({ kind: "app", appName })}
+                />
                 {topApps.length === 0 && <Empty text="No apps flagged yet" />}
               </Panel>
               <Panel title="Top threat sources" style={{ minHeight: PANEL_H }}>
-                <TopThreatSources sources={countries} />
+                <TopThreatSources
+                  sources={countries}
+                  onSelect={(countryCode) => onNavigateGlobe(countryCode)}
+                />
                 {countries.length === 0 && <Empty text="No threat sources yet" />}
               </Panel>
             </div>

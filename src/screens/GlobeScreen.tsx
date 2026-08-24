@@ -37,7 +37,11 @@ function buildArcs(stats: CountryStat[]): ArcPoint[] {
   return arcs;
 }
 
-export default function GlobeScreen() {
+interface Props {
+  focusCountry?: string | null;
+}
+
+export default function GlobeScreen({ focusCountry }: Props) {
   const globeRef = useRef<GlobeMethods | undefined>(undefined);
   const containerRef = useRef<HTMLDivElement>(null);
   const [stats, setStats] = useState<CountryStat[]>([]);
@@ -76,6 +80,17 @@ export default function GlobeScreen() {
     controls.autoRotateSpeed = 0.4;
     controls.enableZoom = false;
   }, [ready]);
+
+  // Drill-down from Report → Top Threat Sources: fly the camera to the
+  // requested country. No-op if the code isn't in our coords table — the
+  // globe still opens normally, just without a focus.
+  useEffect(() => {
+    if (!ready || !focusCountry || !globeRef.current) return;
+    const coords = COUNTRY_COORDS[focusCountry.toUpperCase()];
+    if (!coords) return;
+    globeRef.current.controls().autoRotate = false;
+    globeRef.current.pointOfView({ lat: coords.lat, lng: coords.lng, altitude: 1.8 }, 1000);
+  }, [ready, focusCountry]);
 
   const arcs = buildArcs(stats);
 

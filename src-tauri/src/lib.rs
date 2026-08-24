@@ -136,30 +136,82 @@ fn get_protection_status(state: tauri::State<DbState>) -> ProtectionStatus {
     }
 }
 
+/// Optional narrowing applied to the activity feed query. Both fields are
+/// mutually usable but callers currently set at most one (detector-id filter
+/// from Detection Breakdown, app-name filter from Flagged Apps).
+struct ActivityFeedFilter {
+    detector_id: Option<String>,
+    app_name: Option<String>,
+}
+
 #[tauri::command]
 fn get_activity_feed(limit: i64, state: tauri::State<DbState>) -> Vec<ActivityItem> {
     let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
     let Some(conn) = guard.as_ref() else {
         return vec![];
     };
+    query_activity_feed(conn, limit, None)
+}
 
+#[tauri::command]
+fn get_activity_feed_filtered(
+    limit: i64,
+    detector_id: Option<String>,
+    app_name: Option<String>,
+    state: tauri::State<DbState>,
+) -> Vec<ActivityItem> {
+    let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(conn) = guard.as_ref() else {
+        return vec![];
+    };
+    query_activity_feed(
+        conn,
+        limit,
+        Some(&ActivityFeedFilter {
+            detector_id,
+            app_name,
+        }),
+    )
+}
+
+fn query_activity_feed(
+    conn: &Connection,
+    limit: i64,
+    filter: Option<&ActivityFeedFilter>,
+) -> Vec<ActivityItem> {
     // Fetch recent Alert/Block verdicts, newest first.
     // Allow verdicts are included (brief example: "Spotify connected... allowed.")
     // but the real feed only shows Block/Alert in normal operation.
-    let mut stmt = match conn.prepare(
+    let mut sql = String::from(
         "SELECT v.id, v.ts_ms, v.process_path, v.verdict,
                 v.a_ip_text, v.b_ip_text, v.local_ip_text, v.country_code, v.dns_name,
                 v.composite_score, v.remote_ip_text
-         FROM verdicts v
-         ORDER BY v.ts_ms DESC
-         LIMIT ?1",
-    ) {
+         FROM verdicts v",
+    );
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    if let Some(f) = filter {
+        if let Some(detector_id) = &f.detector_id {
+            sql.push_str(
+                " WHERE v.id IN (SELECT verdict_id FROM detector_findings WHERE detector_id = ?)",
+            );
+            params.push(Box::new(detector_id.clone()));
+        } else if let Some(app_name) = &f.app_name {
+            sql.push_str(" WHERE v.process_path LIKE '%/' || ?");
+            params.push(Box::new(app_name.clone()));
+        }
+    }
+    sql.push_str(" ORDER BY v.ts_ms DESC LIMIT ?");
+    params.push(Box::new(limit));
+
+    let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
         Err(_) => return vec![],
     };
 
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
     let mut items: Vec<ActivityItem> = stmt
-        .query_map(rusqlite::params![limit], |r| {
+        .query_map(param_refs.as_slice(), |r| {
             let process_path: Option<String> = r.get(2)?;
             let app_name = process_path
                 .as_deref()
@@ -562,6 +614,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_protection_status,
             get_activity_feed,
+            get_activity_feed_filtered,
             get_threat_stats,
             get_activity_chart,
             get_activity_chart_for_day,

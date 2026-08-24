@@ -85,6 +85,12 @@ export interface ConfigValues {
   cf_exclusions: string[];
 }
 
+// Drives ActivityScreen's pre-applied filter after a Report-screen drill-down.
+export type ActivityFilter =
+  | { kind: "detector"; id: string; label: string }
+  | { kind: "app"; appName: string }
+  | null;
+
 // ---------------------------------------------------------------------------
 // Tauri context check
 // ---------------------------------------------------------------------------
@@ -104,6 +110,23 @@ export function getProtectionStatus(): Promise<ProtectionStatus> {
 export function getActivityFeed(limit = 50): Promise<ActivityItem[]> {
   if (!isTauri()) return Promise.reject(new Error("not-tauri"));
   return invoke<ActivityItem[]>("get_activity_feed", { limit });
+}
+
+export interface ActivityFeedFilter {
+  detectorId?: string;
+  appName?: string;
+}
+
+export function getActivityFeedFiltered(
+  limit: number,
+  filter: ActivityFeedFilter
+): Promise<ActivityItem[]> {
+  if (!isTauri()) return Promise.reject(new Error("not-tauri"));
+  return invoke<ActivityItem[]>("get_activity_feed_filtered", {
+    limit,
+    detectorId: filter.detectorId ?? null,
+    appName: filter.appName ?? null,
+  });
 }
 
 export function getThreatStats(): Promise<ThreatStats> {

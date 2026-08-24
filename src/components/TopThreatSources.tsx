@@ -1,7 +1,9 @@
 import type { CountryStat } from "../lib/db";
+import ChevronRight from "./ChevronRight";
 
 interface Props {
   sources: CountryStat[];
+  onSelect?: (countryCode: string) => void;
 }
 
 // CLDR flag from country code (e.g. "CN" → 🇨🇳)
@@ -23,7 +25,7 @@ function countryName(code: string): string {
   }
 }
 
-export default function TopThreatSources({ sources }: Props) {
+export default function TopThreatSources({ sources, onSelect }: Props) {
   if (sources.length === 0) return null;
 
   const top = sources.slice(0, 4);
@@ -34,7 +36,14 @@ export default function TopThreatSources({ sources }: Props) {
       {top.map((s, i) => {
         const pct = (s.count / maxCount) * 100;
         return (
-          <div key={s.country_code} className="flex items-center gap-3">
+          <button
+            key={s.country_code}
+            type="button"
+            onClick={() => onSelect?.(s.country_code)}
+            className="group w-full flex items-center gap-3 -mx-2 px-2 py-0.5 rounded-lg
+              text-left bg-transparent border-0 cursor-pointer
+              hover:bg-navy/[0.03] transition-colors"
+          >
             <span className="text-[17px] leading-none shrink-0">
               {flag(s.country_code)}
             </span>
@@ -58,7 +67,8 @@ export default function TopThreatSources({ sources }: Props) {
             <span className="text-xs font-semibold text-navy/40 w-8 text-right tabular-nums shrink-0">
               {s.count}
             </span>
-          </div>
+            <ChevronRight />
+          </button>
         );
       })}
 
