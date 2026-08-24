@@ -327,6 +327,49 @@ fn get_activity_chart(state: tauri::State<DbState>) -> Vec<ChartPoint> {
         .collect()
 }
 
+// day_offset uses the same UTC-epoch-day bucket as get_weekly_blocks
+// (0 = today, 6 = six days ago) — hour is the bucket's index within that
+// day (0-23), not an offset from "now" like get_activity_chart's hour field.
+#[tauri::command]
+fn get_activity_chart_for_day(state: tauri::State<DbState>, day_offset: i64) -> Vec<ChartPoint> {
+    let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(conn) = guard.as_ref() else {
+        return vec![];
+    };
+
+    let day_ms: i64 = 24 * 60 * 60 * 1000;
+    let today_bucket = now_ms() / day_ms;
+    let day_bucket = today_bucket - day_offset;
+    let day_start = day_bucket * day_ms;
+    let day_end = day_start + day_ms;
+
+    let mut stmt = match conn.prepare(
+        "SELECT CAST(ts_ms / 3600000 AS INTEGER) as bucket, COUNT(*) as cnt
+         FROM verdicts WHERE ts_ms >= ?1 AND ts_ms < ?2
+         GROUP BY bucket ORDER BY bucket",
+    ) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+
+    let hour_bucket_start = day_start / 3_600_000;
+    let mut map: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    if let Ok(rows) = stmt.query_map(rusqlite::params![day_start, day_end], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+    }) {
+        for row in rows.flatten() {
+            map.insert(row.0, row.1);
+        }
+    }
+
+    (0..24)
+        .map(|i| ChartPoint {
+            hour: i,
+            count: *map.get(&(hour_bucket_start + i)).unwrap_or(&0),
+        })
+        .collect()
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DetectorStat {
     pub name: String,
@@ -521,6 +564,7 @@ pub fn run() {
             get_activity_feed,
             get_threat_stats,
             get_activity_chart,
+            get_activity_chart_for_day,
             get_detector_breakdown,
             get_top_apps,
             get_threat_countries,

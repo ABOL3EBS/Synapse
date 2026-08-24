@@ -116,6 +116,12 @@ export function getActivityChart(): Promise<ChartPoint[]> {
   return invoke<ChartPoint[]>("get_activity_chart");
 }
 
+// day_offset: 0 = today, 6 = six days ago — same bucketing as getWeeklyBlocks
+export function getActivityChartForDay(day_offset: number): Promise<ChartPoint[]> {
+  if (!isTauri()) return Promise.reject(new Error("not-tauri"));
+  return invoke<ChartPoint[]>("get_activity_chart_for_day", { dayOffset: day_offset });
+}
+
 export function getDetectorBreakdown(): Promise<DetectorStat[]> {
   if (!isTauri()) return Promise.reject(new Error("not-tauri"));
   return invoke<DetectorStat[]>("get_detector_breakdown");

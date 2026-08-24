@@ -3,6 +3,7 @@ import type { ChartPoint } from "../lib/db";
 
 interface Props {
   points: ChartPoint[];
+  labels: string[];
 }
 
 const W     = 100;
@@ -10,7 +11,7 @@ const H     = 24;
 const PAD_X = 2;
 const PAD_Y = 2;
 
-export default function Sparkline({ points }: Props) {
+export default function Sparkline({ points, labels }: Props) {
   const [visible, setVisible] = useState(false);
   useEffect(() => { setVisible(true); }, []);
 
@@ -117,10 +118,10 @@ export default function Sparkline({ points }: Props) {
           })}
         </div>
 
-        {/* X-axis labels: every 6h */}
+        {/* X-axis labels */}
         <div className="flex justify-between mt-1 px-0.5">
-          {["24h ago", "18h ago", "12h ago", "6h ago", "Now"].map((label) => (
-            <span key={label} className="text-[9px] text-navy/25 font-medium">{label}</span>
+          {labels.map((label, i) => (
+            <span key={i} className="text-[9px] text-navy/25 font-medium">{label}</span>
           ))}
         </div>
       </div>

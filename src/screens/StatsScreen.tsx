@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import {
   getThreatStats,
   getActivityChart,
+  getActivityChartForDay,
   getDetectorBreakdown,
   getTopApps,
   getThreatCountries,
@@ -28,6 +29,32 @@ function dayLabel(offset: number): string {
   return d.toLocaleDateString("en", { weekday: "short" });
 }
 
+// Full "Mon DD" label for a selected day's sparkline title / empty state
+function dayFullLabel(offset: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() - offset);
+  return d.toLocaleDateString("en", { month: "short", day: "numeric" });
+}
+
+const DEFAULT_SPARKLINE_LABELS = ["24h ago", "18h ago", "12h ago", "6h ago", "Now"];
+
+function formatHourLabel(hour: number): string {
+  const period = hour < 12 ? "AM" : "PM";
+  const displayHour = hour % 12 === 0 ? 12 : hour % 12;
+  return `${displayHour} ${period}`;
+}
+
+// 5 evenly-spaced clock-time labels drawn from the points actually rendered
+// (so a truncated "today" chart never labels an hour that hasn't happened).
+function buildSelectedDayLabels(points: ChartPoint[]): string[] {
+  const n = points.length;
+  if (n === 0) return DEFAULT_SPARKLINE_LABELS;
+  return [0, 1, 2, 3, 4].map((i) => {
+    const idx = Math.min(n - 1, Math.round((i * (n - 1)) / 4));
+    return formatHourLabel(points[idx].hour);
+  });
+}
+
 export default function StatsScreen() {
   const [stats,    setStats]    = useState<ThreatStats | null>(null);
   const [chart,    setChart]    = useState<ChartPoint[]>([]);
@@ -37,12 +64,18 @@ export default function StatsScreen() {
   const [weekDays, setWeekDays] = useState<DayStat[]>([]);
   const [loading,  setLoading]  = useState(true);
   const [error,    setError]    = useState(false);
+  // null = default rolling last-24h view; 0..6 = a selected day's bar (0 = today)
+  const [selectedDay, setSelectedDay] = useState<number | null>(null);
 
   useEffect(() => {
-    const load = () =>
-      Promise.all([
+    const load = () => {
+      const chartPromise = selectedDay === null
+        ? getActivityChart()
+        : getActivityChartForDay(selectedDay);
+
+      return Promise.all([
         getThreatStats(),
-        getActivityChart(),
+        chartPromise,
         getDetectorBreakdown(),
         getTopApps(),
         getThreatCountries(),
@@ -51,14 +84,38 @@ export default function StatsScreen() {
         .then(([s, c, d, a, ct, wd]) => {
           setStats(s); setChart(c); setDetectors(d);
           setTopApps(a); setCountries(ct); setWeekDays(wd);
+          setError(false);
           setLoading(false);
         })
         .catch(() => { setError(true); setLoading(false); });
+    };
 
     load();
     const id = setInterval(load, REFRESH_MS);
     return () => clearInterval(id);
-  }, []);
+  }, [selectedDay]);
+
+  const handleSelectDay = (offset: number) =>
+    setSelectedDay((prev) => (prev === offset ? null : offset));
+
+  // Today's bar uses the same query as any other day, but future hours
+  // (past the current UTC hour) don't exist yet — trim the fake flat tail.
+  const displayedChart = selectedDay === 0
+    ? chart.slice(0, new Date().getUTCHours() + 1)
+    : chart;
+
+  const chartTotal = displayedChart.reduce((sum, p) => sum + p.count, 0);
+  const showEmptyChart = selectedDay !== null && chartTotal === 0;
+
+  const sparklineLabels = selectedDay === null
+    ? DEFAULT_SPARKLINE_LABELS
+    : buildSelectedDayLabels(displayedChart);
+
+  const sparklineTitle = selectedDay === null
+    ? "Activity · last 24 h"
+    : selectedDay === 0
+      ? "Activity · today"
+      : `Activity · ${dayFullLabel(selectedDay)}`;
 
   if (error) {
     return (
@@ -92,13 +149,24 @@ export default function StatsScreen() {
         </div>
 
         {/* Sparkline — Y-axis gridlines + labels + hourly dots */}
-        <Section title="Activity · last 24 h">
-          <Sparkline points={chart} />
+        <Section title={sparklineTitle}>
+          {showEmptyChart ? (
+            <div
+              className="bg-white rounded-2xl shadow-card border border-black/[0.04] px-5 py-4 flex items-center justify-center"
+              style={{ height: "clamp(80px, 14vh, 180px)" }}
+            >
+              <p className="text-xs text-navy/25">
+                {selectedDay === 0 ? "No activity today" : `No activity on ${dayFullLabel(selectedDay ?? 0)}`}
+              </p>
+            </div>
+          ) : (
+            <Sparkline points={displayedChart} labels={sparklineLabels} />
+          )}
         </Section>
 
         {/* 7-day bar strip */}
         <Section title="Blocked · per day · last 7 days">
-          <WeeklyBars days={weekDays} />
+          <WeeklyBars days={weekDays} selectedDay={selectedDay} onSelectDay={handleSelectDay} />
         </Section>
 
         {/* Three-panel row: capped + centered; stacks to 1-col below md (768px) */}
@@ -189,7 +257,11 @@ function Panel({ title, children, style }: {
   );
 }
 
-function WeeklyBars({ days }: { days: DayStat[] }) {
+function WeeklyBars({ days, selectedDay, onSelectDay }: {
+  days: DayStat[];
+  selectedDay: number | null;
+  onSelectDay: (offset: number) => void;
+}) {
   if (days.length === 0) return (
     <div className="bg-white rounded-2xl shadow-card border border-black/[0.04] px-5 py-4">
       <p className="text-xs text-navy/25 text-center">No data yet</p>
@@ -203,23 +275,35 @@ function WeeklyBars({ days }: { days: DayStat[] }) {
       <div className="flex gap-2 items-end" style={{ height: "clamp(56px, 8vh, 96px)" }}>
         {days.map((d) => {
           const pct = (d.count / maxCount) * 100;
+          const isSelected = d.day_offset === selectedDay;
           return (
-            <div key={d.day_offset} className="flex-1 flex flex-col items-center gap-[3px] justify-end h-full">
+            <button
+              key={d.day_offset}
+              type="button"
+              onClick={() => onSelectDay(d.day_offset)}
+              className="flex-1 flex flex-col items-center gap-[3px] justify-end h-full bg-transparent border-0 p-0 cursor-pointer hover:opacity-80 transition-opacity"
+            >
               <span className="text-[9px] font-semibold text-navy/40 leading-none">{d.count}</span>
-              <div className="w-full rounded-t-[3px] overflow-hidden flex-1 relative bg-crimson/10">
+              <div
+                className={`w-full rounded-t-[3px] overflow-hidden flex-1 relative bg-crimson/10 ${
+                  isSelected ? "ring-2 ring-navy" : ""
+                }`}
+              >
                 <div
                   className="absolute bottom-0 left-0 right-0 rounded-t-[3px] bg-crimson bar-grow"
                   style={{ height: `${pct}%` }}
                 />
               </div>
-            </div>
+            </button>
           );
         })}
       </div>
       <div className="flex gap-2 mt-[5px]">
         {days.map((d) => (
-          <div key={d.day_offset} className="flex-1 text-center text-[9px] text-navy/30 font-medium">
-            {dayLabel(d.day_offset)}
+          <div key={d.day_offset} className="flex-1 text-center text-[9px] font-medium">
+            <span className={d.day_offset === selectedDay ? "text-navy font-semibold" : "text-navy/30"}>
+              {dayLabel(d.day_offset)}
+            </span>
           </div>
         ))}
       </div>
