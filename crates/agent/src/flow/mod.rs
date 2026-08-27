@@ -195,6 +195,22 @@ impl From<FlowRecord> for synapse_common::FlowRecord {
 }
 
 // ---------------------------------------------------------------------------
+// FlowEnrichment — bundled result for attach_enrichment()
+// ---------------------------------------------------------------------------
+
+/// Enrichment fields to attach to a flow. Each field is only written to the
+/// flow if `Some` — `None` leaves the existing value untouched.
+#[derive(Default)]
+pub struct FlowEnrichment {
+    pub dns_name: Option<String>,
+    pub process_path: Option<String>,
+    pub process_start_time: Option<f64>,
+    pub country_code: Option<String>,
+    pub asn: Option<u32>,
+    pub reputation_score: Option<f32>,
+}
+
+// ---------------------------------------------------------------------------
 // FlowTracker — the session window
 // ---------------------------------------------------------------------------
 
@@ -439,35 +455,25 @@ impl FlowTracker {
     }
 
     /// Attach an enrichment result to a flow.
-    #[allow(clippy::too_many_arguments)]
-    pub fn attach_enrichment(
-        &mut self,
-        flow_id: u64,
-        dns_name: Option<String>,
-        process_path: Option<String>,
-        process_start_time: Option<f64>,
-        country_code: Option<String>,
-        asn: Option<u32>,
-        reputation_score: Option<f32>,
-    ) {
+    pub fn attach_enrichment(&mut self, flow_id: u64, enrichment: FlowEnrichment) {
         if let Some(flow) = self.flows.get_mut(&flow_id) {
-            if dns_name.is_some() {
-                flow.dns_name = dns_name;
+            if enrichment.dns_name.is_some() {
+                flow.dns_name = enrichment.dns_name;
             }
-            if process_path.is_some() {
-                flow.process_path = process_path;
+            if enrichment.process_path.is_some() {
+                flow.process_path = enrichment.process_path;
             }
-            if process_start_time.is_some() {
-                flow.process_start_time = process_start_time;
+            if enrichment.process_start_time.is_some() {
+                flow.process_start_time = enrichment.process_start_time;
             }
-            if country_code.is_some() {
-                flow.country_code = country_code;
+            if enrichment.country_code.is_some() {
+                flow.country_code = enrichment.country_code;
             }
-            if asn.is_some() {
-                flow.asn = asn;
+            if enrichment.asn.is_some() {
+                flow.asn = enrichment.asn;
             }
-            if reputation_score.is_some() {
-                flow.reputation_score = reputation_score;
+            if enrichment.reputation_score.is_some() {
+                flow.reputation_score = enrichment.reputation_score;
             }
         }
     }
@@ -778,12 +784,12 @@ mod tests {
 
         tracker.attach_enrichment(
             id,
-            Some("example.com".to_string()),
-            Some("/usr/bin/curl".to_string()),
-            Some(1234567890.0),
-            None,
-            None,
-            None,
+            FlowEnrichment {
+                dns_name: Some("example.com".to_string()),
+                process_path: Some("/usr/bin/curl".to_string()),
+                process_start_time: Some(1234567890.0),
+                ..Default::default()
+            },
         );
 
         let flow = tracker.get(id).unwrap();

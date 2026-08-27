@@ -1418,17 +1418,7 @@ impl CaptureEngine {
         }
 
         // Accumulate per-flow enrichment data.
-        #[derive(Default)]
-        struct FlowEnrichment {
-            dns_name: Option<String>,
-            process_path: Option<String>,
-            process_start_time: Option<f64>,
-            country_code: Option<String>,
-            asn: Option<u32>,
-            reputation_score: Option<f32>,
-        }
-
-        let mut batch: HashMap<u64, FlowEnrichment> = HashMap::new();
+        let mut batch: HashMap<u64, flow::FlowEnrichment> = HashMap::new();
         for result in results {
             if result.success {
                 let entry = batch.entry(result.flow_id).or_default();
@@ -1469,15 +1459,7 @@ impl CaptureEngine {
 
         // Single attach_enrichment call per flow (reduces HashMap lookups).
         for (flow_id, e) in batch {
-            self.tracker.attach_enrichment(
-                flow_id,
-                e.dns_name,
-                e.process_path,
-                e.process_start_time,
-                e.country_code,
-                e.asn,
-                e.reputation_score,
-            );
+            self.tracker.attach_enrichment(flow_id, e);
         }
     }
 }
