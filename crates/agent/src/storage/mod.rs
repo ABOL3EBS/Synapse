@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Receiver, Sender};
 use log::{error, info, warn};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Transaction};
 use synapse_common::{DetectorFinding, FlowRecord};
 
 use spool::CriticalSpool;
@@ -252,6 +252,30 @@ fn worker_loop(db_path: String, spool_path: PathBuf, boot_id: u64, rx: Receiver<
 // Flush: commit a batch to SQLite
 // ---------------------------------------------------------------------------
 
+/// Fields for a single `enforcement_log` insert (bundled per the
+/// struct-instead-of-many-args convention — see `FlowEnrichment`).
+struct EnforcementParams {
+    event_id: String,
+    ip: IpAddr,
+    ttl_ms: u64,
+    reason: String,
+    top_detector: Option<String>,
+    composite_score: f32,
+    send_error: Option<String>,
+}
+
+/// Fields for a single `verdicts` upsert plus its `detector_findings` rows.
+struct VerdictParams {
+    flow: Box<FlowRecord>,
+    local_ip: IpAddr,
+    remote_ip: IpAddr,
+    verdict: String,
+    reason: String,
+    composite_score: f32,
+    ttl_ms: Option<u64>,
+    findings: Vec<DetectorFinding>,
+}
+
 fn flush(
     conn: &mut Connection,
     spool: &mut Option<CriticalSpool>,
@@ -288,29 +312,19 @@ fn flush(
                 let event_id = pending_critical_ids
                     .pop_front()
                     .unwrap_or_else(|| format!("{ts_ms}"));
-                let (ip_blob, ip_text) = ip_to_parts(ip);
-                let requested = if send_error.is_none() { 1i64 } else { 0i64 };
-                if let Err(e) = tx.execute(
-                    "INSERT OR IGNORE INTO enforcement_log
-                     (event_id, ts_ms, action, ip_blob, ip_text, ttl_ms,
-                      reason, detector, score, requested, confirmed, error)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,?11)",
-                    params![
+                insert_enforcement_event(
+                    &tx,
+                    ts_ms,
+                    EnforcementParams {
                         event_id,
-                        ts_ms,
-                        "Block",
-                        &ip_blob[..],
-                        ip_text,
-                        ttl_ms as i64,
+                        ip,
+                        ttl_ms,
                         reason,
                         top_detector,
-                        composite_score as f64,
-                        requested,
+                        composite_score,
                         send_error,
-                    ],
-                ) {
-                    warn!("storage: enforcement insert: {e}");
-                }
+                    },
+                );
             }
 
             StorageEvent::VerdictDecided {
@@ -323,107 +337,20 @@ fn flush(
                 ttl_ms,
                 findings,
             } => {
-                let (a_blob, a_text) = ip_to_parts(flow.a_ip);
-                let (b_blob, b_text) = ip_to_parts(flow.b_ip);
-                let local_ip_text = local_ip.to_string();
-                let remote_ip_text = remote_ip.to_string();
-                let flow_age_ms = flow.flow_age.as_millis() as i64;
-                let verdict_id: i64 = match tx.query_row(
-                    "INSERT INTO verdicts
-                     (ts_ms, flow_id, a_ip_blob, b_ip_blob, a_ip_text, b_ip_text,
-                      a_port, b_port, protocol, pid, process_path, process_start,
-                      dns_name, country_code, asn, reputation_score,
-                      verdict, reason, composite_score, ttl_ms, flow_age_ms,
-                      pkt_count, byte_count, local_ip_text, remote_ip_text)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,
-                             ?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)
-                     ON CONFLICT(a_ip_text, a_port, b_ip_text, b_port, protocol, verdict)
-                     DO UPDATE SET
-                       ts_ms            = excluded.ts_ms,
-                       flow_id          = excluded.flow_id,
-                       composite_score  = excluded.composite_score,
-                       reason           = excluded.reason,
-                       ttl_ms           = excluded.ttl_ms,
-                       flow_age_ms      = excluded.flow_age_ms,
-                       pkt_count        = excluded.pkt_count,
-                       byte_count       = excluded.byte_count,
-                       pid              = excluded.pid,
-                       process_path     = excluded.process_path,
-                       process_start    = excluded.process_start,
-                       dns_name         = excluded.dns_name,
-                       country_code     = excluded.country_code,
-                       asn              = excluded.asn,
-                       reputation_score = excluded.reputation_score,
-                       local_ip_text    = excluded.local_ip_text,
-                       remote_ip_text   = excluded.remote_ip_text
-                     RETURNING id",
-                    params![
-                        ts_ms,
-                        flow.flow_id as i64,
-                        &a_blob[..],
-                        &b_blob[..],
-                        a_text,
-                        b_text,
-                        flow.a_port as i64,
-                        flow.b_port as i64,
-                        flow.protocol as i64,
-                        flow.pid.map(|p| p as i64),
-                        flow.process_path,
-                        flow.process_start_time,
-                        flow.dns_name,
-                        flow.country_code,
-                        flow.asn.map(|a| a as i64),
-                        flow.reputation_score.map(|s| s as f64),
+                insert_verdict_event(
+                    &tx,
+                    ts_ms,
+                    VerdictParams {
+                        flow,
+                        local_ip,
+                        remote_ip,
                         verdict,
                         reason,
-                        composite_score as f64,
-                        ttl_ms.map(|t| t as i64),
-                        flow_age_ms,
-                        flow.packet_count as i64,
-                        flow.byte_count as i64,
-                        local_ip_text,
-                        remote_ip_text,
-                    ],
-                    |r| r.get(0),
-                ) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        warn!("storage: verdict insert: {e}");
-                        continue;
-                    }
-                };
-
-                // On re-evaluation the same verdict row is upserted (same id).
-                // The old detector_findings for this id are stale — replace them.
-                if let Err(e) = tx.execute(
-                    "DELETE FROM detector_findings WHERE verdict_id = ?1",
-                    params![verdict_id],
-                ) {
-                    warn!("storage: stale findings delete: {e}");
-                }
-
-                for finding in &findings {
-                    let ev_json = serde_json::to_string(&finding.evidence).ok();
-                    if let Err(e) = tx.execute(
-                        "INSERT INTO detector_findings
-                         (verdict_id, detector_id, detector_version, score,
-                          confidence, severity, status, latency_us, evidence_json)
-                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-                        params![
-                            verdict_id,
-                            format!("{:?}", finding.detector_id),
-                            finding.detector_version,
-                            finding.score as f64,
-                            finding.confidence as f64,
-                            format!("{:?}", finding.severity),
-                            format!("{:?}", finding.status),
-                            finding.latency_us as i64,
-                            ev_json,
-                        ],
-                    ) {
-                        warn!("storage: finding insert: {e}");
-                    }
-                }
+                        composite_score,
+                        ttl_ms,
+                        findings,
+                    },
+                );
             }
 
             StorageEvent::CircuitBreakerTransition {
@@ -432,24 +359,188 @@ fn flush(
                 to_state,
                 consecutive_failures,
             } => {
-                if let Err(e) = tx.execute(
-                    "INSERT INTO circuit_breaker_events
-                     (ts_ms, detector_id, from_state, to_state, consecutive_failures)
-                     VALUES (?1,?2,?3,?4,?5)",
-                    params![
-                        ts_ms,
-                        detector_id,
-                        from_state,
-                        to_state,
-                        consecutive_failures as i64,
-                    ],
-                ) {
-                    warn!("storage: cb_event insert: {e}");
-                }
+                insert_circuit_breaker_event(
+                    &tx,
+                    ts_ms,
+                    detector_id,
+                    from_state,
+                    to_state,
+                    consecutive_failures,
+                );
             }
         }
     }
 
+    commit_and_confirm_spool(tx, spool, pending_critical_ids);
+}
+
+fn insert_enforcement_event(tx: &Transaction, ts_ms: i64, p: EnforcementParams) {
+    let (ip_blob, ip_text) = ip_to_parts(p.ip);
+    let requested = if p.send_error.is_none() { 1i64 } else { 0i64 };
+    if let Err(e) = tx.execute(
+        "INSERT OR IGNORE INTO enforcement_log
+         (event_id, ts_ms, action, ip_blob, ip_text, ttl_ms,
+          reason, detector, score, requested, confirmed, error)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,?11)",
+        params![
+            p.event_id,
+            ts_ms,
+            "Block",
+            &ip_blob[..],
+            ip_text,
+            p.ttl_ms as i64,
+            p.reason,
+            p.top_detector,
+            p.composite_score as f64,
+            requested,
+            p.send_error,
+        ],
+    ) {
+        warn!("storage: enforcement insert: {e}");
+    }
+}
+
+fn insert_verdict_event(tx: &Transaction, ts_ms: i64, p: VerdictParams) {
+    let verdict_id = match insert_verdict_row(tx, ts_ms, &p) {
+        Ok(id) => id,
+        Err(e) => {
+            warn!("storage: verdict insert: {e}");
+            return;
+        }
+    };
+    replace_detector_findings(tx, verdict_id, &p.findings);
+}
+
+fn insert_verdict_row(tx: &Transaction, ts_ms: i64, p: &VerdictParams) -> rusqlite::Result<i64> {
+    let flow = &p.flow;
+    let (a_blob, a_text) = ip_to_parts(flow.a_ip);
+    let (b_blob, b_text) = ip_to_parts(flow.b_ip);
+    let local_ip_text = p.local_ip.to_string();
+    let remote_ip_text = p.remote_ip.to_string();
+    let flow_age_ms = flow.flow_age.as_millis() as i64;
+    tx.query_row(
+        "INSERT INTO verdicts
+         (ts_ms, flow_id, a_ip_blob, b_ip_blob, a_ip_text, b_ip_text,
+          a_port, b_port, protocol, pid, process_path, process_start,
+          dns_name, country_code, asn, reputation_score,
+          verdict, reason, composite_score, ttl_ms, flow_age_ms,
+          pkt_count, byte_count, local_ip_text, remote_ip_text)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,
+                 ?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)
+         ON CONFLICT(a_ip_text, a_port, b_ip_text, b_port, protocol, verdict)
+         DO UPDATE SET
+           ts_ms            = excluded.ts_ms,
+           flow_id          = excluded.flow_id,
+           composite_score  = excluded.composite_score,
+           reason           = excluded.reason,
+           ttl_ms           = excluded.ttl_ms,
+           flow_age_ms      = excluded.flow_age_ms,
+           pkt_count        = excluded.pkt_count,
+           byte_count       = excluded.byte_count,
+           pid              = excluded.pid,
+           process_path     = excluded.process_path,
+           process_start    = excluded.process_start,
+           dns_name         = excluded.dns_name,
+           country_code     = excluded.country_code,
+           asn              = excluded.asn,
+           reputation_score = excluded.reputation_score,
+           local_ip_text    = excluded.local_ip_text,
+           remote_ip_text   = excluded.remote_ip_text
+         RETURNING id",
+        params![
+            ts_ms,
+            flow.flow_id as i64,
+            &a_blob[..],
+            &b_blob[..],
+            a_text,
+            b_text,
+            flow.a_port as i64,
+            flow.b_port as i64,
+            flow.protocol as i64,
+            flow.pid.map(|pid| pid as i64),
+            flow.process_path,
+            flow.process_start_time,
+            flow.dns_name,
+            flow.country_code,
+            flow.asn.map(|a| a as i64),
+            flow.reputation_score.map(|s| s as f64),
+            p.verdict,
+            p.reason,
+            p.composite_score as f64,
+            p.ttl_ms.map(|t| t as i64),
+            flow_age_ms,
+            flow.packet_count as i64,
+            flow.byte_count as i64,
+            local_ip_text,
+            remote_ip_text,
+        ],
+        |r| r.get(0),
+    )
+}
+
+fn replace_detector_findings(tx: &Transaction, verdict_id: i64, findings: &[DetectorFinding]) {
+    // On re-evaluation the same verdict row is upserted (same id).
+    // The old detector_findings for this id are stale — replace them.
+    if let Err(e) = tx.execute(
+        "DELETE FROM detector_findings WHERE verdict_id = ?1",
+        params![verdict_id],
+    ) {
+        warn!("storage: stale findings delete: {e}");
+    }
+
+    for finding in findings {
+        let ev_json = serde_json::to_string(&finding.evidence).ok();
+        if let Err(e) = tx.execute(
+            "INSERT INTO detector_findings
+             (verdict_id, detector_id, detector_version, score,
+              confidence, severity, status, latency_us, evidence_json)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                verdict_id,
+                format!("{:?}", finding.detector_id),
+                finding.detector_version,
+                finding.score as f64,
+                finding.confidence as f64,
+                format!("{:?}", finding.severity),
+                format!("{:?}", finding.status),
+                finding.latency_us as i64,
+                ev_json,
+            ],
+        ) {
+            warn!("storage: finding insert: {e}");
+        }
+    }
+}
+
+fn insert_circuit_breaker_event(
+    tx: &Transaction,
+    ts_ms: i64,
+    detector_id: String,
+    from_state: String,
+    to_state: String,
+    consecutive_failures: u32,
+) {
+    if let Err(e) = tx.execute(
+        "INSERT INTO circuit_breaker_events
+         (ts_ms, detector_id, from_state, to_state, consecutive_failures)
+         VALUES (?1,?2,?3,?4,?5)",
+        params![
+            ts_ms,
+            detector_id,
+            from_state,
+            to_state,
+            consecutive_failures as i64,
+        ],
+    ) {
+        warn!("storage: cb_event insert: {e}");
+    }
+}
+
+fn commit_and_confirm_spool(
+    tx: Transaction,
+    spool: &mut Option<CriticalSpool>,
+    pending_critical_ids: &mut VecDeque<String>,
+) {
     let commit_ok = tx.commit().is_ok();
 
     // After a successful commit, mark the Critical spool entries as done.
