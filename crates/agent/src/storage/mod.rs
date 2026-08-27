@@ -155,12 +155,24 @@ impl StorageWorker {
 // never fire in a usage pattern of frequent short-lived runs.
 const RETENTION_INTERVAL_MS: i64 = 60 * 60 * 1000; // 1 hour
 
-fn worker_loop(db_path: String, spool_path: PathBuf, boot_id: u64, rx: Receiver<StorageEvent>) {
-    let mut conn = match Connection::open(&db_path) {
+/// Mutable state threaded across worker_loop's iterations — mirrors the
+/// CaptureEngine pattern (a loop with state becomes a struct + methods)
+/// rather than the one-shot params-bundle pattern used for flush()'s events.
+struct WorkerState {
+    conn: Connection,
+    spool: Option<CriticalSpool>,
+    last_retention_ms: i64,
+    seq: u64,
+    pending: Vec<StorageEvent>,
+    pending_critical_ids: VecDeque<String>,
+}
+
+fn init_worker_state(db_path: &str, spool_path: &std::path::Path) -> Option<WorkerState> {
+    let mut conn = match Connection::open(db_path) {
         Ok(c) => c,
         Err(e) => {
             error!("storage worker: open {db_path}: {e}");
-            return;
+            return None;
         }
     };
     if let Err(e) = schema::harden(&conn) {
@@ -170,7 +182,7 @@ fn worker_loop(db_path: String, spool_path: PathBuf, boot_id: u64, rx: Receiver<
     // Open the critical spool. Failure is degraded-mode (not fatal) — enforcement
     // records will still reach the main DB; they just won't survive a crash
     // between IPC send and DB commit. Warn loudly so operators notice.
-    let mut spool: Option<CriticalSpool> = match CriticalSpool::open(&spool_path) {
+    let mut spool: Option<CriticalSpool> = match CriticalSpool::open(spool_path) {
         Ok(s) => Some(s),
         Err(e) => {
             warn!("storage: spool unavailable: {e} — critical events not crash-safe");
@@ -186,64 +198,106 @@ fn worker_loop(db_path: String, spool_path: PathBuf, boot_id: u64, rx: Receiver<
 
     // Load the last retention timestamp from the metadata table. This survives
     // restarts — if it was an hour ago, retention fires on the first tick.
-    let mut last_retention_ms: i64 = load_last_retention_ms(&conn);
+    let last_retention_ms: i64 = load_last_retention_ms(&conn);
 
-    let mut seq: u64 = 0;
-    let mut pending: Vec<StorageEvent> = Vec::with_capacity(20);
-    let mut pending_critical_ids: VecDeque<String> = VecDeque::new();
+    Some(WorkerState {
+        conn,
+        spool,
+        last_retention_ms,
+        seq: 0,
+        pending: Vec::with_capacity(20),
+        pending_critical_ids: VecDeque::new(),
+    })
+}
+
+/// Handle one message from the event channel. Returns `false` when the
+/// channel closed and the worker should shut down (replaces the `return`
+/// in the original inline `Err(_)` arm).
+fn handle_message(
+    msg: Result<StorageEvent, crossbeam_channel::RecvError>,
+    state: &mut WorkerState,
+    boot_id: u64,
+) -> bool {
+    match msg {
+        Ok(event) => {
+            // Critical events go to the spool first.
+            if let StorageEvent::EnforcementRequested { .. } = &event {
+                state.seq += 1;
+                let event_id = format!("{boot_id:016x}{:016x}", state.seq);
+                let ts_ms = system_time_millis();
+                let payload = spool_payload_for(&event);
+                if let Some(ref mut sp) = state.spool {
+                    if let Err(e) = sp.append(&event_id, ts_ms, "EnforcementRequested", &payload) {
+                        warn!("storage: spool append: {e}");
+                    }
+                }
+                state.pending_critical_ids.push_back(event_id);
+            }
+            state.pending.push(event);
+            if state.pending.len() >= 20 {
+                flush(
+                    &mut state.conn,
+                    &mut state.spool,
+                    &mut state.pending,
+                    &mut state.pending_critical_ids,
+                );
+            }
+            true
+        }
+        Err(_) => {
+            // Channel closed — flush remaining and signal shutdown.
+            if !state.pending.is_empty() {
+                flush(
+                    &mut state.conn,
+                    &mut state.spool,
+                    &mut state.pending,
+                    &mut state.pending_critical_ids,
+                );
+            }
+            false
+        }
+    }
+}
+
+fn handle_tick(state: &mut WorkerState) {
+    if !state.pending.is_empty() {
+        flush(
+            &mut state.conn,
+            &mut state.spool,
+            &mut state.pending,
+            &mut state.pending_critical_ids,
+        );
+    }
+    // Wall-clock retention check — survives restarts.
+    let now = system_time_millis();
+    if now - state.last_retention_ms > RETENTION_INTERVAL_MS {
+        run_retention(&mut state.conn);
+        if let Some(ref mut sp) = state.spool {
+            let cutoff = now - 7 * 24 * 60 * 60 * 1000;
+            sp.prune_done(cutoff);
+        }
+        state.last_retention_ms = now;
+        save_last_retention_ms(&mut state.conn, now);
+    }
+}
+
+fn worker_loop(db_path: String, spool_path: PathBuf, boot_id: u64, rx: Receiver<StorageEvent>) {
+    let mut state = match init_worker_state(&db_path, &spool_path) {
+        Some(s) => s,
+        None => return,
+    };
 
     let tick = crossbeam_channel::tick(std::time::Duration::from_millis(250));
 
     loop {
         crossbeam_channel::select! {
-            recv(rx) -> msg => match msg {
-                Ok(event) => {
-                    // Critical events go to the spool first.
-                    if let StorageEvent::EnforcementRequested { .. } = &event {
-                        seq += 1;
-                        let event_id = format!("{boot_id:016x}{seq:016x}");
-                        let ts_ms = system_time_millis();
-                        let payload = spool_payload_for(&event);
-                        if let Some(ref mut sp) = spool {
-                            if let Err(e) = sp.append(&event_id, ts_ms, "EnforcementRequested", &payload) {
-                                warn!("storage: spool append: {e}");
-                            }
-                        }
-                        pending_critical_ids.push_back(event_id);
-                    }
-                    pending.push(event);
-                    if pending.len() >= 20 {
-                        flush(&mut conn, &mut spool, &mut pending,
-                              &mut pending_critical_ids);
-                    }
-                }
-                Err(_) => {
-                    // Channel closed — flush remaining and exit.
-                    if !pending.is_empty() {
-                        flush(&mut conn, &mut spool, &mut pending,
-                              &mut pending_critical_ids);
-                    }
+            recv(rx) -> msg => {
+                if !handle_message(msg, &mut state, boot_id) {
                     info!("storage worker shut down");
                     return;
                 }
-            },
-            recv(tick) -> _ => {
-                if !pending.is_empty() {
-                    flush(&mut conn, &mut spool, &mut pending,
-                          &mut pending_critical_ids);
-                }
-                // Wall-clock retention check — survives restarts.
-                let now = system_time_millis();
-                if now - last_retention_ms > RETENTION_INTERVAL_MS {
-                    run_retention(&mut conn);
-                    if let Some(ref mut sp) = spool {
-                        let cutoff = now - 7 * 24 * 60 * 60 * 1000;
-                        sp.prune_done(cutoff);
-                    }
-                    last_retention_ms = now;
-                    save_last_retention_ms(&mut conn, now);
-                }
             }
+            recv(tick) -> _ => handle_tick(&mut state),
         }
     }
 }
@@ -1030,6 +1084,121 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].event_id, "evt-2");
         let _ = std::fs::remove_file(dir);
+    }
+
+    /// Exercises handle_tick's real retention-trigger condition end-to-end via
+    /// the actual WorkerState/worker_loop path (StorageWorker::start spawns the
+    /// real thread; nothing here calls run_retention/load_last_retention_ms/
+    /// save_last_retention_ms directly). A stale last_retention_run_ms is seeded
+    /// into metadata exactly as a prior real run would have left it, so the
+    /// `now - last_retention_ms > RETENTION_INTERVAL_MS` check fires on the
+    /// first 250ms tick instead of requiring a live 1-hour wait.
+    #[test]
+    fn test_retention_trigger_fires_and_persists_from_stale_timestamp() {
+        let db_path =
+            std::env::temp_dir().join(format!("synapse_retention_{}.db", std::process::id()));
+        let spool_path = db_path.with_extension("spool");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&spool_path);
+
+        let stale_ms = system_time_millis() - 2 * 60 * 60 * 1000;
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            schema::apply_schema(&conn).unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('last_retention_run_ms', ?1)",
+                params![stale_ms],
+            )
+            .unwrap();
+        }
+
+        let worker = StorageWorker::start(db_path.clone()).expect("worker should start");
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        worker.shutdown();
+
+        let conn = Connection::open(&db_path).unwrap();
+        let persisted: i64 = conn
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM metadata WHERE key = 'last_retention_run_ms'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            persisted > stale_ms + 60 * 60 * 1000,
+            "retention check must fire on the tick and advance last_retention_run_ms \
+             past the stale seeded value (seeded={stale_ms}, persisted={persisted})"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&spool_path);
+    }
+
+    /// Exercises replay_spool on real startup (init_worker_state, called from
+    /// StorageWorker::start's spawned thread) rather than calling replay_spool
+    /// directly. An unconfirmed spool entry is left behind using the real
+    /// CriticalSpool API without calling confirm() — exactly what a crash
+    /// between the spool write and the main-DB commit leaves on disk. Starting
+    /// a fresh StorageWorker against the same db+spool paths simulates the
+    /// agent restart that should replay it.
+    #[test]
+    fn test_spool_replay_on_restart_via_real_worker_startup() {
+        let db_path =
+            std::env::temp_dir().join(format!("synapse_replay_{}.db", std::process::id()));
+        let spool_path = db_path.with_extension("spool");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&spool_path);
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            schema::apply_schema(&conn).unwrap();
+        }
+
+        let event_id = "deadbeefdeadbeefdeadbeefdeadbeef";
+        let ts_ms = system_time_millis();
+        let payload = serde_json::json!({
+            "ip_blob_hex": "00000000000000000000ffff01020304",
+            "ip_text": "1.2.3.4",
+            "ttl_ms": 300_000i64,
+            "reason": "crash-replay-test",
+            "detector": "test",
+            "score": 0.9,
+            "send_error": null,
+        })
+        .to_string();
+        {
+            let mut spool = CriticalSpool::open(&spool_path).unwrap();
+            spool
+                .append(event_id, ts_ms, "EnforcementRequested", &payload)
+                .unwrap();
+            // Dropped without confirm() -- exactly what a crash leaves behind.
+        }
+
+        let worker = StorageWorker::start(db_path.clone()).expect("worker should start");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        worker.shutdown();
+
+        let conn = Connection::open(&db_path).unwrap();
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM enforcement_log WHERE event_id = ?1",
+                params![event_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            row_count, 1,
+            "replay_spool must re-insert the unconfirmed spool entry into enforcement_log on startup"
+        );
+
+        let spool_check = CriticalSpool::open(&spool_path).unwrap();
+        assert!(
+            spool_check.unconfirmed().is_empty(),
+            "replay must confirm the entry after successful re-insertion"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&spool_path);
     }
 
     /// Verify remote_ip_text is persisted verbatim and reads back from the verdicts table.
