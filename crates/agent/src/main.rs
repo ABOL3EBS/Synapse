@@ -15,6 +15,7 @@ mod decision;
 mod detectors;
 mod enrichment;
 mod flow;
+mod net_topology;
 mod storage;
 
 use std::collections::{HashMap, HashSet};
@@ -152,13 +153,13 @@ fn main() -> io::Result<()> {
     // Detect local IP from network interface — used for port→PID direction.
     //    P1: ArcSwap for lock-free reads on the hot path.
     let local_ip_cache: Arc<ArcSwap<Option<IpAddr>>> = Arc::new(ArcSwap::from_pointee(
-        capture::detect_local_ip().inspect(|&ip| {
+        net_topology::detect_local_ip().inspect(|&ip| {
             info!("local IP detected: {ip}");
         }),
     ));
 
     // Detect default gateway — protected from blocking in handle_verdict.
-    let gateway_ip = capture::detect_default_gateway();
+    let gateway_ip = net_topology::detect_default_gateway();
     match gateway_ip {
         Some(gw) => info!("default gateway detected: {gw}"),
         None => warn!("could not detect default gateway — gateway guard disabled"),
@@ -167,7 +168,7 @@ fn main() -> io::Result<()> {
     // Detect ALL own IPs (v4+v6) — never block our own addresses.
     //    P1: ArcSwap for lock-free reads in should_skip_block.
     let own_ips: Arc<ArcSwap<HashSet<IpAddr>>> =
-        Arc::new(ArcSwap::from_pointee(capture::detect_own_ips()));
+        Arc::new(ArcSwap::from_pointee(net_topology::detect_own_ips()));
 
     // CrossFlow exclusion set: own_ips + gateway + known high-volume API endpoints.
     // Kept separate from own_ips because the semantics differ: own_ips is used
@@ -216,7 +217,7 @@ fn main() -> io::Result<()> {
         }
         set
     }
-    let vpn_peers = capture::detect_vpn_gateway_peers(&own_ips.load());
+    let vpn_peers = net_topology::detect_vpn_gateway_peers(&own_ips.load());
     if !vpn_peers.is_empty() {
         info!("VPN tunnel peers detected: {:?}", vpn_peers);
     }
@@ -244,10 +245,10 @@ fn main() -> io::Result<()> {
             .name("own-ips-refresh".into())
             .spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_secs(refresh_secs));
-                let new_own = capture::detect_own_ips();
+                let new_own = net_topology::detect_own_ips();
                 // Rebuild CrossFlow exclusion set every tick: gateway may have
                 // changed (network switch) even when own IPs are unchanged.
-                let new_gw = capture::detect_default_gateway();
+                let new_gw = net_topology::detect_default_gateway();
                 if new_gw.is_some() {
                     if consecutive_detect_failures > 0 {
                         info!(
@@ -292,7 +293,7 @@ fn main() -> io::Result<()> {
                 let effective_gw = new_gw.or(last_known_gw);
                 // Re-detect VPN peers every tick — VPN may connect mid-session, and
                 // the whole point of this mechanism is that VPN connects AFTER startup.
-                let new_vpn_peers = capture::detect_vpn_gateway_peers(&new_own);
+                let new_vpn_peers = net_topology::detect_vpn_gateway_peers(&new_own);
                 let new_cf = build_cf_excluded(&new_own, effective_gw, &new_vpn_peers);
                 if !new_vpn_peers.is_empty() {
                     let current_cf = cf_excluded_cache.load();
@@ -328,7 +329,7 @@ fn main() -> io::Result<()> {
             .name("local-ip-refresh".into())
             .spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_secs(refresh_secs));
-                let new_ip = capture::detect_local_ip();
+                let new_ip = net_topology::detect_local_ip();
                 let current = cache.load();
                 if **current != new_ip {
                     match new_ip {
