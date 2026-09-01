@@ -13,6 +13,8 @@ export interface ActivityItem {
   id: number;
   ts_ms: number;
   app_name: string;
+  /** Full process path; used to resolve the real app icon. Null for system procs. */
+  process_path: string | null;
   verdict: "Block" | "Alert" | "Allow";
   detector_ids: string[];
   a_ip_text: string;
@@ -45,6 +47,7 @@ export interface DetectorStat {
 
 export interface TopApp {
   app_name: string;
+  process_path: string | null;
   blocks: number;
   alerts: number;
 }
@@ -163,6 +166,17 @@ export function getThreatCountries(): Promise<CountryStat[]> {
 export function getWeeklyBlocks(): Promise<DayStat[]> {
   if (!isTauri()) return Promise.reject(new Error("not-tauri"));
   return invoke<DayStat[]>("get_weekly_blocks");
+}
+
+/**
+ * Resolve the real macOS app icon for a verdict's process_path.
+ * Returns base64-encoded PNG data, or null when the icon cannot be resolved
+ * (system binaries, non-bundle paths, non-macOS). Backed by an app-bundle
+ * keyed cache in Rust, so many helper processes of one app share one lookup.
+ */
+export function getAppIcon(processPath: string): Promise<string | null> {
+  if (!isTauri()) return Promise.resolve(null);
+  return invoke<string | null>("get_app_icon", { processPath });
 }
 
 export function getActiveBlocks(): Promise<ActiveBlock[]> {

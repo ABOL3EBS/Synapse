@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
+    "flag-icons": "^7.5.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-globe.gl": "^2.38.0"

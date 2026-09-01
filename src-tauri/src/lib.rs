@@ -66,6 +66,10 @@ pub struct ActivityItem {
     pub id: i64,
     pub ts_ms: i64,
     pub app_name: String,
+    /// Full process_path from the verdicts table; used by the frontend to
+    /// resolve the real app icon via get_app_icon(). None for system/
+    /// non-bundle processes.
+    pub process_path: Option<String>,
     pub verdict: String,
     pub detector_ids: Vec<String>,
     pub a_ip_text: String,
@@ -233,6 +237,7 @@ fn query_activity_feed(
                 id: r.get(0)?,
                 ts_ms: r.get(1)?,
                 app_name,
+                process_path: process_path.clone(),
                 verdict: r.get(3)?,
                 detector_ids: vec![], // filled below
                 a_ip_text,
@@ -466,6 +471,10 @@ fn get_detector_breakdown(state: tauri::State<DbState>) -> Vec<DetectorStat> {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TopApp {
     pub app_name: String,
+    /// Full process_path from the verdicts table; used by the frontend to
+    /// resolve the real app icon via get_app_icon(). None for system/
+    /// non-bundle processes.
+    pub process_path: Option<String>,
     pub blocks: i64,
     pub alerts: i64,
 }
@@ -502,6 +511,7 @@ fn get_top_apps(state: tauri::State<DbState>) -> Vec<TopApp> {
             .to_string();
         Ok(TopApp {
             app_name,
+            process_path: Some(path),
             blocks: r.get(1)?,
             alerts: r.get(2)?,
         })
@@ -601,6 +611,159 @@ fn get_threat_countries(state: tauri::State<DbState>) -> Vec<CountryStat> {
 }
 
 // ---------------------------------------------------------------------------
+// App icon resolution — NSWorkspace on macOS, cache keyed by resolved .app
+// ---------------------------------------------------------------------------
+
+/// base64-encoded PNG icon per resolved .app bundle. Caches both hits and
+/// misses so repeated helper-process verdicts (Renderer/GPU/Plugin all
+/// resolve to the same parent .app) trigger at most one NSWorkspace call.
+pub struct IconCache(Mutex<std::collections::HashMap<String, Option<String>>>);
+
+/// Walk `process_path` components upward and return the OUTERMOST ancestor
+/// ending in `.app` — the actual application bundle. Helper bundles nested
+/// under a framework (e.g. `Brave Browser Helper.app` inside
+/// `Brave Browser.app/Contents/Frameworks/`) carry no icon resource of their
+/// own, so NSWorkspace::icon(forFile:) returns a generic placeholder for them.
+/// The outermost `.app` (e.g. `Brave Browser.app`) owns the real icon the
+/// user recognizes.
+fn find_parent_app_bundle(process_path: &str) -> Option<String> {
+    use std::path::Path;
+    let mut current: Option<&Path> = Path::new(process_path).parent();
+    let mut outermost: Option<String> = None;
+    let mut candidates: Vec<String> = Vec::new();
+    while let Some(dir) = current {
+        let is_app = dir
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("app"));
+        if is_app {
+            candidates.push(dir.to_string_lossy().into_owned());
+            // Keep climbing — a later ancestor may be a broader app bundle.
+            outermost = Some(dir.to_string_lossy().into_owned());
+        }
+        current = dir.parent();
+    }
+    if !candidates.is_empty() {
+        eprintln!("[AppIcon] app candidates: {candidates:?}");
+    }
+    outermost
+}
+
+#[cfg(target_os = "macos")]
+fn extract_icon_via_nsworkspace(app_path: &str) -> Option<String> {
+    use base64::engine::general_purpose;
+    use base64::Engine as _;
+    use objc::runtime::Object;
+    use objc::{class, msg_send, sel, sel_impl};
+    use std::ffi::CString;
+
+    // Rust &str is NOT null-terminated. stringWithUTF8String: requires a
+    // null-terminated C string — passing a raw as_ptr() causes it to read
+    // past the buffer into garbage, producing a garbage NSString and a nil
+    // icon. CString guarantees the trailing \0.
+    let c_path = CString::new(app_path).ok()?;
+
+    unsafe {
+        // NSWorkspace.sharedWorkspace.icon(forFile: app_path) → NSImage
+        let workspace: *mut Object = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let path_ns: *mut Object = msg_send![
+            class!(NSString),
+            stringWithUTF8String: c_path.as_ptr()
+        ];
+        if path_ns.is_null() {
+            eprintln!("[AppIcon] NSString: FAILED");
+            return None;
+        }
+        let icon: *mut Object = msg_send![workspace, iconForFile: path_ns];
+        if icon.is_null() {
+            eprintln!("[AppIcon] NSWorkspace icon: FAILED for: {app_path}");
+            return None;
+        }
+        eprintln!("[AppIcon] NSWorkspace icon: SUCCESS for: {app_path}");
+
+        // NSImage → TIFF → NSBitmapImageRep → PNG data
+        let tiff: *mut Object = msg_send![icon, TIFFRepresentation];
+        if tiff.is_null() {
+            eprintln!("[AppIcon] PNG conversion: FAILED (TIFFRepresentation nil)");
+            return None;
+        }
+        let rep: *mut Object = msg_send![class!(NSBitmapImageRep), imageRepWithData: tiff];
+        if rep.is_null() {
+            eprintln!("[AppIcon] PNG conversion: FAILED (imageRepWithData nil)");
+            return None;
+        }
+        let png_data: *mut Object = msg_send![
+            rep,
+            representationUsingType: 4 /* NSBitmapImageFileTypePNG */
+            properties: std::ptr::null::<Object>()
+        ];
+        if png_data.is_null() {
+            eprintln!("[AppIcon] PNG conversion: FAILED (representationUsingType nil)");
+            return None;
+        }
+        eprintln!("[AppIcon] PNG conversion: SUCCESS");
+
+        let bytes: *const u8 = msg_send![png_data, bytes];
+        let len: usize = msg_send![png_data, length];
+        eprintln!("[AppIcon] PNG bytes: {len}");
+        if len == 0 || bytes.is_null() {
+            eprintln!("[AppIcon] PNG bytes: empty/null");
+            return None;
+        }
+        let slice = std::slice::from_raw_parts(bytes, len);
+        Some(general_purpose::STANDARD.encode(slice))
+    }
+}
+
+/// Resolve and return the real macOS app icon for the process that produced
+/// a verdict. `process_path` is the full path from the `verdicts` table.
+/// Returns base64-encoded PNG data, or `None` when the icon cannot be
+/// resolved (system binaries, non-bundle paths, non-macOS targets).
+#[tauri::command]
+#[cfg(target_os = "macos")]
+fn get_app_icon(process_path: String, state: tauri::State<IconCache>) -> Option<String> {
+    eprintln!("[AppIcon] process: {process_path}");
+
+    let Some(app_path) = find_parent_app_bundle(&process_path) else {
+        eprintln!("[AppIcon] selected bundle: None (no .app ancestor)");
+        return None;
+    };
+    eprintln!("[AppIcon] selected bundle: {app_path}");
+
+    // Cache keyed by the resolved MAIN .app bundle, so every helper variant
+    // of one app (Brave Renderer/GPU/Plugin) shares a single extraction.
+    if let Some(cached) = state
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&app_path)
+    {
+        match cached {
+            Some(s) => eprintln!("[AppIcon] cache hit: {app_path} → {}b", s.len()),
+            None => eprintln!("[AppIcon] cache hit: {app_path} → None"),
+        }
+        return cached.clone();
+    }
+
+    let icon = extract_icon_via_nsworkspace(&app_path);
+    match &icon {
+        Some(s) => eprintln!("[AppIcon] result: {app_path} → {} base64 bytes", s.len()),
+        None => eprintln!("[AppIcon] result: {app_path} → None"),
+    };
+    state
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(app_path, icon.clone());
+    icon
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+fn get_app_icon(_process_path: String) -> Option<String> {
+    None
+}
+
+// ---------------------------------------------------------------------------
 // App entry point
 // ---------------------------------------------------------------------------
 
@@ -608,6 +771,7 @@ fn get_threat_countries(state: tauri::State<DbState>) -> Vec<CountryStat> {
 pub fn run() {
     tauri::Builder::default()
         .manage(DbState(Mutex::new(open_db())))
+        .manage(IconCache(Mutex::new(std::collections::HashMap::new())))
         .manage(settings::WriteDbState(
             Mutex::new(settings::open_write_db()),
         ))
@@ -622,6 +786,7 @@ pub fn run() {
             get_top_apps,
             get_threat_countries,
             get_weekly_blocks,
+            get_app_icon,
             settings::get_active_blocks,
             settings::request_unblock,
             settings::get_agent_status,
@@ -629,4 +794,60 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Synapse dashboard");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_parent_app_bundle;
+
+    #[test]
+    fn nested_helper_bundle_returns_outermost_app() {
+        // Real DB path: an Electron helper nested inside the parent app,
+        // the parent framework, and its own helper bundle. The helper bundle
+        // carries no icon resource, so we walk to the OUTERMOST `.app` —
+        // Brave Browser.app — which owns the real icon.
+        let path = "/Applications/Brave Browser.app/Contents/Frameworks/\
+                    Brave Browser Framework.framework/Versions/151.1.93.138/\
+                    Helpers/Brave Browser Helper.app/Contents/MacOS/Brave Browser Helper";
+        assert_eq!(
+            find_parent_app_bundle(path),
+            Some("/Applications/Brave Browser.app".to_string())
+        );
+    }
+
+    #[test]
+    fn top_level_binary_returns_its_bundle() {
+        // WhatsApp spawns its executable directly inside the bundle.
+        assert_eq!(
+            find_parent_app_bundle("/Applications/WhatsApp.app/Contents/MacOS/WhatsApp"),
+            Some("/Applications/WhatsApp.app".to_string())
+        );
+    }
+
+    #[test]
+    fn caseless_app_extension_matches() {
+        // ".APP" (uppercase) must match too.
+        assert_eq!(
+            find_parent_app_bundle("/Applications/Foo.APP/MacOS/foo"),
+            Some("/Applications/Foo.APP".to_string())
+        );
+    }
+
+    #[test]
+    fn no_app_ancestor_returns_none() {
+        // System binaries (rapportd, replicatord) have no .app ancestor.
+        assert_eq!(find_parent_app_bundle("/usr/libexec/rapportd"), None);
+        assert_eq!(
+            find_parent_app_bundle(
+                "/System/Library/PrivateFrameworks/ReplicatorCore.framework/\
+                 Support/replicatord"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn bare_filename_returns_none() {
+        assert_eq!(find_parent_app_bundle("Brave Browser Helper"), None);
+    }
 }

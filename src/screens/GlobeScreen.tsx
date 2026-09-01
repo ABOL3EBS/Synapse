@@ -3,6 +3,7 @@ import Globe, { GlobeMethods } from "react-globe.gl";
 import { getThreatCountries, type CountryStat } from "../lib/db";
 import { COUNTRY_COORDS } from "../lib/countries";
 import { countryName } from "../lib/translate";
+import FlagIcon from "../components/FlagIcon";
 
 const REFRESH_MS = 30_000;
 
@@ -174,7 +175,10 @@ export default function GlobeScreen({ focusCountry }: Props) {
             return (
               <div key={s.country_code} className="mb-3 xl:mb-4">
                 <div className="flex justify-between items-center mb-1">
-                  <span className="text-xs xl:text-sm text-navy/70 font-medium truncate mr-2">{name}</span>
+                  <span className="flex items-center gap-1.5 min-w-0 mr-2">
+                    <FlagIcon code={s.country_code} className="text-xs xl:text-sm" />
+                    <span className="text-xs xl:text-sm text-navy/70 font-medium truncate">{name}</span>
+                  </span>
                   <span className="text-[10px] xl:text-xs text-navy/40 tabular-nums shrink-0">{s.count}</span>
                 </div>
                 <div className="h-1 xl:h-1.5 rounded-full bg-navy/8 overflow-hidden">

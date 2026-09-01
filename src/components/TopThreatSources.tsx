@@ -1,18 +1,10 @@
 import type { CountryStat } from "../lib/db";
 import ChevronRight from "./ChevronRight";
+import FlagIcon from "./FlagIcon";
 
 interface Props {
   sources: CountryStat[];
   onSelect?: (countryCode: string) => void;
-}
-
-// CLDR flag from country code (e.g. "CN" → 🇨🇳)
-function flag(code: string): string {
-  return code
-    .toUpperCase()
-    .split("")
-    .map((c) => String.fromCodePoint(0x1f1e6 + c.charCodeAt(0) - 65))
-    .join("");
 }
 
 // Country name from ISO 3166-1 alpha-2. Falls back to raw code.
@@ -44,9 +36,7 @@ export default function TopThreatSources({ sources, onSelect }: Props) {
               text-left bg-transparent border-0 cursor-pointer
               hover:bg-navy/[0.03] transition-colors"
           >
-            <span className="text-[17px] leading-none shrink-0">
-              {flag(s.country_code)}
-            </span>
+            <FlagIcon code={s.country_code} className="text-base" />
 
             <div className="flex-1 min-w-0">
               <p className="text-xs font-medium text-navy/70 truncate mb-[3px]">

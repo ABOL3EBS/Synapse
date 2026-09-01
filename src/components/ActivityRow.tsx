@@ -3,6 +3,7 @@ import type { ActivityItem } from "../lib/db";
 import { toPlainEnglish, toWhySentence } from "../lib/translate";
 import { relativeTime } from "../lib/time";
 import { useNow } from "../hooks/useNow";
+import AppIcon from "./AppIcon";
 
 const DETECTOR_LABEL: Record<string, string> = {
   CrossFlow:          "Connection pattern analysis",
@@ -49,11 +50,14 @@ export default function ActivityRow({ item, isNew }: Props) {
     <div className={`rounded-2xl shadow-card border border-black/[0.04] overflow-hidden${isNew ? " card-flash" : " bg-white"}`}>
       {/* Main row */}
       <button
-        className="w-full text-left px-4 xl:px-5 py-3.5 xl:py-4 flex items-start gap-3 xl:gap-4"
+        className="w-full text-left px-4 xl:px-5 py-3.5 xl:py-4 flex items-center gap-3 xl:gap-4"
         onClick={() => setExpanded((e) => !e)}
       >
         {/* Verdict dot */}
-        <span className={`mt-1.5 shrink-0 w-2 h-2 xl:w-2.5 xl:h-2.5 rounded-full ${VERDICT_DOT[item.verdict]}`} />
+        <span className={`shrink-0 w-2 h-2 xl:w-2.5 xl:h-2.5 rounded-full ${VERDICT_DOT[item.verdict]}`} />
+
+        {/* App icon (real macOS icon; letter-circle fallback) */}
+        {item.process_path && <AppIcon processPath={item.process_path} size={40} />}
 
         {/* Content */}
         <div className="flex-1 min-w-0">

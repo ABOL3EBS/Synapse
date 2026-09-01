@@ -1,6 +1,36 @@
 # Implementation Status — Synapse IPS
 
-**Last verified:** 2026-08-18. Ground-truth ledger — if this file and the architecture doc disagree, this file wins.
+**Last verified:** 2026-09-01. Ground-truth ledger — if this file and the architecture doc disagree, this file wins.
+
+## Latest change (2026-09-01) — real app icons in Activity feed + Report Flagged Apps + real flag images
+
+The Activity feed shows the real macOS app icon next to each verdict, Report's Flagged Apps section reuses the same icons, and flag emojis are replaced with real flag images in Report's Top Threat Sources and the Threat Map sidebar.
+
+### App icons — NSWorkspace via Tauri (no static map)
+
+- **`src-tauri/src/lib.rs`:** `get_app_icon` Tauri command. `find_parent_app_bundle()` walks the verdict's `process_path` upward, collects all `.app` candidates, and returns the **OUTERMOST** application bundle (e.g. `Brave Browser Helper.app` nested under a framework → `Brave Browser.app`). Helper bundles carry no icon resource of their own, so NSWorkspace returns a generic placeholder for them; the outermost `.app` owns the real icon. Then `NSWorkspace.sharedWorkspace.icon(forFile:)` → `NSImage → TIFF → NSBitmapImageRep → PNG` → base64. `IconCache(Mutex<HashMap<String, Option<String>>>)` caches by the resolved **main** `.app` bundle — all helper variants (Renderer/GPU/Plugin) of one app share a single NSWorkspace extraction. macOS-gated with a `#[cfg(not)]` `None` fallback.
+- **Two bugs fixed during implementation:**
+  1. **Crash (EXC_BREAKPOINT) on opening Activity** — `stringWithString:` was passed a raw `&str` where an `NSString*` is expected → type mismatch → garbage ObjC receiver → objc abort. Fix: `stringWithUTF8String:` (correct message for a C string).
+  2. **Generic/identical icons** — `&str::as_ptr()` is not null-terminated, so `stringWithUTF8String:` read past the buffer into garbage and `iconForFile:` returned nil (every icon was a generic 103,474-byte placeholder). Fix: wrap the path in `CString`. Separately, `find_parent_app_bundle` returned the innermost helper bundle instead of the main app — fixed to return the outermost `.app`, confirmed by distinct per-app PNG byte counts (Cursor 1,087,279 · Brave 1,498,336 · Granola 336,661).
+- **`ActivityItem` struct** gained `process_path: Option<String>` (full path from the `verdicts` table, previously queried but discarded).
+- **`TopApp` struct** (Report Flagged Apps) gained `process_path: Option<String>` — the `get_top_apps` query already selected it; now exposed so `TopApps.tsx` reuses `<AppIcon>`.
+- **`src/components/AppIcon.tsx`** (new): real `<img>` on success, coloured-letter-circle fallback for system processes (`rapportd` → `R`). `appHue`/`appInitial` exported for reuse. Uses a module-level per-path promise cache. Activity + Flagged Apps both render at 40×40px.
+- **`src/components/AppIcon.tsx` sizing:** Activity rows pass `size={40}` (`ActivityRow.tsx`), row switched `items-start` → `items-center` so the larger icon centers vertically with content. `TopApps.tsx` replaced its local `w-6 h-6` letter circle with `<AppIcon size={40} />`, keeping layout/typography/counts/progress bars/legend unchanged.
+- **`scripts/extract-app-icons.sh`** (new, committed): reproducible dev-preview utility — `sips -z 64 64 <largest .icns> --out public/apps/NAME.png` per app. NOT used at runtime; exists so icon extraction is a repeatable committed step. Written for stock bash 3.2 (no assoc arrays).
+- **5 unit tests** for `find_parent_app_bundle`: nested helper bundle → outermost `.app`, top-level binary → its bundle, caseless `.APP` match, system binaries/no-`.app`-ancestor → `None`, bare filename → `None`.
+
+### Flags — `flag-icons` npm sprite
+
+- `flag-icons@7.5.0` installed; CSS imported in `src/index.css` (top of file, before Tailwind directives).
+- **`src/components/FlagIcon.tsx`** (new): `<span class="fi fi-{code}" />` for ISO 3166-1 alpha-2, muted "?" fallback for empty codes.
+- **`TopThreatSources.tsx`:** emoji `flag()` function removed, replaced with `<FlagIcon>`.
+- **`GlobeScreen.tsx`:** Threat Origins sidebar now shows a flag next to each country name.
+
+### Build status
+
+Rust (`src-tauri` workspace): build clean, clippy `-D warnings` clean, fmt clean, 12 tests pass (5 new + 7 pre-existing). Root workspace: build/clippy/fmt clean, 226 tests, 0 failures. Frontend: `npm run build` (tsc + vite) + `tsc --noEmit` pass. **Live-verified 2026-09-01:** real icons render for Brave/Granola/Cursor in the Activity feed (distinct per-app PNGs confirmed in `[AppIcon]` logs); `rapportd` falls back to the `R` letter. **Live Tauri-window verification of flag images pending** — static checks pass but no screenshot confirmation yet.
+
+---
 
 ## Latest change (2026-08-24) — Report → Activity/Threat Map drill-down
 
@@ -368,23 +398,27 @@ This is a **fixable verification gap**, not an accepted limitation like the VPN-
 
 | File | Lines | Description |
 |---|---|---|
-| `src-tauri/src/lib.rs` | 478 | Tauri IPC commands: `get_threat_stats`, `get_activity_chart`, `get_detector_breakdown`, `get_top_apps`, `get_threat_countries`, `get_activity_feed`. Read-only rusqlite connection, WAL mode. `ActivityItem` now includes `composite_score: Option<f64>`. |
+| `src-tauri/src/lib.rs` | 800 | Tauri IPC commands: `get_threat_stats`, `get_activity_chart`, `get_detector_breakdown`, `get_top_apps`, `get_threat_countries`, `get_activity_feed`, `get_app_icon` (NSWorkspace icon extraction + `IconCache` keyed by resolved `.app` bundle, macOS-gated). Read-only rusqlite connection, WAL mode. `ActivityItem` includes `composite_score: Option<f64>` + `process_path: Option<String>`. |
 | `src/App.tsx` | 22 | Root shell — SideNav + tab routing. |
 | `src/components/SideNav.tsx` | 107 | Nav tabs: Protection / Activity / Report / Threat Map / Settings. `startDragging()` on wordmark for window drag. |
 | `src/screens/ProtectionScreen.tsx` | 147 | Shield icon + status + active blocks count. `shield-pulse` CSS animation. 10 s poll. |
 | `src/screens/ActivityScreen.tsx` | 119 | Live feed, 5 s poll. `seenIds` ref + `flashIds` state: new rows flash green on arrival. `isNew` prop passed to `ActivityRow`. |
 | `src/screens/SettingsScreen.tsx` | 274 | Active Blocks (live countdown via `useNow` + `fetchedAt`; BlockRow shows reason subtitle), Detection Thresholds, CrossFlow Exclusions. |
-| `src/screens/StatsScreen.tsx` | 131 | Report screen — sparkline, detector breakdown chart, top flagged apps, animated KPI counters (`useCountUp`). |
-| `src/screens/GlobeScreen.tsx` | 170 | Threat Map — react-globe.gl, `earth-day.jpg` local texture (1600×800 equirectangular), animated arcs, ranked sidebar. |
-| `src/components/ActivityRow.tsx` | 128 | Expandable verdict card. Block dot/badge → red. Technical-details panel includes Score (`composite_score`). `isNew` prop applies `card-flash` CSS. Relative timestamps via `useNow`. |
+| `src/screens/StatsScreen.tsx` | 335 | Report screen — sparkline, detector breakdown chart, top flagged apps, animated KPI counters (`useCountUp`). |
+| `src/screens/GlobeScreen.tsx` | 203 | Threat Map — react-globe.gl, `earth-day.jpg` local texture (1600×800 equirectangular), animated arcs, ranked sidebar with real flag icons. |
+| `src/components/ActivityRow.tsx` | 132 | Expandable verdict card. Block dot/badge → red. Real app icon via `<AppIcon>` (letter-circle fallback). Technical-details panel includes Score (`composite_score`). `isNew` prop applies `card-flash` CSS. Relative timestamps via `useNow`. |
+| `src/components/AppIcon.tsx` | 74 | Real macOS app icon for a verdict's `process_path`. Per-process-path promise cache (one IPC call per unique path). Coloured-letter-circle fallback; exports shared `appHue()`/`appInitial()` (reused by `TopApps.tsx`). |
+| `src/components/TopThreatSources.tsx` | 70 | Top-4 threat countries with real flag icons (`<FlagIcon>`), drill-down click, bar chart. |
+| `src/components/FlagIcon.tsx` | 25 | `flag-icons` sprite `<span class="fi fi-{code}">` from ISO 3166-1 alpha-2; muted `?` fallback for empty codes. |
 | `src/components/Sparkline.tsx` | 58 | SVG path sparkline with gradient fill. |
 | `src/components/DetectorChart.tsx` | 50 | Horizontal bar chart for detector breakdown. |
-| `src/components/TopApps.tsx` | 73 | Top flagged apps with hue-from-name coloring, log-scale bars, B/A badges. |
+| `src/components/TopApps.tsx` | 81 | Top flagged apps with hue-from-name coloring, log-scale bars, B/A badges. `appHue`/`appInitial` shared from `AppIcon.tsx`. |
 | `src/hooks/useNow.ts` | 11 | `useNow(intervalMs)` — returns live `Date.now()`, used by ActivityRow + BlockRow. |
-| `src/lib/db.ts` | 146 | TypeScript wrappers for all Tauri commands. `ActivityItem` includes `composite_score: number \| null`. |
+| `src/lib/db.ts` | 199 | TypeScript wrappers for all Tauri commands incl. `getAppIcon`. `ActivityItem` includes `composite_score: number \| null` + `process_path: string \| null`. |
 | `src/lib/time.ts` | 11 | `relativeTime(ts_ms, now?)` — optional `now` param enables live drift via `useNow`. |
 | `src/lib/countries.ts` | 196 | 170-entry ISO-2 → `{lat, lng, name}` centroid map for globe ring placement. |
-| `src/index.css` | 90 | Tailwind base + custom animations: `shield-pulse`, `bar-grow`, `activity-row` stagger, `card-flash` (new-item green fade). |
+| `src/index.css` | 93 | Tailwind base + `flag-icons` CSS import + custom animations: `shield-pulse`, `bar-grow`, `activity-row` stagger, `card-flash` (new-item green fade). |
+| `scripts/extract-app-icons.sh` | 43 | Dev utility — `sips -z 64 64 <largest .icns> --out public/apps/NAME.png` per app. NOT used at runtime (see `get_app_icon`). Stock bash 3.2 compatible. |
 | `public/earth-day.jpg` | — | 1600×800 equirectangular day-side texture (238KB), local copy from node_modules to avoid protocol-relative URL failure in Tauri webview. |
 
 **Verified in real Tauri window (2026-08-01):** All 4 screens render with real SQLite data. Globe renders with visible continents, auto-rotates, pulsing rings match real `get_threat_countries` output. Texture URL fix confirmed — switching from `//unpkg.com/...` to `/earth-day.jpg` resolved the near-black globe that appeared only in the Tauri context (not the browser preview).

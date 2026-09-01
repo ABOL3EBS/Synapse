@@ -1,20 +1,10 @@
 import type { TopApp } from "../lib/db";
 import ChevronRight from "./ChevronRight";
+import AppIcon, { appHue } from "./AppIcon";
 
 interface Props {
   apps: TopApp[];
   onSelect?: (appName: string) => void;
-}
-
-function initial(name: string): string {
-  return name.charAt(0).toUpperCase();
-}
-
-// Hue from app name — consistent colour per app
-function appHue(name: string): number {
-  let h = 0;
-  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) & 0xffff;
-  return h % 360;
 }
 
 export default function TopApps({ apps, onSelect }: Props) {
@@ -37,14 +27,8 @@ export default function TopApps({ apps, onSelect }: Props) {
               text-left bg-transparent border-0 cursor-pointer
               hover:bg-navy/[0.03] transition-colors"
           >
-            {/* App initial circle */}
-            <div
-              className="w-6 h-6 rounded-full shrink-0 flex items-center justify-center
-                         text-[10px] font-bold text-white"
-              style={{ background: `hsl(${hue}, 55%, 48%)` }}
-            >
-              {initial(app.app_name)}
-            </div>
+            {/* Real app icon (40px, same as Activity); letter-circle fallback */}
+            <AppIcon processPath={app.process_path} size={40} />
 
             <div className="flex-1 min-w-0">
               <p className="text-xs font-medium text-navy/70 truncate">{app.app_name}</p>

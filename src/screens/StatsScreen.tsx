@@ -231,7 +231,7 @@ function SkeletonCard() {
   );
 }
 
-function StatCard({ label, value, accent }: {
+function StatCard({ label, value, accent: _accent }: {
   label: string; value: number; accent: "emerald" | "navy";
 }) {
   const animated = useCountUp(value);
