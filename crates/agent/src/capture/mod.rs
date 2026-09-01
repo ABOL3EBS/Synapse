@@ -144,6 +144,20 @@ pub(crate) fn is_infrastructure_destination(ip: IpAddr) -> bool {
     }
 }
 
+/// Fields common to every verdict-handling branch, resolved once in
+/// handle_verdict() and reused by the Alert/Block paths. Grouped into a
+/// struct to keep handle_alert_verdict/handle_block_verdict under
+/// clippy::too_many_arguments (5+ params triggers a struct — see CLAUDE.md
+/// refactor triggers).
+struct VerdictContext<'a> {
+    flow_id: u64,
+    flow: &'a synapse_common::FlowRecord,
+    findings: &'a [synapse_common::DetectorFinding],
+    composite_score: f32,
+    remote: IpAddr,
+    local_ip: IpAddr,
+}
+
 impl CaptureEngine {
     pub fn new(init: CaptureInit) -> Self {
         Self {
@@ -328,104 +342,149 @@ impl CaptureEngine {
             warn!("[SKIP] flow={} — resolved=None (startup window)", flow_id);
             return;
         };
-        let remote = resolved.remote_ip;
-        let local_ip = resolved.local_ip;
+        let ctx = VerdictContext {
+            flow_id,
+            flow,
+            findings,
+            composite_score,
+            remote: resolved.remote_ip,
+            local_ip: resolved.local_ip,
+        };
 
         match verdict {
             synapse_common::Verdict::Allow => {
                 info!("[ALLOW] flow={}", flow_id);
             }
             synapse_common::Verdict::Alert { ref reason } => {
-                info!("[ALERT] flow={} remote={} {}", flow_id, remote, reason);
-                if let Some(ref tx) = self.storage_tx {
-                    let _ = tx.send(StorageEvent::VerdictDecided {
-                        flow: Box::new(flow.clone()),
-                        local_ip,
-                        remote_ip: remote,
-                        verdict: "Alert".to_string(),
-                        reason: reason.clone(),
-                        composite_score,
-                        ttl_ms: None,
-                        findings: findings.to_vec(),
-                    });
-                }
+                self.handle_alert_verdict(ctx, reason);
             }
             synapse_common::Verdict::Block { ttl, ref reason } => {
-                if let Some(skip_reason) = self.should_skip_block(remote) {
-                    warn!("[SKIP] flow={} — {skip_reason}", flow_id);
-                } else {
-                    let dominated = self
-                        .block_cooldown
-                        .get(&remote)
-                        .is_some_and(|&expires| Instant::now() < expires);
-                    if dominated {
-                        debug!("BLOCK skip flow={} {remote} (cooldown active)", flow_id);
-                    } else {
-                        info!(
-                            "[BLOCK] flow={} remote={remote} ttl={ttl:?} {reason}",
-                            flow_id,
-                        );
+                self.handle_block_verdict(ctx, ttl, reason);
+            }
+        }
+    }
 
-                        // Persist the verdict decision before attempting enforcement.
-                        if let Some(ref tx) = self.storage_tx {
-                            let _ = tx.send(StorageEvent::VerdictDecided {
-                                flow: Box::new(flow.clone()),
-                                local_ip,
-                                remote_ip: remote,
-                                verdict: "Block".to_string(),
-                                reason: reason.clone(),
-                                composite_score,
-                                ttl_ms: Some(ttl.as_millis() as u64),
-                                findings: findings.to_vec(),
-                            });
-                        }
+    fn handle_alert_verdict(&mut self, ctx: VerdictContext, reason: &str) {
+        info!(
+            "[ALERT] flow={} remote={} {}",
+            ctx.flow_id, ctx.remote, reason
+        );
+        if let Some(ref tx) = self.storage_tx {
+            let _ = tx.send(StorageEvent::VerdictDecided {
+                flow: Box::new(ctx.flow.clone()),
+                local_ip: ctx.local_ip,
+                remote_ip: ctx.remote,
+                verdict: "Alert".to_string(),
+                reason: reason.to_string(),
+                composite_score: ctx.composite_score,
+                ttl_ms: None,
+                findings: ctx.findings.to_vec(),
+            });
+        }
+    }
 
-                        // Pick the top-scoring Completed detector for the enforcement log.
-                        let top_detector = findings
-                            .iter()
-                            .filter(|f| f.status == synapse_common::DetectorStatus::Completed)
-                            .max_by(|a, b| {
-                                (a.score * a.confidence)
-                                    .partial_cmp(&(b.score * b.confidence))
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                            })
-                            .map(|f| format!("{:?}", f.detector_id));
+    /// Guard clauses replace the original nested if/else — same two skip
+    /// conditions, same fallthrough-to-send behavior, just de-nested.
+    /// See commit message / PR discussion for the branch-by-branch equivalence
+    /// proof against the pre-split nested version.
+    fn handle_block_verdict(
+        &mut self,
+        ctx: VerdictContext,
+        ttl: std::time::Duration,
+        reason: &str,
+    ) {
+        if let Some(skip_reason) = self.should_skip_block(ctx.remote) {
+            warn!("[SKIP] flow={} — {skip_reason}", ctx.flow_id);
+            return;
+        }
 
-                        let cmd = EnforcementCommand::Block { ip: remote, ttl };
-                        if let Err(e) = protocol::send_message(&mut self.write_half, &cmd) {
-                            self.ipc_failures += 1;
-                            error!(
-                                "enforcement send failed for {remote}: {e} — \
-                                 consecutive failures: {}/{}",
-                                self.ipc_failures, MAX_IPC_FAILURES,
-                            );
-                            if let Some(ref tx) = self.storage_tx {
-                                let _ = tx.send(StorageEvent::EnforcementRequested {
-                                    ip: remote,
-                                    ttl_ms: ttl.as_millis() as u64,
-                                    reason: reason.clone(),
-                                    top_detector,
-                                    composite_score,
-                                    send_error: Some(format!("{e}")),
-                                });
-                            }
-                        } else {
-                            self.ipc_failures = 0;
-                            info!("[ENFORCE] command sent: Block {remote} ttl={ttl:?}");
-                            self.block_cooldown.insert(remote, Instant::now() + ttl);
-                            if let Some(ref tx) = self.storage_tx {
-                                let _ = tx.send(StorageEvent::EnforcementRequested {
-                                    ip: remote,
-                                    ttl_ms: ttl.as_millis() as u64,
-                                    reason: reason.clone(),
-                                    top_detector,
-                                    composite_score,
-                                    send_error: None,
-                                });
-                            }
-                        }
-                    }
-                }
+        let dominated = self
+            .block_cooldown
+            .get(&ctx.remote)
+            .is_some_and(|&expires| Instant::now() < expires);
+        if dominated {
+            debug!(
+                "BLOCK skip flow={} {} (cooldown active)",
+                ctx.flow_id, ctx.remote
+            );
+            return;
+        }
+
+        info!(
+            "[BLOCK] flow={} remote={} ttl={ttl:?} {reason}",
+            ctx.flow_id, ctx.remote
+        );
+
+        // Persist the verdict decision before attempting enforcement.
+        if let Some(ref tx) = self.storage_tx {
+            let _ = tx.send(StorageEvent::VerdictDecided {
+                flow: Box::new(ctx.flow.clone()),
+                local_ip: ctx.local_ip,
+                remote_ip: ctx.remote,
+                verdict: "Block".to_string(),
+                reason: reason.to_string(),
+                composite_score: ctx.composite_score,
+                ttl_ms: Some(ttl.as_millis() as u64),
+                findings: ctx.findings.to_vec(),
+            });
+        }
+
+        let top_detector = Self::select_top_detector(ctx.findings);
+        self.send_block_command(ctx.remote, ttl, reason, ctx.composite_score, top_detector);
+    }
+
+    /// Pick the top-scoring Completed detector for the enforcement log.
+    fn select_top_detector(findings: &[synapse_common::DetectorFinding]) -> Option<String> {
+        findings
+            .iter()
+            .filter(|f| f.status == synapse_common::DetectorStatus::Completed)
+            .max_by(|a, b| {
+                (a.score * a.confidence)
+                    .partial_cmp(&(b.score * b.confidence))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|f| format!("{:?}", f.detector_id))
+    }
+
+    fn send_block_command(
+        &mut self,
+        remote: IpAddr,
+        ttl: std::time::Duration,
+        reason: &str,
+        composite_score: f32,
+        top_detector: Option<String>,
+    ) {
+        let cmd = EnforcementCommand::Block { ip: remote, ttl };
+        if let Err(e) = protocol::send_message(&mut self.write_half, &cmd) {
+            self.ipc_failures += 1;
+            error!(
+                "enforcement send failed for {remote}: {e} — \
+                 consecutive failures: {}/{}",
+                self.ipc_failures, MAX_IPC_FAILURES,
+            );
+            if let Some(ref tx) = self.storage_tx {
+                let _ = tx.send(StorageEvent::EnforcementRequested {
+                    ip: remote,
+                    ttl_ms: ttl.as_millis() as u64,
+                    reason: reason.to_string(),
+                    top_detector,
+                    composite_score,
+                    send_error: Some(format!("{e}")),
+                });
+            }
+        } else {
+            self.ipc_failures = 0;
+            info!("[ENFORCE] command sent: Block {remote} ttl={ttl:?}");
+            self.block_cooldown.insert(remote, Instant::now() + ttl);
+            if let Some(ref tx) = self.storage_tx {
+                let _ = tx.send(StorageEvent::EnforcementRequested {
+                    ip: remote,
+                    ttl_ms: ttl.as_millis() as u64,
+                    reason: reason.to_string(),
+                    top_detector,
+                    composite_score,
+                    send_error: None,
+                });
             }
         }
     }
@@ -507,6 +566,17 @@ impl CaptureEngine {
         let n = n as usize;
         debug!("BPF read: {} bytes from fd={}", n, self.bpf_fd);
 
+        self.process_bpf_buffer(n);
+
+        Ok(true)
+    }
+
+    /// Walk BPF header records in `self.buf[0..n]`, dispatching each parsed IP
+    /// packet to `process_parsed_frame`. `process_parsed_frame` returning
+    /// `false` (local_ip not yet known) re-enters this loop at the SAME
+    /// offset via `continue` — mirrors the original inline `continue`, which
+    /// skipped the offset-advance step below for the same reason.
+    fn process_bpf_buffer(&mut self, n: usize) {
         let mut offset = 0usize;
         while offset + BpfHdr::SIZE <= n {
             let hdr = match BpfHdr::from_bytes(&self.buf[offset..]) {
@@ -537,121 +607,8 @@ impl CaptureEngine {
             let frame = &self.buf[data_start..data_end];
 
             if let Some(info_pkt) = parse_ip_frame(frame) {
-                debug!(
-                    "parsed packet: {}:{} → {}:{} proto={}",
-                    info_pkt.src_ip,
-                    info_pkt.src_port,
-                    info_pkt.dst_ip,
-                    info_pkt.dst_port,
-                    info_pkt.protocol
-                );
-                if self.pkt_count.is_multiple_of(10) {
-                    debug!(
-                        "pkt#{}: {}:{} → {}:{} (proto={})",
-                        self.pkt_count,
-                        info_pkt.src_ip,
-                        info_pkt.src_port,
-                        info_pkt.dst_ip,
-                        info_pkt.dst_port,
-                        info_pkt.protocol,
-                    );
-                }
-
-                // P1 + R10: Lock-free snapshot. Hoisted so both PID lookup and
-                // CrossFlow recording use the same local_ip without a second ArcSwap read.
-                let current_local_ip = match **self.caches.local_ip.load() {
-                    Some(ip) => ip,
-                    None => {
-                        debug!("local_ip unknown — skipping packet (direction unknown)");
-                        continue;
-                    }
-                };
-
-                let (local_port, pid) = {
-                    // P1: Lock-free snapshot via arc_swap — no mutex on hot path.
-                    let cache = self.caches.port_pid.load();
-                    let lookup = |port: u16, proto: u8| -> Option<(u16, u32)> {
-                        let key = (port, proto);
-                        cache.get(&key).map(|&pid| (port, pid))
-                    };
-                    let (local, _) = determine_local_port(
-                        info_pkt.src_ip,
-                        info_pkt.src_port,
-                        info_pkt.dst_ip,
-                        info_pkt.dst_port,
-                        current_local_ip,
-                    );
-                    lookup(local, info_pkt.protocol).unwrap_or((0, 0))
-                };
-
-                let update = self.tracker.update(
-                    &info_pkt,
-                    local_port,
-                    if pid != 0 { Some(pid) } else { None },
-                );
-
-                if let flow::FlowUpdate::NewFlow(flow_id) = update {
-                    debug!(
-                        "[FLOW] created #{}: {}:{} → {}:{} (proto={}, local_port={}, pid={:?})",
-                        flow_id,
-                        info_pkt.src_ip,
-                        info_pkt.src_port,
-                        info_pkt.dst_ip,
-                        info_pkt.dst_port,
-                        info_pkt.protocol,
-                        local_port,
-                        if pid != 0 { Some(pid) } else { None },
-                    );
-
-                    // Record cross-flow state (no IPC or blocking, just in-memory stats).
-                    // current_local_ip was hoisted above the pid-lookup block so no
-                    // second ArcSwap load is needed here.
-                    let (remote_ip, remote_port) = determine_remote_endpoint(
-                        info_pkt.src_ip,
-                        info_pkt.src_port,
-                        info_pkt.dst_ip,
-                        info_pkt.dst_port,
-                        current_local_ip,
-                    );
-                    if let Ok(mut state) = self.cross_flow_state.lock() {
-                        state.record_connection(pid, remote_ip, info_pkt.protocol, remote_port);
-                        if pid != 0 {
-                            state.record_pid_connection(pid, remote_ip);
-                        }
-                    }
-
-                    // Freeze direction-resolved endpoints on the flow record.
-                    // Uses per-packet src/dst (genuine wire direction), not canonical
-                    // a_ip/b_ip. See ResolvedFlow doc comment for safety analysis.
-                    self.tracker.set_resolved(
-                        flow_id,
-                        ResolvedFlow {
-                            local_ip: current_local_ip,
-                            local_port,
-                            remote_ip,
-                            remote_port,
-                        },
-                    );
-
-                    let request = EnrichmentRequest {
-                        flow_id,
-                        src_ip: info_pkt.src_ip,
-                        dst_ip: info_pkt.dst_ip,
-                        src_port: info_pkt.src_port,
-                        dst_port: info_pkt.dst_port,
-                        protocol: info_pkt.protocol,
-                        pid: if pid != 0 { Some(pid) } else { None },
-                        kinds: [
-                            EnrichmentKind::DnsReverse,
-                            EnrichmentKind::ProcessAttribution,
-                            EnrichmentKind::GeoIp,
-                            EnrichmentKind::Reputation,
-                        ],
-                    };
-
-                    if let Err(e) = self.enrich_pool.dispatch(request) {
-                        warn!("enrichment dispatch failed: {e}");
-                    }
+                if !self.process_parsed_frame(&info_pkt) {
+                    continue;
                 }
             }
 
@@ -663,8 +620,149 @@ impl CaptureEngine {
                 }
             }
         }
+    }
 
-        Ok(true)
+    /// Process one parsed IP packet: logging, direction-aware local
+    /// port/PID lookup, flow tracker update, and (for new flows) cross-flow
+    /// recording + enrichment dispatch. Returns `false` when
+    /// `current_local_ip` is not yet known — the caller must skip its
+    /// offset-advance in that case, matching the original's `continue`.
+    fn process_parsed_frame(&mut self, info_pkt: &synapse_common::PacketInfo) -> bool {
+        debug!(
+            "parsed packet: {}:{} → {}:{} proto={}",
+            info_pkt.src_ip,
+            info_pkt.src_port,
+            info_pkt.dst_ip,
+            info_pkt.dst_port,
+            info_pkt.protocol
+        );
+        if self.pkt_count.is_multiple_of(10) {
+            debug!(
+                "pkt#{}: {}:{} → {}:{} (proto={})",
+                self.pkt_count,
+                info_pkt.src_ip,
+                info_pkt.src_port,
+                info_pkt.dst_ip,
+                info_pkt.dst_port,
+                info_pkt.protocol,
+            );
+        }
+
+        // P1 + R10: Lock-free snapshot. Hoisted so both PID lookup and
+        // CrossFlow recording use the same local_ip without a second ArcSwap read.
+        let current_local_ip = match **self.caches.local_ip.load() {
+            Some(ip) => ip,
+            None => {
+                debug!("local_ip unknown — skipping packet (direction unknown)");
+                return false;
+            }
+        };
+
+        let (local_port, pid) = self.lookup_local_port_and_pid(info_pkt, current_local_ip);
+
+        let update = self.tracker.update(
+            info_pkt,
+            local_port,
+            if pid != 0 { Some(pid) } else { None },
+        );
+
+        if let flow::FlowUpdate::NewFlow(flow_id) = update {
+            self.handle_new_flow(flow_id, info_pkt, pid, local_port, current_local_ip);
+        }
+
+        true
+    }
+
+    fn lookup_local_port_and_pid(
+        &self,
+        info_pkt: &synapse_common::PacketInfo,
+        current_local_ip: IpAddr,
+    ) -> (u16, u32) {
+        // P1: Lock-free snapshot via arc_swap — no mutex on hot path.
+        let cache = self.caches.port_pid.load();
+        let lookup = |port: u16, proto: u8| -> Option<(u16, u32)> {
+            let key = (port, proto);
+            cache.get(&key).map(|&pid| (port, pid))
+        };
+        let (local, _) = determine_local_port(
+            info_pkt.src_ip,
+            info_pkt.src_port,
+            info_pkt.dst_ip,
+            info_pkt.dst_port,
+            current_local_ip,
+        );
+        lookup(local, info_pkt.protocol).unwrap_or((0, 0))
+    }
+
+    fn handle_new_flow(
+        &mut self,
+        flow_id: u64,
+        info_pkt: &synapse_common::PacketInfo,
+        pid: u32,
+        local_port: u16,
+        current_local_ip: IpAddr,
+    ) {
+        debug!(
+            "[FLOW] created #{}: {}:{} → {}:{} (proto={}, local_port={}, pid={:?})",
+            flow_id,
+            info_pkt.src_ip,
+            info_pkt.src_port,
+            info_pkt.dst_ip,
+            info_pkt.dst_port,
+            info_pkt.protocol,
+            local_port,
+            if pid != 0 { Some(pid) } else { None },
+        );
+
+        // Record cross-flow state (no IPC or blocking, just in-memory stats).
+        // current_local_ip was hoisted above the pid-lookup block so no
+        // second ArcSwap load is needed here.
+        let (remote_ip, remote_port) = determine_remote_endpoint(
+            info_pkt.src_ip,
+            info_pkt.src_port,
+            info_pkt.dst_ip,
+            info_pkt.dst_port,
+            current_local_ip,
+        );
+        if let Ok(mut state) = self.cross_flow_state.lock() {
+            state.record_connection(pid, remote_ip, info_pkt.protocol, remote_port);
+            if pid != 0 {
+                state.record_pid_connection(pid, remote_ip);
+            }
+        }
+
+        // Freeze direction-resolved endpoints on the flow record.
+        // Uses per-packet src/dst (genuine wire direction), not canonical
+        // a_ip/b_ip. See ResolvedFlow doc comment for safety analysis.
+        self.tracker.set_resolved(
+            flow_id,
+            ResolvedFlow {
+                local_ip: current_local_ip,
+                local_port,
+                remote_ip,
+                remote_port,
+            },
+        );
+
+        let request = EnrichmentRequest {
+            flow_id,
+            src_ip: info_pkt.src_ip,
+            dst_ip: info_pkt.dst_ip,
+            src_port: info_pkt.src_port,
+            dst_port: info_pkt.dst_port,
+            protocol: info_pkt.protocol,
+            pid: if pid != 0 { Some(pid) } else { None },
+            kinds: [
+                EnrichmentKind::DnsReverse,
+                EnrichmentKind::ProcessAttribution,
+                EnrichmentKind::GeoIp,
+                EnrichmentKind::Reputation,
+            ],
+        };
+
+        if let Err(e) = self.enrich_pool.dispatch(request) {
+            warn!("enrichment dispatch failed: {e}");
+        }
     }
 
     /// Collect enrichment results and attach to flows (non-blocking).

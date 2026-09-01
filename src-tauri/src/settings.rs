@@ -328,8 +328,7 @@ pub fn get_config_values() -> ConfigValues {
     // Always-excluded hardcoded IPs are prepended regardless of TOML config.
     // Own IPs and detected gateway are also always excluded at runtime but are
     // dynamic (network-dependent) and cannot be read from the Tauri process.
-    let mut cf_exclusions: Vec<String> =
-        CF_ALWAYS_EXCLUDED.iter().map(|s| s.to_string()).collect();
+    let mut cf_exclusions: Vec<String> = CF_ALWAYS_EXCLUDED.iter().map(|s| s.to_string()).collect();
 
     if let Ok(text) = std::fs::read_to_string(config_path()) {
         let cfg: TomlConfig = toml::from_str(&text).unwrap_or_default();
