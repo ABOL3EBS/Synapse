@@ -118,10 +118,10 @@ export default function StatsScreen({ onNavigateActivity, onNavigateGlobe }: Pro
     : buildSelectedDayLabels(displayedChart);
 
   const sparklineTitle = selectedDay === null
-    ? "Activity · last 24 h"
+    ? "Alerts & Blocks · last 24 h"
     : selectedDay === 0
-      ? "Activity · today"
-      : `Activity · ${dayFullLabel(selectedDay)}`;
+      ? "Alerts & Blocks · today"
+      : `Alerts & Blocks · ${dayFullLabel(selectedDay)}`;
 
   if (error) {
     return (
