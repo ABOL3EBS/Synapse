@@ -159,8 +159,9 @@ fn main() -> io::Result<()> {
     ));
 
     // Detect default gateway — protected from blocking in handle_verdict.
-    let gateway_ip = net_topology::detect_default_gateway();
-    match gateway_ip {
+    let gateway_ip_cache: Arc<ArcSwap<Option<IpAddr>>> =
+        Arc::new(ArcSwap::from_pointee(net_topology::detect_default_gateway()));
+    match **gateway_ip_cache.load() {
         Some(gw) => info!("default gateway detected: {gw}"),
         None => warn!("could not detect default gateway — gateway guard disabled"),
     }
@@ -222,7 +223,7 @@ fn main() -> io::Result<()> {
         info!("VPN tunnel peers detected: {:?}", vpn_peers);
     }
     let cf_excluded: Arc<ArcSwap<HashSet<IpAddr>>> = Arc::new(ArcSwap::from_pointee(
-        build_cf_excluded(&own_ips.load(), gateway_ip, &vpn_peers),
+        build_cf_excluded(&own_ips.load(), **gateway_ip_cache.load(), &vpn_peers),
     ));
     info!(
         "CrossFlow exclusion set: {} addresses (own_ips + gateway + vpn_peers + api endpoints)",
@@ -232,11 +233,12 @@ fn main() -> io::Result<()> {
     {
         let own_ips_cache = own_ips.clone();
         let cf_excluded_cache = cf_excluded.clone();
+        let gw_cache = gateway_ip_cache.clone();
         let refresh_secs = cfg.local_ip_refresh_secs();
         // Seed last_known_gw from startup detection so the refresh thread
         // never silently drops the gateway when detection transiently fails
         // (e.g. VPN reconnect causes needed == 0 for one or two ticks).
-        let mut last_known_gw: Option<IpAddr> = gateway_ip;
+        let mut last_known_gw: Option<IpAddr> = **gw_cache.load();
         // Count consecutive ticks where detection returned None and we fell back.
         // Surfaced as warn! so persistent detection failures (not just transient ones)
         // remain visible — the Aug 6 incident was silent for 1h45m before triggering.
@@ -315,6 +317,8 @@ fn main() -> io::Result<()> {
                     own_ips_cache.store(Arc::new(new_own));
                 }
                 cf_excluded_cache.store(Arc::new(new_cf));
+                // Live-refresh the enforcement guard's gateway reference.
+                gw_cache.store(Arc::new(effective_gw));
                 log::debug!(
                     "own-ips-refresh tick: cf_excluded updated (effective_gateway={:?})",
                     effective_gw
@@ -428,7 +432,7 @@ fn main() -> io::Result<()> {
         poll_timeout_ms: cfg.poll_timeout_ms(),
         detector_timeout,
         cb_config,
-        gateway_ip,
+        gateway_ip: gateway_ip_cache,
     };
     let net_caches = capture::NetworkCaches {
         local_ip: local_ip_cache,

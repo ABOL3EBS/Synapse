@@ -62,7 +62,7 @@ pub struct CaptureConfig {
     pub poll_timeout_ms: i32,
     pub detector_timeout: std::time::Duration,
     pub cb_config: detectors::CircuitBreakerConfig,
-    pub gateway_ip: Option<IpAddr>,
+    pub gateway_ip: Arc<ArcSwap<Option<IpAddr>>>,
 }
 
 /// Lock-free shared state updated by background threads (own-IPs refresh,
@@ -516,8 +516,8 @@ impl CaptureEngine {
         if own.contains(&remote) {
             return Some("remote is own IP");
         }
-        // Default gateway.
-        if Some(remote) == self.config.gateway_ip {
+        // Default gateway (live-refreshed ArcSwap — matches own-ips-refresh thread).
+        if Some(remote) == **self.config.gateway_ip.load() {
             return Some("remote is default gateway");
         }
         if is_infrastructure_destination(remote) {
@@ -856,7 +856,7 @@ mod tests {
                 poll_timeout_ms: 100,
                 detector_timeout: std::time::Duration::from_millis(100),
                 cb_config: detectors::CircuitBreakerConfig::default(),
-                gateway_ip: None,
+                gateway_ip: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None)),
             },
             enrich_pool: crate::enrichment::EnrichmentPool::new(None, None, 1),
             tracker: crate::flow::FlowTracker::new(crate::flow::FlowConfig::default()),
@@ -972,7 +972,7 @@ mod tests {
                 poll_timeout_ms: 100,
                 detector_timeout: std::time::Duration::from_millis(100),
                 cb_config: detectors::CircuitBreakerConfig::default(),
-                gateway_ip: None,
+                gateway_ip: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None)),
             },
             enrich_pool: crate::enrichment::EnrichmentPool::new(None, None, 1),
             tracker: crate::flow::FlowTracker::new(crate::flow::FlowConfig::default()),
