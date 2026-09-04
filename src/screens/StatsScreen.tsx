@@ -37,8 +37,6 @@ function dayFullLabel(offset: number): string {
   return d.toLocaleDateString("en", { month: "short", day: "numeric" });
 }
 
-const DEFAULT_SPARKLINE_LABELS = ["24h ago", "18h ago", "12h ago", "6h ago", "Now"];
-
 function formatHourLabel(hour: number): string {
   const period = hour < 12 ? "AM" : "PM";
   const displayHour = hour % 12 === 0 ? 12 : hour % 12;
@@ -49,7 +47,7 @@ function formatHourLabel(hour: number): string {
 // (so a truncated "today" chart never labels an hour that hasn't happened).
 function buildSelectedDayLabels(points: ChartPoint[]): string[] {
   const n = points.length;
-  if (n === 0) return DEFAULT_SPARKLINE_LABELS;
+  if (n === 0) return ["—", "—", "—", "—", "—"];
   return [0, 1, 2, 3, 4].map((i) => {
     const idx = Math.min(n - 1, Math.round((i * (n - 1)) / 4));
     return formatHourLabel(points[idx].hour);
@@ -105,17 +103,15 @@ export default function StatsScreen({ onNavigateActivity, onNavigateGlobe }: Pro
     setSelectedDay((prev) => (prev === offset ? null : offset));
 
   // Today's bar uses the same query as any other day, but future hours
-  // (past the current UTC hour) don't exist yet — trim the fake flat tail.
+  // (past the current local hour) don't exist yet — trim the fake flat tail.
   const displayedChart = selectedDay === 0
-    ? chart.slice(0, new Date().getUTCHours() + 1)
+    ? chart.slice(0, new Date().getHours() + 1)
     : chart;
 
   const chartTotal = displayedChart.reduce((sum, p) => sum + p.count, 0);
   const showEmptyChart = selectedDay !== null && chartTotal === 0;
 
-  const sparklineLabels = selectedDay === null
-    ? DEFAULT_SPARKLINE_LABELS
-    : buildSelectedDayLabels(displayedChart);
+  const sparklineLabels = buildSelectedDayLabels(displayedChart);
 
   const sparklineTitle = selectedDay === null
     ? "Alerts & Blocks · last 24 h"

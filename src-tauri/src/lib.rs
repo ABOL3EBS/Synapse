@@ -51,6 +51,28 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Local UTC offset in milliseconds, including DST. Computed once per process
+/// lifetime (same as `detect_local_ip()` — the system timezone doesn't change
+/// while a desktop app runs, and a 1-hour staleness across a DST boundary is
+/// acceptable for a dashboard with 30-second refresh).
+fn local_utc_offset_ms() -> i64 {
+    use std::sync::OnceLock;
+    static OFFSET: OnceLock<i64> = OnceLock::new();
+    *OFFSET.get_or_init(|| {
+        let now = std::time::SystemTime::now();
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let secs = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        unsafe { libc::localtime_r(&secs, &mut tm) };
+        tm.tm_gmtoff as i64 * 1000
+    })
+}
+
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+const HOUR_MS: i64 = 60 * 60 * 1000;
+
 // ---------------------------------------------------------------------------
 // Response types (mirrored in src/lib/db.ts)
 // ---------------------------------------------------------------------------
@@ -312,8 +334,9 @@ fn get_threat_stats(state: tauri::State<DbState>) -> ThreatStats {
     };
 
     let now = now_ms();
-    let today_ago = now - 24 * 60 * 60 * 1000;
-    let week_ago = now - 7 * 24 * 60 * 60 * 1000;
+    let off = local_utc_offset_ms();
+    let today_start = ((now + off) / DAY_MS) * DAY_MS - off;
+    let week_ago = now - 7 * DAY_MS;
 
     let q = |sql: &str, since: i64| -> i64 {
         conn.query_row(sql, rusqlite::params![since], |r| r.get(0))
@@ -323,7 +346,7 @@ fn get_threat_stats(state: tauri::State<DbState>) -> ThreatStats {
     ThreatStats {
         blocks_today: q(
             "SELECT COUNT(*) FROM verdicts WHERE verdict='Block' AND ts_ms >= ?1",
-            today_ago,
+            today_start,
         ),
         blocks_week: q(
             "SELECT COUNT(*) FROM verdicts WHERE verdict='Block' AND ts_ms >= ?1",
@@ -355,8 +378,8 @@ fn get_activity_chart(state: tauri::State<DbState>) -> Vec<ChartPoint> {
     };
 
     let now = now_ms();
-    let since = now - 24 * 60 * 60 * 1000;
-    let since_bucket = since / 3_600_000;
+    let since = now - 24 * HOUR_MS;
+    let off = local_utc_offset_ms();
 
     let mut stmt = match conn.prepare(
         "SELECT CAST(ts_ms / 3600000 AS INTEGER) as bucket, COUNT(*) as cnt
@@ -376,17 +399,22 @@ fn get_activity_chart(state: tauri::State<DbState>) -> Vec<ChartPoint> {
         }
     }
 
+    // Map each of the 24 local hours ending now to its UTC epoch-hour bucket.
+    // i=0 is the current local hour, i=23 is 23 local hours ago.
     (0..24)
-        .map(|i| ChartPoint {
-            hour: i,
-            count: *map.get(&(since_bucket + i)).unwrap_or(&0),
+        .map(|i| {
+            let utc_bucket = ((now - i * HOUR_MS + off) / HOUR_MS) % 24;
+            let local_hour = ((utc_bucket + off / HOUR_MS) % 24 + 24) % 24;
+            ChartPoint {
+                hour: local_hour,
+                count: *map.get(&utc_bucket).unwrap_or(&0),
+            }
         })
         .collect()
 }
 
-// day_offset uses the same UTC-epoch-day bucket as get_weekly_blocks
-// (0 = today, 6 = six days ago) — hour is the bucket's index within that
-// day (0-23), not an offset from "now" like get_activity_chart's hour field.
+// day_offset uses the same local-day bucket as get_weekly_blocks
+// (0 = today, 6 = six days ago) — hour is the local clock hour (0-23).
 #[tauri::command]
 fn get_activity_chart_for_day(state: tauri::State<DbState>, day_offset: i64) -> Vec<ChartPoint> {
     let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -394,11 +422,11 @@ fn get_activity_chart_for_day(state: tauri::State<DbState>, day_offset: i64) -> 
         return vec![];
     };
 
-    let day_ms: i64 = 24 * 60 * 60 * 1000;
-    let today_bucket = now_ms() / day_ms;
-    let day_bucket = today_bucket - day_offset;
-    let day_start = day_bucket * day_ms;
-    let day_end = day_start + day_ms;
+    let now = now_ms();
+    let off = local_utc_offset_ms();
+    let today_start = ((now + off) / DAY_MS) * DAY_MS - off;
+    let day_start = today_start - day_offset * DAY_MS;
+    let day_end = day_start + DAY_MS;
 
     let mut stmt = match conn.prepare(
         "SELECT CAST(ts_ms / 3600000 AS INTEGER) as bucket, COUNT(*) as cnt
@@ -409,7 +437,6 @@ fn get_activity_chart_for_day(state: tauri::State<DbState>, day_offset: i64) -> 
         Err(_) => return vec![],
     };
 
-    let hour_bucket_start = day_start / 3_600_000;
     let mut map: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
     if let Ok(rows) = stmt.query_map(rusqlite::params![day_start, day_end], |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
@@ -419,10 +446,15 @@ fn get_activity_chart_for_day(state: tauri::State<DbState>, day_offset: i64) -> 
         }
     }
 
+    // Map each UTC epoch-hour bucket to local clock hour for display.
     (0..24)
-        .map(|i| ChartPoint {
-            hour: i,
-            count: *map.get(&(hour_bucket_start + i)).unwrap_or(&0),
+        .map(|i| {
+            let utc_bucket = (day_start / HOUR_MS) + i;
+            let local_hour = ((utc_bucket + off / HOUR_MS) % 24 + 24) % 24;
+            ChartPoint {
+                hour: local_hour,
+                count: *map.get(&utc_bucket).unwrap_or(&0),
+            }
         })
         .collect()
 }
@@ -538,26 +570,29 @@ fn get_weekly_blocks(state: tauri::State<DbState>) -> Vec<DayStat> {
     };
 
     let now = now_ms();
-    let day_ms: i64 = 24 * 60 * 60 * 1000;
-    let today_bucket = now / day_ms;
-    let since = now - 7 * day_ms;
+    let off = local_utc_offset_ms();
+    let today_start = ((now + off) / DAY_MS) * DAY_MS - off;
+    let since = today_start - 6 * DAY_MS;
 
+    // Single query: all Block verdicts in the last 7 local days. Bucket by
+    // local day in Rust so the boundary is local midnight, not UTC midnight.
     let mut stmt = match conn.prepare(
-        "SELECT CAST(ts_ms / 86400000 AS INTEGER) as bucket, COUNT(*) as cnt
-         FROM verdicts
-         WHERE verdict = 'Block' AND ts_ms >= ?1
-         GROUP BY bucket",
+        "SELECT ts_ms FROM verdicts
+         WHERE verdict = 'Block' AND ts_ms >= ?1",
     ) {
         Ok(s) => s,
         Err(_) => return vec![],
     };
 
-    let mut map: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    let mut counts = std::collections::HashMap::<i64, i64>::new();
     if let Ok(rows) = stmt.query_map(rusqlite::params![since], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        r.get::<_, i64>(0)
     }) {
-        for (bucket, cnt) in rows.flatten() {
-            map.insert(bucket, cnt);
+        for ts in rows.flatten() {
+            let day_offset = (today_start - ts) / DAY_MS;
+            if (0..7).contains(&day_offset) {
+                *counts.entry(day_offset).or_insert(0) += 1;
+            }
         }
     }
 
@@ -566,7 +601,7 @@ fn get_weekly_blocks(state: tauri::State<DbState>) -> Vec<DayStat> {
         .rev()
         .map(|offset| DayStat {
             day_offset: offset,
-            count: *map.get(&(today_bucket - offset)).unwrap_or(&0),
+            count: counts.get(&offset).copied().unwrap_or(0),
         })
         .collect()
 }
