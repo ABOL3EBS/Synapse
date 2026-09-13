@@ -99,8 +99,8 @@ fn write_block_record(conn: &Connection, ip: &str, ts_ms: i64) -> rusqlite::Resu
     conn.execute(
         "INSERT OR IGNORE INTO enforcement_log
          (event_id, ts_ms, action, ip_blob, ip_text, ttl_ms,
-          reason, detector, score, requested, confirmed, error)
-         VALUES (?1,?2,'Block',?3,?4,?5,'block-test-binary','block-test',1.0,1,1,NULL)",
+          reason, detector, score, error)
+         VALUES (?1,?2,'Block',?3,?4,?5,'block-test-binary','block-test',1.0,NULL)",
         rusqlite::params![event_id, ts_ms, &blob[..], ip, TTL_MS],
     )?;
     println!(
@@ -117,8 +117,8 @@ fn write_unblock_record(conn: &Connection, ip: &str, ts_ms: i64) -> rusqlite::Re
     conn.execute(
         "INSERT OR IGNORE INTO enforcement_log
          (event_id, ts_ms, action, ip_blob, ip_text, ttl_ms,
-          reason, detector, score, requested, confirmed, error)
-         VALUES (?1,?2,'Unblock',?3,?4,0,'block-test-cleanup','block-test',0.0,1,1,NULL)",
+          reason, detector, score, error)
+         VALUES (?1,?2,'Unblock',?3,?4,0,'block-test-cleanup','block-test',0.0,NULL)",
         rusqlite::params![event_id, ts_ms, &blob[..], ip],
     )?;
     println!(

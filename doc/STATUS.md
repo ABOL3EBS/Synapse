@@ -1,6 +1,55 @@
 # Implementation Status — Synapse IPS
 
-**Last verified:** 2026-09-01. Ground-truth ledger — if this file and the architecture doc disagree, this file wins.
+**Last verified:** 2026-09-13. Ground-truth ledger — if this file and the architecture doc disagree, this file wins.
+
+## Latest change (2026-09-13) — Schema V6: drop dead columns, spool payload versioning, DB-level CHECK constraints
+
+Three real-DB hardening fixes, each verified against the live production database (copy) plus unit/regression tests. **229 workspace + 12 Tauri tests, 0 failures.** build/clippy/fmt clean in both workspaces.
+
+### V6 migration — `enforcement_log.requested`/`confirmed` dropped, not just ignored
+
+- The two legacy columns were written-but-never-read except dead-code / semantic-noise paths.
+- Live-data review before shipping: distinct `action` = {Block, Unblock}, distinct `verdict` = {Alert, Block}, 0 out-of-range scores, **0 rows with `requested=0`**. The 17 `confirmed=1` rows are dashboard unblocks + `block-test` binary writes — `confirmed` is written as 1 but never read back as an ACK (no ACK exists in the protocol). Dropping loses zero functional behavior.
+- `get_active_blocks` never filtered on requested/confirmed; `get_threat_stats.blocked_addresses` dropping `requested=1` is semantically identical (every writer sets requested=1 except failed-send blocks, which already carry `error IS NOT NULL` and were already excluded). `kpi_since.unique_ips_blocked` drops the `confirmed = 0` filter (kpi_since is dead code — `#![allow(dead_code)]` in `reader.rs`).
+
+### Spool payload versioning — `spool.payload_version`
+
+- `PAYLOAD_VERSION = 1` in `spool.rs`; every spool append writes the version of the JSON payload shape. Pre-versioning spools get `payload_version INTEGER NOT NULL DEFAULT 1` via `ALTER TABLE` on open — old payloads are shape v1 and stay replayable.
+- Replay (`replay_spool`) refuses unrecognised versions: logs `warn!` with the event_id + versions and **leaves the entry unconfirmed** (never parsed, never dropped). New `CriticalSpool::open` + real-worker test:
+  `test_spool_unsupported_payload_version_skipped_not_confirmed` — a version-999 entry is skipped while a v1 entry in the same spool replays normally.
+
+### CHECK constraints at the DB level
+
+- `enforcement_log`: `action IN ('Block','Unblock')`; `score` NULL-or-∈[0,1].
+- `verdicts`: `verdict IN ('Alert','Block')`; `composite_score ∈ [0,1]`.
+- `detector_findings`: `score`, `confidence` ∈ [0,1].
+- Live-verified on the migrated copy: `INSERT ... action='Ban'` → `CHECK constraint failed`.
+
+### V6 migration mechanics + the id-preservation bug caught in the live demo
+
+- Rename dance recreates all three tables: `PRAGMA foreign_keys=OFF` → `BEGIN` → create `*_v6` → copy → `DROP` old → rename → recreate indexes → `COMMIT` → `PRAGMA foreign_key_check` → `foreign_keys=ON`. All 9 indexes recreated.
+- **CAUGHT IN THE LIVE DEMO (would have shipped a data-corrupting migration):** the first formulation of the `verdicts` INSERT omitted the `id` column. The recreated table re-assigned ids from 1, but `detector_findings.verdict_id` references real production ids in the **200k range** (V4 dedup keeps `MAX(id)`; retention deletes old rows; live verdicts ids are 210308–225774). Result: **all 5388 findings orphaned** — `PRAGMA foreign_key_check` printed one violation per finding row. Fixed by copying `id` verbatim. Regression test seeds a realistic high id and asserts zero orphans + a successful join back to the parent.
+- **Orphan reconciliation — there are no pre-existing orphans.** The initial (buggy) run's `foreign_key_check` spewed one violation per finding row, and early analysis speculated some might be pre-existing orphans from historical `foreign_keys=OFF` retention. The post-fix clean run disproved that: `foreign_key_check` returned **0 rows** and the orphan query returned **0** — the live copy had zero orphaned findings at migration time. Every violation seen earlier was the id-drop bug (`verdicts` recreated with fresh 1..898 ids while findings still referenced 210308..225774). Nothing to preserve, nothing to repair; the migration leaves the DB with 0 orphans.
+
+### Live migration demo (copy only — real DB untouched, migrates at next agent start)
+
+```
+BEFORE: integrity ok · user_version=5 · enf=223 · verdicts=210308..225774 (898) · findings=5388
+RUN V6 (byte-identical SQL extracted from schema.rs)   → "read OK, no errors"
+AFTER:  integrity ok · fk_violations=0 · enf=223 · verdicts 210308..225774 (898) · findings=5388
+        · orphans=0 · enforcement_log(cols) has NO requested/confirmed · 9 indexes present
+```
+
+Real agent DB (`~/.synapse/synapse.db`) is still `user_version=5`; it migrates idempotently on next agent startup. All demo artifacts in `/var/folders/mb/k8stjq5d5bd6jrlmfj0y5d_c0000gn/T/opencode/`.
+
+### Files touched
+
+`schema.rs` (V6_MIGRATION + `SCHEMA_VERSION=6` + V1_DDL shape + 2 new tests), `spool.rs` (payload_version), `mod.rs` (replay version gate, INSERTs, 1 new test), `reader.rs` (queries), `models.rs` (EnforcementRow fields), `block_test.rs`, `src-tauri/src/lib.rs` (blocked_addresses), `src-tauri/src/settings.rs` (write_unblock_to_db + test fixture). `cargo fmt` normalized one pre-existing unformatted chart block in `src-tauri/src/lib.rs:585`.
+
+## Deferred (accepted DB debt, documented — not fixed)
+
+- **Perf: `kpi_since` and `get_threat_stats` do `COUNT(DISTINCT ip_text)` over the 90-day `enforcement_log`** (plus `get_threat_countries` has no `(country_code, ts_ms)` index on `verdicts`). Fine at current scale; revisit if the DB grows.
+- **Minor hygiene:** `metadata.value` stores the retention timestamp as TEXT; `event_id` is hex-prefixed for replay events vs `dashboard-<ts>` for manual unblocks; `verdicts.asn`/`reputation_score` are speculative columns written only occasionally.
 
 ## Latest change (2026-09-01) — real app icons in Activity feed + Report Flagged Apps + real flag images
 
@@ -263,9 +312,9 @@ This is a **fixable verification gap**, not an accepted limitation like the VPN-
 | Enrichment pool | `crates/agent/src/enrichment/mod.rs` | 756 | Configurable worker count (`std::thread` + `mpsc`), DNS reverse via `getnameinfo`, process attribution via libproc, **GeoIP via maxminddb 0.30** (`GeoIpDb`: separate `city_reader` + optional `asn_reader`; `lookup()` returns `(country_code, asn)` — City DB for country, **dedicated ASN DB for ASN** (City DB never contained ASN data; prior code silently returned None); `is_public_ip()` skips RFC1918/loopback/CGNAT/link-local), reputation store. `examples/geoip_check.rs` diagnostic. `test-data/GeoIP2-City-Test.mmdb` + `test-data/GeoLite2-ASN-Test.mmdb` committed fixtures (MaxMind public test DBs). 2 new GeoIP integration tests (no network required). |
 | Flow tracker | `crates/agent/src/flow/mod.rs` | 1203 | In-memory session window with configurable tick interval via `FlowConfig`. Direction-agnostic canonicalization, configurable `max_flows` eviction with O(log n) `BinaryHeap`, local_port + PID stored per-flow, enrichment attachment, `last_evaluated` per-flow. `tick()` returns `(expired, due_for_re_evaluate)` tuple. O(k) VecDeque-based re-evaluation scheduling with wall-clock due check. |
 | IPC protocol | `crates/platform-macos/src/protocol.rs` | 164 | `send_fd`/`recv_fd` (SCM_RIGHTS), `send_message`/`recv_message` (bincode, length-prefixed), stream split via `try_clone()` |
-| Storage worker | `crates/agent/src/storage/` (5 files) | 1507 | `StorageWorker` + `StorageEvent` enum (`EnforcementRequested`, `VerdictDecided`, `CircuitBreakerTransition`). Crash-safe spool (`CriticalSpool` — separate DB, `synchronous=FULL`). Idempotent replay via `INSERT OR IGNORE` + stable event IDs (`boot_id XOR fib_hash(pid)` prefix). Binary IP storage (16-byte BLOB + TEXT, always both). SQLite hardening PRAGMAs. **V2 schema** via `PRAGMA user_version` — V1: base tables; V2: adds `metadata` table with `last_retention_run_ms` for wall-clock retention persistence across restarts. Retention: enforcement_log 90d, verdicts+findings (CASCADE) 7d, CB events 7d — wall-clock hourly check on every 250ms tick, last-run timestamp persisted in `metadata`. `pending_critical_ids: VecDeque<String>`, `pop_front()` (O(1)) — previously `Vec` + `remove(0)` (O(n)). `StorageReader` (read-only connection, `query_only=ON`) with `recent_verdicts`, `verdict_findings`, `recent_enforcement`, `detector_health`, `kpi_since`. `#![allow(dead_code)]` on models/reader until Tauri IPC is wired. 4 tests: `test_ip_roundtrip_v4`, `test_ip_roundtrip_v6`, `test_spool_append_and_confirm`, `test_write_failure_degrades_gracefully`. |
+| Storage worker | `crates/agent/src/storage/` (5 files) | 2457 | `StorageWorker` + `StorageEvent` enum (`EnforcementRequested`, `VerdictDecided`, `CircuitBreakerTransition`). Crash-safe spool (`CriticalSpool` — separate DB, `synchronous=FULL`) **with `payload_version` column (V6)** — replay refuses unrecognised payload shapes (logs + keeps unconfirmed). Idempotent replay via `INSERT OR IGNORE` + stable event IDs (`boot_id XOR fib_hash(pid)` prefix). Binary IP storage (16-byte BLOB + TEXT, always both). SQLite hardening PRAGMAs. **V6 schema** (`SCHEMA_VERSION=6`, `PRAGMA user_version`) — DDL history: V1 base; V2 `metadata` (`last_retention_run_ms` wall-clock persistence); V4 verdict dedup + `v_5tuple_verdict` unique index; V5 `remote_ip_text`; V6 drops `enforcement_log.requested`/`confirmed`, adds CHECK constraints (emums + score ranges) via rename dance preserving `verdicts.id`. Retention: enforcement_log 90d, verdicts+findings (CASCADE) 7d, CB events 7d — wall-clock hourly check on every 250ms tick, last-run timestamp persisted in `metadata`. `pending_critical_ids: VecDeque<String>`, `pop_front()` (O(1)) — previously `Vec` + `remove(0)` (O(n)). `StorageReader` (read-only connection, `query_only=ON`) with `recent_verdicts`, `verdict_findings`, `recent_enforcement`, `detector_health`, `kpi_since`. `#![allow(dead_code)]` on models/reader until Tauri IPC is wired. 13 tests: replay-version gate, schema-migration + CHECK tests, `test_ip_roundtrip_v4`, `test_ip_roundtrip_v6`, `test_spool_append_and_confirm`, `test_write_failure_degrades_gracefully`. |
 
-**Total:** ~13,880 lines across 29 files. 215 tests (181 agent + 16 common + 6 platform-macos lib + 12 helper).
+**Total:** ~17,050 lines across 41 files. 229 tests (194 agent + 17 common + 6 platform-macos lib + 12 helper).
 
 **Verified end-to-end (2026-07-22):** Helper sends PortPidCache (49–51 entries, ~483 PIDs, ~6675 fds, 62–64 probe_ok, ~7–8ms root scan). Agent receives cache, looks up src_port on each packet, resolves to correct PID + executable path. Live test: Brave Browser connection to 142.251.142.74:443 resolved to pid=743 → `Brave Browser Helper`.
 

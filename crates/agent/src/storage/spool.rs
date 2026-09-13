@@ -14,10 +14,16 @@ use std::path::Path;
 use log::warn;
 use rusqlite::{params, Connection};
 
+/// Version of the JSON payload format written by `spool_payload_for()`.
+/// Bumped when the payload shape changes. Replay refuses unrecognised
+/// versions (logs + skips) rather than misparsing them.
+pub const PAYLOAD_VERSION: u32 = 1;
+
 pub struct SpoolEntry {
     pub event_id: String,
     pub ts_ms: i64,
     pub payload: String,
+    pub payload_version: u32,
 }
 
 pub struct CriticalSpool {
@@ -42,6 +48,25 @@ impl CriticalSpool {
              );",
         )
         .map_err(|e| format!("spool schema: {e}"))?;
+
+        // Pre-payload_version spools (created before V6) get the column with
+        // DEFAULT 1 — the payload shape written by older agents is version 1,
+        // so those entries remain replayable.
+        let has_version_col = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('spool') WHERE name = 'payload_version'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            != 0;
+        if !has_version_col {
+            conn.execute_batch(
+                "ALTER TABLE spool ADD COLUMN payload_version INTEGER NOT NULL DEFAULT 1;",
+            )
+            .map_err(|e| format!("spool schema (payload_version): {e}"))?;
+        }
+
         Ok(Self { conn })
     }
 
@@ -52,15 +77,16 @@ impl CriticalSpool {
         event_id: &str,
         ts_ms: i64,
         kind: &str,
+        payload_version: u32,
         payload: &str,
     ) -> Result<(), String> {
         self.conn
             .execute(
                 // `kind` is written for operator/debugging visibility via raw SQL
                 // but not read back into Rust — see D7 in the 2026-08-03 health audit.
-                "INSERT OR IGNORE INTO spool (event_id, ts_ms, kind, payload) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![event_id, ts_ms, kind, payload],
+                "INSERT OR IGNORE INTO spool (event_id, ts_ms, kind, payload_version, payload) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![event_id, ts_ms, kind, payload_version as i64, payload],
             )
             .map(|_| ())
             .map_err(|e| format!("spool append {event_id}: {e}"))
@@ -70,7 +96,7 @@ impl CriticalSpool {
     /// the main DB on startup.
     pub fn unconfirmed(&self) -> Vec<SpoolEntry> {
         let mut stmt = match self.conn.prepare(
-            "SELECT event_id, ts_ms, payload \
+            "SELECT event_id, ts_ms, payload, payload_version \
              FROM spool WHERE done = 0 ORDER BY id",
         ) {
             Ok(s) => s,
@@ -84,6 +110,7 @@ impl CriticalSpool {
                 event_id: r.get(0)?,
                 ts_ms: r.get(1)?,
                 payload: r.get(2)?,
+                payload_version: r.get(3)?,
             })
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())

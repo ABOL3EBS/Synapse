@@ -227,7 +227,13 @@ fn handle_message(
                 let ts_ms = system_time_millis();
                 let payload = spool_payload_for(&event);
                 if let Some(ref mut sp) = state.spool {
-                    if let Err(e) = sp.append(&event_id, ts_ms, "EnforcementRequested", &payload) {
+                    if let Err(e) = sp.append(
+                        &event_id,
+                        ts_ms,
+                        "EnforcementRequested",
+                        spool::PAYLOAD_VERSION,
+                        &payload,
+                    ) {
                         warn!("storage: spool append: {e}");
                     }
                 }
@@ -430,12 +436,11 @@ fn flush(
 
 fn insert_enforcement_event(tx: &Transaction, ts_ms: i64, p: EnforcementParams) {
     let (ip_blob, ip_text) = ip_to_parts(p.ip);
-    let requested = if p.send_error.is_none() { 1i64 } else { 0i64 };
     if let Err(e) = tx.execute(
         "INSERT OR IGNORE INTO enforcement_log
          (event_id, ts_ms, action, ip_blob, ip_text, ttl_ms,
-          reason, detector, score, requested, confirmed, error)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,?11)",
+          reason, detector, score, error)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
         params![
             p.event_id,
             ts_ms,
@@ -446,7 +451,6 @@ fn insert_enforcement_event(tx: &Transaction, ts_ms: i64, p: EnforcementParams) 
             p.reason,
             p.top_detector,
             p.composite_score as f64,
-            requested,
             p.send_error,
         ],
     ) {
@@ -631,7 +635,20 @@ fn replay_spool(spool: &mut CriticalSpool, conn: &mut Connection) {
     );
     let mut confirmed = Vec::new();
     for entry in entries {
-        // Each payload was serialised by spool_payload_for() as JSON.
+        // Every payload is JSON produced by spool_payload_for() and tagged with
+        // its payload_version. An unrecognised version means the caller (likely
+        // a newer or older binary) wrote a payload shape this build cannot safely
+        // interpret — log it loudly and LEAVE IT unconsumed rather than guessing.
+        if entry.payload_version != spool::PAYLOAD_VERSION {
+            warn!(
+                "storage: spool entry {} has unsupported payload_version {} (current {}) — \
+                 skipping; entry retained unconfirmed",
+                entry.event_id,
+                entry.payload_version,
+                spool::PAYLOAD_VERSION
+            );
+            continue;
+        }
         // Re-insert into enforcement_log with INSERT OR IGNORE — idempotent.
         let ok = replay_enforcement(conn, &entry.event_id, entry.ts_ms, &entry.payload);
         if ok {
@@ -666,17 +683,13 @@ fn replay_enforcement(conn: &mut Connection, event_id: &str, ts_ms: i64, payload
     let detector = v["detector"].as_str();
     let score = v["score"].as_f64();
     let send_error = v["send_error"].as_str();
-    let requested = if send_error.is_none() { 1i64 } else { 0i64 };
 
     conn.execute(
         "INSERT OR IGNORE INTO enforcement_log
          (event_id, ts_ms, action, ip_blob, ip_text, ttl_ms,
-          reason, detector, score, requested, confirmed, error)
-         VALUES (?1,?2,'Block',?3,?4,?5,?6,?7,?8,?9,0,?10)",
-        params![
-            event_id, ts_ms, ip_blob, ip_text, ttl_ms, reason, detector, score, requested,
-            send_error,
-        ],
+          reason, detector, score, error)
+         VALUES (?1,?2,'Block',?3,?4,?5,?6,?7,?8,?9)",
+        params![event_id, ts_ms, ip_blob, ip_text, ttl_ms, reason, detector, score, send_error,],
     )
     .is_ok()
 }
@@ -1072,10 +1085,22 @@ mod tests {
         let _ = std::fs::remove_file(&dir);
         let mut spool = CriticalSpool::open(&dir).expect("open spool");
         spool
-            .append("evt-1", 1000, "EnforcementRequested", "{}")
+            .append(
+                "evt-1",
+                1000,
+                "EnforcementRequested",
+                spool::PAYLOAD_VERSION,
+                "{}",
+            )
             .unwrap();
         spool
-            .append("evt-2", 2000, "EnforcementRequested", "{}")
+            .append(
+                "evt-2",
+                2000,
+                "EnforcementRequested",
+                spool::PAYLOAD_VERSION,
+                "{}",
+            )
             .unwrap();
         let pending = spool.unconfirmed();
         assert_eq!(pending.len(), 2);
@@ -1169,7 +1194,13 @@ mod tests {
         {
             let mut spool = CriticalSpool::open(&spool_path).unwrap();
             spool
-                .append(event_id, ts_ms, "EnforcementRequested", &payload)
+                .append(
+                    event_id,
+                    ts_ms,
+                    "EnforcementRequested",
+                    spool::PAYLOAD_VERSION,
+                    &payload,
+                )
                 .unwrap();
             // Dropped without confirm() -- exactly what a crash leaves behind.
         }
@@ -1201,7 +1232,81 @@ mod tests {
         let _ = std::fs::remove_file(&spool_path);
     }
 
-    /// Verify remote_ip_text is persisted verbatim and reads back from the verdicts table.
+    /// An unconfirmed spool entry carrying an unrecognised payload_version must
+    /// be logged-and-skipped (never parsed, never confirmed), while current-version
+    /// entries in the same spool replay normally. Runs through the real
+    /// StorageWorker startup path — the exact code that consumes the spool.
+    #[test]
+    fn test_spool_unsupported_payload_version_skipped_not_confirmed() {
+        let db_path = std::env::temp_dir().join(format!("synapse_ver_{}.db", std::process::id()));
+        let spool_path = db_path.with_extension("spool");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&spool_path);
+
+        let current_event = "cafe0000000000000000000000000001";
+        let ts_ms = system_time_millis();
+        let payload = serde_json::json!({
+            "ip_blob_hex": "00000000000000000000ffff01020304",
+            "ip_text": "1.2.3.4",
+            "ttl_ms": 300_000i64,
+            "reason": "payload-version-test",
+            "detector": "test",
+            "score": 0.9,
+            "send_error": null,
+        })
+        .to_string();
+        {
+            let mut spool = CriticalSpool::open(&spool_path).unwrap();
+            spool
+                .append(
+                    current_event,
+                    ts_ms,
+                    "EnforcementRequested",
+                    spool::PAYLOAD_VERSION,
+                    &payload,
+                )
+                .unwrap();
+            // Simulate a future/newer writer: version 999, payload shape we cannot
+            // safely interpret. Content is intentionally garbage — it must never
+            // be parsed.
+            spool
+                .append(
+                    "cafe0000000000000000000000000002",
+                    ts_ms,
+                    "EnforcementRequested",
+                    999,
+                    "{ not-valid-json shape of a future version }",
+                )
+                .unwrap();
+        }
+
+        let worker = StorageWorker::start(db_path.clone()).expect("worker should start");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        worker.shutdown();
+
+        let conn = Connection::open(&db_path).unwrap();
+        let replayed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM enforcement_log WHERE event_id = ?1",
+                params![current_event],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(replayed, 1, "current-version entry must replay");
+
+        let spool_check = CriticalSpool::open(&spool_path).unwrap();
+        let pending = spool_check.unconfirmed();
+        assert_eq!(
+            pending.len(),
+            1,
+            "future-version entry must remain unconfirmed"
+        );
+        assert_eq!(pending[0].event_id, "cafe0000000000000000000000000002");
+        assert_eq!(pending[0].payload_version, 999);
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&spool_path);
+    }
     ///
     /// This closes the storage side of Step F: the dashboard can now read
     /// remote_ip_text directly without re-deriving direction from a/b canonical ordering.

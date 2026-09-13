@@ -18,8 +18,6 @@ pub struct EnforcementRow {
     pub reason: String,
     pub detector: Option<String>,
     pub score: Option<f64>,
-    pub requested: bool,
-    pub confirmed: bool,
     pub error: Option<String>,
 }
 

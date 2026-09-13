@@ -108,7 +108,7 @@ impl StorageReader {
     pub fn recent_enforcement(&self, limit: usize) -> Vec<EnforcementRow> {
         let mut stmt = match self.conn.prepare(
             "SELECT id, ts_ms, action, ip_text, ttl_ms, reason,
-                    detector, score, requested, confirmed, error
+                    detector, score, error
              FROM enforcement_log ORDER BY ts_ms DESC LIMIT ?1",
         ) {
             Ok(s) => s,
@@ -127,9 +127,7 @@ impl StorageReader {
                 reason: r.get(5)?,
                 detector: r.get(6)?,
                 score: r.get(7)?,
-                requested: r.get::<_, i64>(8)? != 0,
-                confirmed: r.get::<_, i64>(9)? != 0,
-                error: r.get(10)?,
+                error: r.get(8)?,
             })
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -179,7 +177,7 @@ impl StorageReader {
             alerts_24h: q("SELECT count(*) FROM verdicts \
                  WHERE verdict='Alert' AND ts_ms >= ?1"),
             unique_ips_blocked: q("SELECT count(DISTINCT ip_text) FROM enforcement_log \
-                 WHERE ts_ms >= ?1 AND confirmed = 0 AND error IS NULL"),
+                 WHERE ts_ms >= ?1 AND error IS NULL"),
             enforcement_failures: q("SELECT count(*) FROM enforcement_log \
                  WHERE ts_ms >= ?1 AND error IS NOT NULL"),
         }

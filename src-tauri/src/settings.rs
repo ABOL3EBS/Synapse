@@ -103,8 +103,8 @@ pub(crate) fn write_unblock_to_db(
 ) -> Result<(), String> {
     conn.execute(
         "INSERT INTO enforcement_log \
-         (event_id, ts_ms, action, ip_blob, ip_text, ttl_ms, reason, requested, confirmed) \
-         VALUES (?1, ?2, 'Unblock', zeroblob(16), ?3, 0, 'dashboard-requested', 1, 1)",
+         (event_id, ts_ms, action, ip_blob, ip_text, ttl_ms, reason) \
+         VALUES (?1, ?2, 'Unblock', zeroblob(16), ?3, 0, 'dashboard-requested')",
         rusqlite::params![format!("dashboard-{now}"), now, ip_text],
     )
     .map(|_| ())
@@ -367,8 +367,6 @@ mod tests {
                 ip_text   TEXT    NOT NULL,
                 ttl_ms    INTEGER,
                 reason    TEXT    NOT NULL DEFAULT '',
-                requested INTEGER NOT NULL DEFAULT 0,
-                confirmed INTEGER NOT NULL DEFAULT 0,
                 error     TEXT
              );",
         )

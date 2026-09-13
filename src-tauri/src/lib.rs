@@ -354,7 +354,7 @@ fn get_threat_stats(state: tauri::State<DbState>) -> ThreatStats {
         ),
         blocked_addresses: q(
             "SELECT COUNT(DISTINCT ip_text) FROM enforcement_log \
-             WHERE requested=1 AND error IS NULL AND ts_ms >= ?1",
+             WHERE error IS NULL AND ts_ms >= ?1",
             week_ago,
         ),
     }
@@ -585,9 +585,7 @@ fn get_weekly_blocks(state: tauri::State<DbState>) -> Vec<DayStat> {
     };
 
     let mut counts = std::collections::HashMap::<i64, i64>::new();
-    if let Ok(rows) = stmt.query_map(rusqlite::params![since], |r| {
-        r.get::<_, i64>(0)
-    }) {
+    if let Ok(rows) = stmt.query_map(rusqlite::params![since], |r| r.get::<_, i64>(0)) {
         for ts in rows.flatten() {
             let day_offset = (today_start - ts) / DAY_MS;
             if (0..7).contains(&day_offset) {
